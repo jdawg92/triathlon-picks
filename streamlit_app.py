@@ -93,6 +93,18 @@ def apply_dashboard_theme() -> None:
             margin-top: 0.15rem;
         }
 
+
+        .ptn-sidebar-section {
+            color: #94A3B8;
+            font-size: 0.70rem;
+            font-weight: 900;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            margin: 1.05rem 0 0.35rem 0;
+            padding-top: 0.55rem;
+            border-top: 1px solid rgba(148, 163, 184, 0.16);
+        }
+
         .ptn-hero {
             padding: 1.35rem 1.5rem;
             border: 1px solid var(--ptn-border);
@@ -1105,7 +1117,7 @@ def apply_gender_updates_from_rows(rows: List[Dict[str, Any]]) -> int:
 # Permissioned athlete-profile gender backfill
 # ============================================================
 def canonical_athlete_url(url: Any) -> Optional[str]:
-    """Normalize PTN athlete URLs enough for a one-time profile lookup."""
+    """Normalize PTN athlete URLs for profile lookups without losing variants."""
     s = clean_str(url)
     if not s:
         return None
@@ -1113,75 +1125,134 @@ def canonical_athlete_url(url: Any) -> Optional[str]:
         s = "https://protrinews.com" + s
     if s.startswith("http://"):
         s = "https://" + s[len("http://"):]
-    # Prefer English athlete URL if someone stored the non-/en/ path.
-    s = re.sub(r"https://protrinews\.com/athletes/", "https://protrinews.com/en/athletes/", s)
     return s.rstrip("/")
+
+
+def athlete_profile_url_candidates(url: Any) -> List[str]:
+    """Return a small set of allowed URL variants for the same PTN athlete.
+
+    Some imported rows use /athletes/slug and some use /en/athletes/slug. The
+    profile payload is not always identical, so the backfill checks both variants
+    before declaring that no explicit gender field was found.
+    """
+    base = canonical_athlete_url(url)
+    if not base:
+        return []
+    variants = []
+
+    def add(u: str) -> None:
+        u = clean_str(u).rstrip("/")
+        if u and u not in variants:
+            variants.append(u)
+
+    add(base)
+    add(re.sub(r"https://protrinews\.com/athletes/", "https://protrinews.com/en/athletes/", base))
+    add(re.sub(r"https://protrinews\.com/en/athletes/", "https://protrinews.com/athletes/", base))
+    return variants[:3]
+
+
+def _html_to_visible_text(html: str) -> str:
+    text = re.sub(r"<script[\s\S]*?</script>", " ", html or "", flags=re.I)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;|&#160;", " ", text, flags=re.I)
+    text = re.sub(r"&amp;", "&", text, flags=re.I)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_profile_gender_value(value: Any) -> Optional[str]:
+    raw = clean_str(value).lower()
+    raw = raw.strip(' "\'`:,;{}[]()')
+    if raw in {"male", "men", "man", "m", "masculino", "hommes"}:
+        return "Men"
+    if raw in {"female", "women", "woman", "w", "f", "feminino", "femmes"}:
+        return "Women"
+    return normalize_gender(value)
 
 
 def extract_gender_from_profile_html(html: str) -> Tuple[Optional[str], str]:
     """Extract Men/Women competition category from profile HTML when present.
 
-    This is intentionally conservative. It only returns a gender when the page
-    appears to include an explicit gender/sex/category field, not from the
-    athlete's name, image, country, or results.
+    This version is still conservative: it looks for explicit profile fields or
+    unambiguous page text, never from the athlete's name, country, image, or a
+    guessed first-name database.
     """
     if not html:
         return None, "empty_html"
 
-    # JSON-style fields embedded by Next.js / app state.
+    # Common JSON / app-state shapes, including escaped JSON inside Next payloads.
     json_patterns = [
-        r'"gender"\s*:\s*"(male|female|men|women|m|f)"',
-        r'"sex"\s*:\s*"(male|female|men|women|m|f)"',
-        r'"category"\s*:\s*"(male|female|men|women|m|f)"',
-        r'"division"\s*:\s*"(male|female|men|women|m|f)"',
+        r'"(?:gender|sex|category|division|raceGender|competitionGender|genderName|gender_name)"\s*:\s*"([^"\\]{1,30})"',
+        r'\\"(?:gender|sex|category|division|raceGender|competitionGender|genderName|gender_name)\\"\s*:\s*\\"([^"\\]{1,30})\\"',
+        r'"(?:gender|sex|category|division)"\s*:\s*\{[^\}]{0,160}"(?:name|label|value)"\s*:\s*"([^"\\]{1,30})"',
+        r'\\"(?:gender|sex|category|division)\\"\s*:\s*\{[^\}]{0,200}\\"(?:name|label|value)\\"\s*:\s*\\"([^"\\]{1,30})\\"',
     ]
     for pat in json_patterns:
-        m = re.search(pat, html, flags=re.I)
-        if m:
-            g = normalize_gender(m.group(1))
+        for m in re.finditer(pat, html, flags=re.I):
+            g = _normalize_profile_gender_value(m.group(1))
             if g in ["Men", "Women"]:
                 return g, "profile_json_field"
 
-    # Label/value patterns after stripping tags.
-    text = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
-    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text)
+    text = _html_to_visible_text(html)
+    if not text:
+        return None, "empty_text"
+
+    # Explicit label/value patterns in rendered text.
     label_patterns = [
-        r"\bGender\b\s*[:\-]?\s*(Male|Female|Men|Women)\b",
-        r"\bSex\b\s*[:\-]?\s*(Male|Female|Men|Women)\b",
-        r"\bCategory\b\s*[:\-]?\s*(Male|Female|Men|Women)\b",
+        r"\b(?:Gender|Sex|Category|Division|Competition Category)\b\s*[:\-]?\s*(Male|Female|Men|Women|M|F)\b",
+        r"\b(Male|Female|Men|Women)\b\s*[:\-]?\s*\b(?:Gender|Sex|Category|Division)\b",
+        r"\b(?:Elite|Pro)\s+(Men|Women)\b",
+        r"\b(Men|Women)\s+(?:Elite|Pro)\b",
     ]
     for pat in label_patterns:
         m = re.search(pat, text, flags=re.I)
         if m:
-            g = normalize_gender(m.group(1))
-            if g in ["Men", "Women"]:
-                return g, "profile_visible_label"
+            for group in m.groups():
+                g = _normalize_profile_gender_value(group)
+                if g in ["Men", "Women"]:
+                    return g, "profile_visible_label"
+
+    # Fallback: if one gender word is uniquely present and the opposite is not,
+    # treat it as medium-strength explicit page text. Avoid matching men inside women.
+    women_hits = len(re.findall(r"\b(?:women|woman|female)\b", text, flags=re.I))
+    men_hits = len(re.findall(r"\b(?:men|man|male)\b", text, flags=re.I))
+    if women_hits > 0 and men_hits == 0:
+        return "Women", "profile_unique_gender_word"
+    if men_hits > 0 and women_hits == 0:
+        return "Men", "profile_unique_gender_word"
 
     return None, "not_found"
 
 
 def fetch_profile_gender(athlete_url: str, timeout: int = 15) -> Tuple[Optional[str], str, Optional[str]]:
-    """Fetch one permissioned athlete profile URL and return gender + source + error."""
-    url = canonical_athlete_url(athlete_url)
-    if not url:
+    """Fetch one permissioned athlete profile URL and return gender + source + notes/error."""
+    candidates = athlete_profile_url_candidates(athlete_url)
+    if not candidates:
         return None, "bad_url", "Missing athlete URL"
-    try:
-        resp = requests.get(
-            url,
-            timeout=timeout,
-            headers={
-                "User-Agent": "TriathlonPicksGenderBackfill/1.0 (permissioned; contact: dashboard owner)",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-        )
-        if resp.status_code != 200:
-            return None, "http_error", f"HTTP {resp.status_code}"
-        gender, source = extract_gender_from_profile_html(resp.text)
-        return gender, source, None
-    except Exception as e:
-        return None, "request_error", str(e)
+
+    attempts = []
+    for url in candidates:
+        try:
+            resp = requests.get(
+                url,
+                timeout=timeout,
+                headers={
+                    "User-Agent": "TriathlonPicksGenderBackfill/1.1 (permissioned; missing-gender cleanup only)",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+            )
+            size = len(resp.text or "")
+            if resp.status_code != 200:
+                attempts.append(f"{url} -> HTTP {resp.status_code}")
+                continue
+            gender, source = extract_gender_from_profile_html(resp.text)
+            if gender in ["Men", "Women"]:
+                return gender, f"{source} ({url})", None
+            attempts.append(f"{url} -> {source}, {size:,} chars")
+        except Exception as e:
+            attempts.append(f"{url} -> request_error: {e}")
+
+    return None, "not_found", " | ".join(attempts[:4])
 
 
 def missing_gender_athletes(athletes: pd.DataFrame, results: pd.DataFrame, starts: pd.DataFrame, limit: int = 200) -> pd.DataFrame:
@@ -2895,16 +2966,26 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 apply_dashboard_theme()
 
-PAGE_OPTIONS = {
-    "🏆 Race Dashboard": "Race Dashboard",
-    "🥇 Athlete Rankings": "Athlete Rankings",
-    "👤 Athletes": "Athletes",
-    "🧬 Gender Tools": "Gender Tools",
-    "🔎 Split Audit": "Split Audit",
-    "📥 Import CSVs": "Import CSVs",
-    "🗄️ Database Viewer": "Database Viewer",
-    "🔌 Connection": "Connection",
-}
+NAV_GROUPS = [
+    ("Predictions", [
+        ("🏆 Race Dashboard", "Race Dashboard"),
+        ("🥇 Athlete Rankings", "Athlete Rankings"),
+    ]),
+    ("Athlete Data", [
+        ("👤 Athletes", "Athletes"),
+        ("🔎 Split Audit", "Split Audit"),
+    ]),
+    ("Tools & Admin", [
+        ("🧬 Gender Tools", "Gender Tools"),
+        ("📥 Import CSVs", "Import CSVs"),
+        ("🗄️ Database Viewer", "Database Viewer"),
+        ("🔌 Connection", "Connection"),
+    ]),
+]
+PAGE_OPTIONS = {label: page_name for _, items in NAV_GROUPS for label, page_name in items}
+
+if "page_label" not in st.session_state or st.session_state["page_label"] not in PAGE_OPTIONS:
+    st.session_state["page_label"] = "🏆 Race Dashboard"
 
 with st.sidebar:
     st.markdown(
@@ -2916,15 +2997,19 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
-    page_label = st.radio(
-        "Navigation",
-        list(PAGE_OPTIONS.keys()),
-        index=0,
-        label_visibility="collapsed",
-    )
+
+    for section, items in NAV_GROUPS:
+        st.markdown(f'<div class="ptn-sidebar-section">{section}</div>', unsafe_allow_html=True)
+        for label, page_name in items:
+            active = st.session_state["page_label"] == label
+            if st.button(label, key=f"nav_{page_name}", type="primary" if active else "secondary", width="stretch"):
+                st.session_state["page_label"] = label
+                st.rerun()
+
+    page_label = st.session_state["page_label"]
     page = PAGE_OPTIONS[page_label]
     st.markdown("---")
-    if st.button("🔄 Refresh database cache", use_container_width=True):
+    if st.button("🔄 Refresh database cache", width="stretch"):
         clear_cache()
         st.rerun()
 
@@ -2941,7 +3026,7 @@ if page == "Connection":
         count_rows_data = []
         for table_name in ["athletes", "athlete_results", "race_field_results", "start_lists", "race_overrides", "scoring_settings", "model_runs", "split_audit"]:
             count_rows_data.append({"Table": table_name, "Rows in Supabase": count_rows(table_name)})
-        st.dataframe(pd.DataFrame(count_rows_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(count_rows_data), width="stretch", hide_index=True)
     except Exception as e:
         st.error("Could not read from Supabase. Make sure tables exist and secrets are correct.")
         st.exception(e)
@@ -2957,7 +3042,7 @@ elif page == "Import CSVs":
     if uploaded:
         df = read_uploaded_csv(uploaded)
         st.subheader("Preview")
-        st.dataframe(df.head(20), use_container_width=True)
+        st.dataframe(df.head(20), width="stretch")
         st.write(f"Rows detected: {len(df):,}")
 
         if st.button(f"Import {table_choice}", type="primary"):
@@ -3060,7 +3145,7 @@ elif page == "Athletes":
 
 elif page == "Gender Tools":
     st.header("🧬 Gender Tools")
-    st.caption("Fill Men/Women competition category from start lists, existing gender values, and explicit race-name hints. This does not scrape athlete profile pages or guess from names/photos.")
+    st.caption("Fill Men/Women competition category from start lists, existing gender values, explicit race-name hints, manual overrides, and permissioned missing-only profile checks. It never guesses from names/photos.")
 
     raw_athletes = load_table("athletes")
     raw_results = load_table("athlete_results")
@@ -3143,7 +3228,7 @@ elif page == "Gender Tools":
 
     st.markdown("---")
     st.subheader("Permissioned profile gender backfill")
-    st.caption("Use this only for missing-gender athletes and only in small batches. It does not scrape the whole database daily; it checks selected missing athlete profiles, rate-limited, and immediately propagates any explicit gender field found.")
+    st.caption("Use this only for missing-gender athletes and only in small batches. It checks both /athletes/ and /en/athletes/ profile variants, rate-limited, then propagates any explicit gender/category field found.")
 
     max_candidates = st.number_input("Missing-gender candidates to preview", min_value=25, max_value=2000, value=250, step=25)
     candidates = missing_gender_athletes(raw_athletes, combined_results, raw_starts, limit=int(max_candidates))
@@ -3171,6 +3256,8 @@ elif page == "Gender Tools":
             else:
                 found = int((log_df["Detected Gender"].isin(["Men", "Women"])).sum())
                 st.success(f"Checked {len(log_df):,} profiles. Found and applied {found:,} genders.")
+                if found == 0:
+                    st.info("If Source shows not_found, the profile HTML did not expose an explicit gender/category field in the places we checked. The Error column now shows which URL variants were checked and the response size so we can tune the parser if needed.")
                 display_table(log_df, ["Athlete", "Detected Gender", "Source", "Updated", "Error", "Athlete URL"], height=420)
                 st.download_button(
                     "Download profile backfill log CSV",
@@ -3276,7 +3363,7 @@ elif page == "Database Viewer":
         all_rows = fetch_all(table, page_size=1000)
         df_all = pd.DataFrame(all_rows)
         st.write(f"Fetched {len(df_all):,} rows from Supabase. Showing first {min(limit, len(df_all)):,}.")
-        st.dataframe(df_all.head(limit), use_container_width=True)
+        st.dataframe(df_all.head(limit), width="stretch")
         if not df_all.empty:
             st.download_button(
                 label=f"Download all {table} rows as CSV",
@@ -3385,7 +3472,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                     "Included audit rows": included_rows,
                     "Included start-list rows": start_included,
                 })
-            st.dataframe(pd.DataFrame(health), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(health), width="stretch", hide_index=True)
             st.caption("Important: sample size is the number of imported rows we currently have for that race, not the full ProTriNews field. Small imported samples are included but capped/weighted down until full race-field caching is added.")
             with st.expander("Why sample size may not match ProTriNews field size", expanded=False):
                 st.write(
