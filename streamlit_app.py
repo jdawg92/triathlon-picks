@@ -1008,6 +1008,22 @@ def score_splits_for_start_list(
         if len(recent_scored) and not (recent_scored["split_rank"] <= 5).any() and (avg_behind is None or avg_behind > 2.5):
             final = min(final, 50)
 
+        # Evidence-count confidence caps. One great split should show as
+        # interesting evidence, but it should not rank beside athletes with
+        # several recent validated splits. This fixes cases like an athlete
+        # ranking near the top off only one race such as IM Texas.
+        if evidence_count <= 1:
+            final = min(final, 45)
+            confidence = "Low - 1 split"
+        elif evidence_count == 2:
+            final = min(final, 60)
+            confidence = "Low - 2 splits"
+        elif evidence_count == 3:
+            final = min(final, 75)
+            confidence = "Medium - 3 splits"
+        else:
+            confidence = "Good"
+
         best_row = recent_scored.sort_values(["evidence_score", "race_date"], ascending=[False, False]).head(1)
         last_row = recent.head(1)
         rows.append({
@@ -1020,6 +1036,7 @@ def score_splits_for_start_list(
             "Recent Top 3 %": round(top3_rate * 100, 1),
             "Recent Fastest %": round(fastest_rate * 100, 1),
             "Evidence Count": evidence_count,
+            "Confidence": confidence,
             "Last Race": clean_str(last_row["race_name"].iloc[0]) if not last_row.empty else "",
             "Last Race Date": format_date(last_row["race_date"].iloc[0]) if not last_row.empty else "",
             "Last Rank": clean_str(last_row["rank_display"].iloc[0]) if not last_row.empty else "",
@@ -1393,7 +1410,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                 scored_top = scored.head(12).copy()
                 selected_row = selectable_table(
                     scored_top,
-                    ["Rank", "Athlete", "Score", "Recent Score", "Strong Field Score", "Recent Avg Behind %", "Recent Top 3 %", "Recent Fastest %", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
+                    ["Rank", "Athlete", "Score", "Confidence", "Recent Score", "Strong Field Score", "Recent Avg Behind %", "Recent Top 3 %", "Recent Fastest %", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
                     key=f"split_pick_table_{disc}",
                 )
                 st.caption("Click an athlete row above to show their last 5 valid split rows. Score is based on recent race-relative split performance; % behind fastest is the main metric.")
@@ -1420,11 +1437,19 @@ elif page in {"Race Dashboard", "Split Audit"}:
                     if aud.empty:
                         st.info("No audit rows for this athlete.")
                     else:
+                        # Match by URL OR athlete name. Sometimes an imported CSV
+                        # has a slightly different/missing URL even though the
+                        # displayed athlete name is correct; using only URL made
+                        # the evidence table look stuck on the previous athlete.
+                        name_mask = aud["athlete_name"].fillna("").str.lower().eq(str(selected_athlete).lower())
                         if selected_url:
-                            mask = aud["athlete_url"].astype(str).eq(selected_url)
+                            url_mask = aud["athlete_url"].astype(str).eq(selected_url)
+                            mask = url_mask | name_mask
                         else:
-                            mask = aud["athlete_name"].fillna("").str.lower().eq(str(selected_athlete).lower())
+                            mask = name_mask
                         ev = aud[mask].sort_values("race_date", ascending=False).head(5)
+                        if ev.empty:
+                            st.warning("No split evidence found for the selected athlete. Check athlete URL/name matching in the imported CSVs.")
                         display_table(
                             ev,
                             ["race_date", "race_name", "race_type", "sof", "sample_size", "split", "sample_rank_display", "pct_behind_fastest", "evidence_score", "final_cap", "included", "coverage_note", "reason"],
