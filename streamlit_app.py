@@ -246,7 +246,9 @@ def format_seconds(seconds: Any) -> str:
 
 
 def normalize_race_type(race_name: Optional[str], race_type: Optional[str], distance: Optional[str]) -> Optional[str]:
-    txt = " ".join([race_name or "", race_type or "", distance or ""]).lower()
+    # Values coming back from Supabase/pandas may be strings, floats, NaN, dates, or numbers.
+    # Always coerce through clean_str before joining so the app does not crash on imported CSV data.
+    txt = " ".join([clean_str(race_name) or "", clean_str(race_type) or "", clean_str(distance) or ""]).lower()
     if "t100" in txt or "pto" in txt:
         return "T100"
     if "wtcs" in txt or "world triathlon championship series" in txt:
