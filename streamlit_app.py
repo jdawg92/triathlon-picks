@@ -606,12 +606,13 @@ def normalize_race_type(race_name: Optional[str], race_type: Optional[str], dist
 
 
 def filter_rankings_by_gender(df: pd.DataFrame, selected_gender: str) -> pd.DataFrame:
-    """Strict gender filter for global athlete rankings.
+    """Gender filter for global athlete rankings.
 
-    Rankings should not mix Men/Women. Rows with unknown gender are excluded
-    here because global rankings are not tied to a single start list where we
-    can safely infer gender. A small race-name fallback is used only when the
-    race title explicitly says Men/Women.
+    Known opposite-gender rows are excluded. Unknown-gender rows are kept only
+    when the race name does not explicitly indicate the opposite gender. This is
+    important because older athlete-history imports often have blank gender, and
+    excluding every unknown row hides athletes such as short-course/T100 racers
+    whose profiles were imported before gender was available.
     """
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df
@@ -625,9 +626,6 @@ def filter_rankings_by_gender(df: pd.DataFrame, selected_gender: str) -> pd.Data
         out["gender"] = None
     out["__gender_norm"] = out["gender"].map(normalize_gender)
 
-    # Last-resort explicit race-name hints only. This avoids bringing women into
-    # the men's ranking just because gender is missing, while still rescuing
-    # rows named like "IRONMAN World Championship — Men's".
     if "race_name" in out.columns:
         names = out["race_name"].map(lambda x: (clean_str(x) or "").lower())
         explicit_men = names.str.contains(r"\bmen\b|men's|male", regex=True, na=False)
@@ -636,7 +634,15 @@ def filter_rankings_by_gender(df: pd.DataFrame, selected_gender: str) -> pd.Data
         out.loc[missing & explicit_men, "__gender_norm"] = "Men"
         out.loc[missing & explicit_women, "__gender_norm"] = "Women"
 
-    out = out[out["__gender_norm"].eq(gender)].copy()
+    known_match = out["__gender_norm"].eq(gender)
+    unknown = out["__gender_norm"].isna()
+    if "race_name" in out.columns:
+        compatible_unknown = unknown & out["race_name"].map(lambda x: race_gender_compatible(x, gender))
+    else:
+        compatible_unknown = unknown
+
+    out = out[known_match | compatible_unknown].copy()
+    out["gender_filter_note"] = np.where(out["__gender_norm"].isna(), "unknown gender included", "known gender")
     return out.drop(columns=["__gender_norm"], errors="ignore")
 
 
@@ -659,6 +665,74 @@ def ranking_scope_mask(df: pd.DataFrame, scope: str) -> pd.Series:
         return txt.str.contains("wtcs|world triathlon|continental|olympic|sprint", regex=True, na=False)
     return pd.Series([True] * len(df), index=df.index)
 
+
+
+
+def prediction_scope_from_race(race_name: Any, race_type: Any = None, distance: Any = None) -> str:
+    """Choose which result family should feed a selected-race predictor.
+
+    For WTCS/World Triathlon/short-course start lists, we should not pull in
+    70.3 or full-distance evidence. Those races answer a different question.
+    """
+    rt = normalize_race_type(race_name, race_type, distance)
+    txt = " ".join([clean_str(race_name) or "", clean_str(race_type) or "", clean_str(distance) or ""]).lower()
+    if rt in {"WTCS", "World Triathlon Cup", "Continental Cup", "Olympic", "Sprint"}:
+        return "Short Course / WTCS"
+    if any(x in txt for x in ["wtcs", "world triathlon", "olympic", "sprint", "triathlon cup"]):
+        return "Short Course / WTCS"
+    if rt == "T100":
+        return "T100 / PTO"
+    if rt == "Full":
+        return "Full IRONMAN"
+    return "IRONMAN 70.3 / Middle"
+
+
+def apply_prediction_scope(df: pd.DataFrame, scope: str) -> pd.DataFrame:
+    """Filter results to the race family appropriate for the selected predictor.
+
+    Short-course/WTCS prediction uses only sprint, Olympic, WTCS, World
+    Triathlon Cup, and continental-cup style evidence. For 70.3/T100/full, we
+    leave the broader two-year window available because cross-family evidence
+    can still be useful and is already weighted/capped by the scoring model.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+    if scope == "Short Course / WTCS":
+        return df[ranking_scope_mask(df, "Short Course / WTCS")].copy()
+    return df.copy()
+
+
+def championship_result_score(row: pd.Series) -> float:
+    """Extra overall signal for championship wins/podiums.
+
+    This helps the global 70.3 ranking respect athletes with true world-title
+    evidence instead of overrating normal race consistency.
+    """
+    race = (clean_str(row.get("race_name")) or "").lower()
+    rt = (clean_str(row.get("race_type")) or "").lower()
+    place = parse_place_number(row.get("place"))
+    if place is None:
+        return 0.0
+    is_champs = any(x in race for x in ["world championship", "world championships", "championship final", "olympic games"])
+    if not is_champs:
+        return 0.0
+    base = 0.0
+    if place == 1:
+        base = 100.0
+    elif place == 2:
+        base = 94.0
+    elif place == 3:
+        base = 90.0
+    elif place <= 5:
+        base = 84.0
+    elif place <= 10:
+        base = 76.0
+    else:
+        base = 62.0
+    # 70.3 Worlds and T100 finals are especially relevant to those ranking scopes.
+    if "70.3" in race or "70.3" in rt or "t100" in race or "t100" in rt:
+        return base
+    return base * 0.8
 
 def json_safe_row(row: pd.Series) -> Dict[str, Any]:
     out = {}
@@ -1895,6 +1969,10 @@ def score_overall(
             recent_scored = recent
         current_year = gg[gg["race_date"].dt.year == target_year]
         strong = recent_scored[(recent_scored["sof"].fillna(0) >= 70) | (recent_scored["race_type"].isin(["T100", "WTCS"]))]
+        championship_score = 0.0
+        if not recent_scored.empty:
+            champ_scores = recent_scored.apply(championship_result_score, axis=1)
+            championship_score = safe_float(champ_scores.max()) or 0.0
 
         weights = recent_scored["overall_weight"].astype(float).tolist()
         recent_score = weighted_avg(recent_scored["ors"].astype(float).tolist(), weights) or 0
@@ -1909,7 +1987,14 @@ def score_overall(
         if open_rank:
             open_rank_score = clamp(105 - open_rank * 3.5, 0, 100)
 
-        final = 0.45 * recent_score + 0.25 * current_year_score + 0.15 * best_recent + 0.10 * strong_score + 0.05 * open_rank_score
+        final = (
+            0.38 * recent_score
+            + 0.20 * current_year_score
+            + 0.16 * best_recent
+            + 0.14 * strong_score
+            + 0.08 * championship_score
+            + 0.04 * open_rank_score
+        )
         rows.append({
             "Athlete": name,
             "Athlete URL": url,
@@ -1918,6 +2003,7 @@ def score_overall(
             "Current Year ORS": round(current_year_score, 1) if current_year_score is not None else None,
             "Best Recent ORS": round(best_recent, 1),
             "Strong Field ORS": round(strong_score, 1),
+            "Championship Score": round(championship_score, 1),
             "Recent Races Used": len(recent_scored),
             "OpenRank": open_rank,
             "Last Race": clean_str(recent.iloc[0].get("race_name")) if len(recent) else "",
@@ -2297,14 +2383,14 @@ elif page == "Athlete Rankings":
     start_all["open_rank"] = None
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("Rows after gender filter", f"{post_gender_count:,}", help=f"Started with {pre_gender_count:,} rows in the date window. Unknown-gender rows are excluded here to prevent mixed Men/Women rankings.")
+    m1.metric("Rows after gender filter", f"{post_gender_count:,}", help=f"Started with {pre_gender_count:,} rows in the date window. Known opposite-gender rows are excluded; unknown-gender rows are kept if the race name is compatible so older imports do not hide athletes with missing gender.")
     m2.metric("Rows after race-family filter", f"{len(ranking_results):,}")
     m3.metric("Athletes ranked", f"{start_all['athlete_name'].nunique():,}")
 
     tabs = st.tabs(["🏆 Overall", "🏊 Swim", "🚴 Bike", "🏃 Run"])
     with tabs[0]:
         overall_all = score_overall(ranking_results, start_all, overrides, as_of_ts, year, recent_n_rank, drop_worst_rank)
-        display_table(overall_all.head(75), ["Rank", "Athlete", "Score", "Recent Form ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"], height=620)
+        display_table(overall_all.head(75), ["Rank", "Athlete", "Score", "Recent Form ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Championship Score", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"], height=620)
     for tab, disc in zip(tabs[1:], ["swim", "bike", "run"]):
         with tab:
             aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, ranking_gender, disc, min_field_size=5)
@@ -2381,7 +2467,9 @@ elif page in {"Race Dashboard", "Split Audit"}:
     duplicate_start_rows = imported_start_rows - len(start_athletes)
 
     # Use two full calendar years back through race day.
-    results_window = results[(results["race_date"].notna()) & (results["race_date"] >= window_start) & (results["race_date"] <= selected_date)].copy()
+    results_window_all = results[(results["race_date"].notna()) & (results["race_date"] >= window_start) & (results["race_date"] <= selected_date)].copy()
+    prediction_scope = prediction_scope_from_race(selected_race, None, None)
+    results_window = apply_prediction_scope(results_window_all, prediction_scope)
 
     render_race_card(selected_race, selected_gender, selected_date, window_start)
 
@@ -2398,11 +2486,14 @@ elif page in {"Race Dashboard", "Split Audit"}:
     }
 
     if page == "Race Dashboard":
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Start list athletes", len(start_athletes), delta=(f"{duplicate_start_rows} duplicate rows ignored" if duplicate_start_rows else None))
-        c2.metric("Result rows in window", len(results_window))
-        c3.metric("Overrides", len(overrides) if not overrides.empty else 0)
-        c4.metric("Low-sample warning threshold", min_field_size)
+        c2.metric("Prediction profile", prediction_scope)
+        c3.metric("Rows used", len(results_window), delta=(f"from {len(results_window_all):,}" if len(results_window_all) != len(results_window) else None))
+        c4.metric("Overrides", len(overrides) if not overrides.empty else 0)
+        c5.metric("Low-sample warning", min_field_size)
+        if prediction_scope == "Short Course / WTCS":
+            st.info("Short-course / WTCS predictor is restricted to Olympic, Sprint, WTCS, World Triathlon Cup, and Continental Cup evidence. 70.3 and full-distance rows are not used for this selected start list.")
 
         with st.expander("Split data health", expanded=False):
             health = []
@@ -2442,7 +2533,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
         overall = score_overall(results_window, start_athletes, overrides, selected_date, target_year, recent_n, drop_worst)
         display_table(
             overall.head(15),
-            ["Rank", "Athlete", "Score", "Recent Form ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "OpenRank", "Last Race", "Last Race Date"],
+            ["Rank", "Athlete", "Score", "Recent Form ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Championship Score", "Recent Races Used", "OpenRank", "Last Race", "Last Race Date"],
         )
 
         if not overall.empty:
