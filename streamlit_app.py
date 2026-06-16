@@ -397,7 +397,7 @@ def dedupe_start_athletes(start_athletes: pd.DataFrame) -> pd.DataFrame:
     if "open_rank" not in df.columns:
         df["open_rank"] = None
 
-    df["__athlete_url_key"] = df["athlete_url"].map(lambda x: (clean_str(x) or "").strip().lower())
+    df["__athlete_url_key"] = df["athlete_url"].map(lambda x: (canonical_athlete_url(x) or "").strip().lower())
     df["__athlete_name_key"] = df["athlete_name"].map(lambda x: (clean_str(x) or "").strip().lower())
     df["__athlete_key"] = df["__athlete_url_key"]
     missing_url = df["__athlete_key"].eq("")
@@ -423,7 +423,7 @@ def start_lookup_maps(start_athletes: pd.DataFrame) -> tuple[dict, dict]:
         return url_lookup, name_lookup
     for _, row in df.iterrows():
         row_dict = row.to_dict()
-        url = clean_str(row.get("athlete_url"))
+        url = canonical_athlete_url(row.get("athlete_url"))
         name = clean_str(row.get("athlete_name"))
         if url and url not in url_lookup:
             url_lookup[url] = row_dict
@@ -956,7 +956,7 @@ def athlete_upsert_rows_preserve_gender(rows: List[Dict[str, Any]]) -> List[Dict
     cleaned: List[Dict[str, Any]] = []
     seen = set()
     for row in rows or []:
-        athlete_url = clean_str(row.get("athlete_url"))
+        athlete_url = canonical_athlete_url(row.get("athlete_url"))
         athlete_name = clean_str(row.get("athlete_name"))
         if not athlete_url:
             continue
@@ -972,10 +972,226 @@ def athlete_upsert_rows_preserve_gender(rows: List[Dict[str, Any]]) -> List[Dict
     return cleaned
 
 
-def upsert_athletes_preserve_gender(rows: List[Dict[str, Any]]):
+def upsert_athletes_preserve_gender(rows: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """Merge athlete records by canonical URL without creating duplicates.
+
+    This does not rely only on Supabase upsert because older DBs may not yet
+    have a unique constraint on athletes.athlete_url. It first checks existing
+    athletes by canonical URL, updates the existing row when found, and inserts
+    only truly new athlete URLs.
+
+    Returns: (inserted_count, updated_count).
+    """
     prepared = athlete_upsert_rows_preserve_gender(rows)
-    if prepared:
-        upsert_chunks("athletes", prepared, on_conflict="athlete_url")
+    if not prepared:
+        return 0, 0
+
+    existing = load_table("athletes")
+    existing_map: Dict[str, Dict[str, Any]] = {}
+    if existing is not None and not existing.empty and "athlete_url" in existing.columns:
+        for _, r in existing.iterrows():
+            url = canonical_athlete_url(r.get("athlete_url"))
+            if not url or url in existing_map:
+                continue
+            existing_map[url] = r.to_dict()
+
+    to_insert: List[Dict[str, Any]] = []
+    updated = 0
+    for row in prepared:
+        url = canonical_athlete_url(row.get("athlete_url"))
+        if not url:
+            continue
+        row = dict(row)
+        row["athlete_url"] = url
+        existing_row = existing_map.get(url)
+        if existing_row:
+            payload: Dict[str, Any] = {"athlete_url": url}
+            incoming_name = clean_str(row.get("athlete_name"))
+            existing_name = clean_str(existing_row.get("athlete_name"))
+            incoming_gender = normalize_gender(row.get("gender"))
+            existing_gender = normalize_gender(existing_row.get("gender"))
+            if incoming_name and not existing_name:
+                payload["athlete_name"] = incoming_name
+            if incoming_gender in ["Men", "Women"] and existing_gender not in ["Men", "Women"]:
+                payload["gender"] = incoming_gender
+            existing_url_raw = clean_str(existing_row.get("athlete_url"))
+            if len(payload) > 1 or existing_url_raw != url:
+                try:
+                    if existing_row.get("id") is not None:
+                        supabase.table("athletes").update(payload).eq("id", existing_row.get("id")).execute()
+                    else:
+                        supabase.table("athletes").update(payload).eq("athlete_url", existing_row.get("athlete_url")).execute()
+                    updated += 1
+                except Exception:
+                    pass
+        else:
+            to_insert.append(row)
+            existing_map[url] = row
+
+    if to_insert:
+        insert_chunks("athletes", to_insert)
+    return len(to_insert), updated
+
+
+def start_list_import_key(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """Stable key for one athlete in one race/gender start list."""
+    race_name = (clean_str(row.get("race_name")) or "").strip().lower()
+    race_date = clean_str(row.get("race_date")) or ""
+    gender = normalize_gender(row.get("gender")) or ""
+    athlete_key = canonical_athlete_url(row.get("athlete_url")) or (clean_str(row.get("athlete_name")) or "").strip().lower()
+    return race_name, race_date, gender, athlete_key
+
+
+def dedupe_start_list_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove duplicate rows inside one uploaded start-list CSV."""
+    best: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    for row in rows or []:
+        row = dict(row)
+        row["athlete_url"] = canonical_athlete_url(row.get("athlete_url"))
+        key = start_list_import_key(row)
+        if not key[-1]:
+            continue
+        current = best.get(key)
+        if current is None:
+            best[key] = row
+            continue
+        row_rank = parse_int(row.get("open_rank")) or 999999
+        current_rank = parse_int(current.get("open_rank")) or 999999
+        if (row.get("athlete_url") and not current.get("athlete_url")) or row_rank < current_rank:
+            best[key] = row
+    return list(best.values())
+
+
+def merge_start_list_rows(rows: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """Insert only new start-list athletes; skip rows already present."""
+    rows = dedupe_start_list_rows(rows)
+    if not rows:
+        return 0, 0
+
+    existing = load_table("start_lists")
+    existing_keys = set()
+    if existing is not None and not existing.empty:
+        existing = canonicalize_athlete_url_column(existing)
+        for _, r in existing.iterrows():
+            existing_keys.add(start_list_import_key(r.to_dict()))
+
+    to_insert = []
+    skipped = 0
+    for row in rows:
+        key = start_list_import_key(row)
+        if key in existing_keys:
+            skipped += 1
+            continue
+        to_insert.append(row)
+        existing_keys.add(key)
+
+    if to_insert:
+        insert_chunks("start_lists", to_insert)
+    return len(to_insert), skipped
+
+
+def delete_matching_start_lists(rows: List[Dict[str, Any]]) -> int:
+    """Delete only the race/date/gender groups included in an uploaded start list."""
+    groups = set()
+    for row in rows or []:
+        race_name = clean_str(row.get("race_name"))
+        race_date = clean_str(row.get("race_date"))
+        gender = normalize_gender(row.get("gender"))
+        if race_name and race_date and gender:
+            groups.add((race_name, race_date, gender))
+    deleted_groups = 0
+    for race_name, race_date, gender in groups:
+        try:
+            supabase.table("start_lists").delete().eq("race_name", race_name).eq("race_date", race_date).eq("gender", gender).execute()
+            deleted_groups += 1
+        except Exception:
+            pass
+    return deleted_groups
+
+
+def merge_duplicate_athlete_urls() -> pd.DataFrame:
+    """Canonicalize athlete URLs and merge duplicate athlete records."""
+    athletes_df = load_table("athletes")
+    if athletes_df is None or athletes_df.empty or "athlete_url" not in athletes_df.columns:
+        return pd.DataFrame()
+
+    df = athletes_df.copy()
+    df["canonical_url"] = df["athlete_url"].map(canonical_athlete_url)
+    df = df[df["canonical_url"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    logs: List[Dict[str, Any]] = []
+    related_tables = ["athlete_results", "race_field_results", "start_lists", "race_overrides"]
+
+    for canonical_url, group in df.groupby("canonical_url", dropna=True):
+        original_urls = sorted({clean_str(x) for x in group["athlete_url"].tolist() if clean_str(x)})
+        needs_merge = len(group) > 1 or any(u != canonical_url for u in original_urls)
+        if not needs_merge:
+            continue
+
+        g = group.copy()
+        g["__is_canonical"] = g["athlete_url"].map(lambda x: 1 if clean_str(x) == canonical_url else 0)
+        g["__has_gender"] = g["gender"].map(lambda x: 1 if normalize_gender(x) in ["Men", "Women"] else 0) if "gender" in g.columns else 0
+        g["__has_name"] = g["athlete_name"].map(lambda x: 1 if clean_str(x) else 0) if "athlete_name" in g.columns else 0
+        g = g.sort_values(["__is_canonical", "__has_gender", "__has_name", "id"], ascending=[False, False, False, True])
+        keeper = g.iloc[0].to_dict()
+        keeper_id = keeper.get("id")
+
+        name_vals = [clean_str(x) for x in group.get("athlete_name", pd.Series(dtype=object)).tolist() if clean_str(x)]
+        gender_vals = [normalize_gender(x) for x in group.get("gender", pd.Series(dtype=object)).tolist() if normalize_gender(x) in ["Men", "Women"]]
+        merged_name = clean_str(keeper.get("athlete_name")) or (name_vals[0] if name_vals else None)
+        merged_gender = normalize_gender(keeper.get("gender")) or (gender_vals[0] if gender_vals else None)
+
+        ref_updates = 0
+        for table in related_tables:
+            for old_url in original_urls:
+                if not old_url or old_url == canonical_url:
+                    continue
+                try:
+                    supabase.table(table).update({"athlete_url": canonical_url}).eq("athlete_url", old_url).execute()
+                    ref_updates += 1
+                except Exception:
+                    pass
+
+        deleted = 0
+        for _, r in g.iterrows():
+            rid = r.get("id")
+            if keeper_id is not None and rid == keeper_id:
+                continue
+            if rid is None:
+                continue
+            try:
+                supabase.table("athletes").delete().eq("id", rid).execute()
+                deleted += 1
+            except Exception:
+                pass
+
+        payload = {"athlete_url": canonical_url}
+        if merged_name:
+            payload["athlete_name"] = merged_name
+        if merged_gender in ["Men", "Women"]:
+            payload["gender"] = merged_gender
+        try:
+            if keeper_id is not None:
+                supabase.table("athletes").update(payload).eq("id", keeper_id).execute()
+            else:
+                supabase.table("athletes").update(payload).eq("athlete_url", keeper.get("athlete_url")).execute()
+        except Exception:
+            pass
+
+        logs.append({
+            "Canonical URL": canonical_url,
+            "Kept Athlete": merged_name,
+            "Gender": merged_gender,
+            "Original URL Count": len(original_urls),
+            "Duplicate Athlete Rows Deleted": deleted,
+            "Related Table URL Updates Attempted": ref_updates,
+            "Original URLs": "; ".join(original_urls),
+        })
+
+    clear_cache()
+    return pd.DataFrame(logs)
 
 
 def infer_gender_from_race_name(value: Any) -> Optional[str]:
@@ -1005,7 +1221,7 @@ def build_gender_suggestions(athletes: pd.DataFrame, starts: pd.DataFrame, resul
         g = normalize_gender(gender)
         if g not in ["Men", "Women"]:
             return
-        u = clean_str(url)
+        u = canonical_athlete_url(url)
         n = clean_str(name)
         if not u and not n:
             return
@@ -1083,7 +1299,7 @@ def apply_gender_updates(suggestions: pd.DataFrame, include_medium: bool = False
     progress = st.progress(0, text="Applying gender updates...") if len(work) else None
     for idx, (_, r) in enumerate(work.iterrows(), start=1):
         g = normalize_gender(r.get("Suggested Gender"))
-        url = clean_str(r.get("Athlete URL"))
+        url = canonical_athlete_url(r.get("Athlete URL"))
         name = clean_str(r.get("Athlete"))
         if not g or (not url and not name):
             continue
@@ -1127,7 +1343,7 @@ def apply_gender_updates_from_rows(rows: List[Dict[str, Any]]) -> int:
             continue
         row = g.iloc[0]
         suggestions.append({
-            "Athlete URL": clean_str(row.get("athlete_url")),
+            "Athlete URL": canonical_athlete_url(row.get("athlete_url")),
             "Athlete": clean_str(row.get("athlete_name")),
             "Suggested Gender": next(iter(genders)),
             "Confidence": "High",
@@ -1145,15 +1361,39 @@ def apply_gender_updates_from_rows(rows: List[Dict[str, Any]]) -> int:
 # Permissioned athlete-profile gender backfill
 # ============================================================
 def canonical_athlete_url(url: Any) -> Optional[str]:
-    """Normalize PTN athlete URLs for profile lookups without losing variants."""
+    """Normalize athlete profile URLs so imports merge instead of duplicating.
+
+    PTN URLs can arrive as /athletes/slug, /en/athletes/slug, http vs https,
+    or with trailing slashes/query strings. The database should store one stable
+    key: https://protrinews.com/athletes/<slug>.
+    """
     s = clean_str(url)
     if not s:
         return None
-    if s.startswith("/athletes/") or s.startswith("/en/athletes/"):
+    s = s.strip()
+    s = re.sub(r"[?#].*$", "", s).rstrip("/")
+    if s.startswith("//"):
+        s = "https:" + s
+    if s.startswith("/"):
         s = "https://protrinews.com" + s
     if s.startswith("http://"):
         s = "https://" + s[len("http://"):]
-    return s.rstrip("/")
+
+    m = re.search(r"https://(?:www\.)?protrinews\.com/(?:en/)?athletes/([^/?#]+)", s, flags=re.I)
+    if m:
+        slug = m.group(1).strip().strip("/").lower()
+        if slug:
+            return f"https://protrinews.com/athletes/{slug}"
+    return s
+
+
+def canonicalize_athlete_url_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with athlete_url normalized when that column exists."""
+    if df is None or df.empty or "athlete_url" not in df.columns:
+        return df
+    out = df.copy()
+    out["athlete_url"] = out["athlete_url"].map(canonical_athlete_url)
+    return out
 
 
 def athlete_profile_url_candidates(url: Any) -> List[str]:
@@ -1368,7 +1608,7 @@ def normalize_athlete_results(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], L
     rows = []
     athletes = {}
     for _, r in df.iterrows():
-        athlete_url = clean_str(first_col(r, ["Athlete URL", "athlete_url", "Source URL", "Profile URL"]))
+        athlete_url = canonical_athlete_url(first_col(r, ["Athlete URL", "athlete_url", "Source URL", "Profile URL"]))
         athlete_name = clean_str(first_col(r, ["Athlete", "Athlete Name", "athlete_name", "Name"]))
         race_name = clean_str(first_col(r, ["Race", "Race Name", "race_name"]))
         race_url = clean_str(first_col(r, ["Race URL", "race_url"]))
@@ -1427,7 +1667,7 @@ def normalize_start_lists(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], List[
     rows = []
     athletes = {}
     for _, r in df.iterrows():
-        athlete_url = clean_str(first_col(r, ["Athlete URL", "athlete_url", "Profile URL"]))
+        athlete_url = canonical_athlete_url(first_col(r, ["Athlete URL", "athlete_url", "Profile URL"]))
         athlete_name = clean_str(first_col(r, ["Athlete", "Athlete Name", "athlete_name", "Name"]))
         race_name = clean_str(first_col(r, ["Race", "Race Name", "race_name"]))
         race_date = parse_date_value(first_col(r, ["Race Date", "Date", "race_date"]))
@@ -1452,7 +1692,7 @@ def normalize_race_overrides(df: pd.DataFrame) -> List[Dict[str, Any]]:
     rows = []
     for _, r in df.iterrows():
         rec = {
-            "athlete_url": clean_str(first_col(r, ["Athlete URL", "athlete_url", "Profile URL"])),
+            "athlete_url": canonical_athlete_url(first_col(r, ["Athlete URL", "athlete_url", "Profile URL"])),
             "race_date": parse_date_value(first_col(r, ["Date", "Race Date", "race_date"])),
             "race_name": clean_str(first_col(r, ["Race", "Race Name", "race_name"])),
             "applies_to": clean_str(first_col(r, ["Applies To", "applies_to"])),
@@ -1571,6 +1811,12 @@ def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
     athletes = load_table("athletes")
     overrides = load_table("race_overrides")
 
+    athlete_results = canonicalize_athlete_url_column(athlete_results)
+    race_field_results = canonicalize_athlete_url_column(race_field_results)
+    starts = canonicalize_athlete_url_column(starts)
+    athletes = canonicalize_athlete_url_column(athletes)
+    overrides = canonicalize_athlete_url_column(overrides)
+
     if not athlete_results.empty:
         athlete_results["data_source"] = "athlete_results"
     if not race_field_results.empty:
@@ -1607,7 +1853,7 @@ def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
             g = normalize_gender(r.get("gender"))
             if not g:
                 continue
-            u = clean_str(r.get("athlete_url"))
+            u = canonical_athlete_url(r.get("athlete_url"))
             n = clean_str(r.get("athlete_name"))
             if u:
                 gender_map[u] = g
@@ -1618,7 +1864,7 @@ def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
         results["race_date"] = pd.to_datetime(results["race_date"], errors="coerce")
         results["gender"] = results.apply(
             lambda r: normalize_gender(r.get("gender"))
-            or gender_map.get(clean_str(r.get("athlete_url")) or "")
+            or gender_map.get(canonical_athlete_url(r.get("athlete_url")) or "")
             or name_gender_map.get((clean_str(r.get("athlete_name")) or "").lower()),
             axis=1,
         )
@@ -3081,10 +3327,10 @@ elif page == "Import CSVs":
                     if replace:
                         delete_all("athlete_results")
                     insert_chunks("athlete_results", rows)
-                    upsert_athletes_preserve_gender(athlete_rows)
+                    athlete_inserted, athlete_updated = upsert_athletes_preserve_gender(athlete_rows)
                     clear_cache()
                     after_count = count_rows("athlete_results")
-                    st.success(f"Imported {len(rows):,} athlete result rows and upserted {len(athlete_rows):,} athletes.")
+                    st.success(f"Imported {len(rows):,} athlete result rows. Athletes merged: {athlete_inserted:,} new, {athlete_updated:,} updated.")
                     st.info(f"Supabase athlete_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
 
                 elif table_choice == "Race Field Results":
@@ -3093,22 +3339,30 @@ elif page == "Import CSVs":
                     if replace:
                         delete_all("race_field_results")
                     insert_chunks("race_field_results", rows)
-                    upsert_athletes_preserve_gender(athlete_rows)
+                    athlete_inserted, athlete_updated = upsert_athletes_preserve_gender(athlete_rows)
                     clear_cache()
                     after_count = count_rows("race_field_results")
-                    st.success(f"Imported {len(rows):,} race-field result rows and upserted {len(athlete_rows):,} athletes.")
+                    st.success(f"Imported {len(rows):,} race-field result rows. Athletes merged: {athlete_inserted:,} new, {athlete_updated:,} updated.")
                     st.info(f"Supabase race_field_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
 
                 elif table_choice == "Start Lists":
                     rows, athlete_rows = normalize_start_lists(df)
+                    rows = dedupe_start_list_rows(rows)
+                    inserted = len(rows)
+                    skipped = 0
+                    replaced_groups = 0
                     if replace:
-                        delete_all("start_lists")
-                    insert_chunks("start_lists", rows)
-                    upsert_athletes_preserve_gender(athlete_rows)
+                        replaced_groups = delete_matching_start_lists(rows)
+                        insert_chunks("start_lists", rows)
+                    else:
+                        inserted, skipped = merge_start_list_rows(rows)
+                    athlete_inserted, athlete_updated = upsert_athletes_preserve_gender(athlete_rows)
                     propagated = apply_gender_updates_from_rows(rows)
                     clear_cache()
-                    st.success(f"Imported {len(rows):,} start-list rows and upserted {len(athlete_rows):,} athletes.")
-                    st.info(f"Auto-propagated gender for {propagated:,} athletes from this start list import.")
+                    st.success(f"Imported {inserted:,} new start-list rows and skipped {skipped:,} duplicate rows.")
+                    if replace:
+                        st.info(f"Replace mode deleted existing rows for {replaced_groups:,} matching race/date/gender group(s), not the entire start_lists table.")
+                    st.info(f"Merged athletes by canonical URL: {athlete_inserted:,} new, {athlete_updated:,} updated. Auto-propagated gender for {propagated:,} athletes from this start list import.")
 
                 elif table_choice == "Race Overrides":
                     rows = normalize_race_overrides(df)
@@ -3209,6 +3463,24 @@ elif page == "Gender Tools":
     st.subheader("Gender coverage")
     display_table(coverage, list(coverage.columns), height=180)
 
+    st.markdown("---")
+    st.subheader("Athlete URL merge / duplicate cleanup")
+    st.caption("Use this after importing start lists/results if the same athlete exists as both /en/athletes/slug and /athletes/slug, or if old imports created duplicate athlete rows.")
+    if st.button("Merge duplicate athlete URLs and update related tables"):
+        merge_log = merge_duplicate_athlete_urls()
+        if merge_log.empty:
+            st.success("No duplicate/canonical athlete URL problems found.")
+        else:
+            st.success(f"Merged/canonicalized {len(merge_log):,} athlete URL groups.")
+            display_table(merge_log.head(1000), list(merge_log.columns), height=360)
+            st.download_button(
+                "Download athlete merge log CSV",
+                data=merge_log.to_csv(index=False).encode("utf-8"),
+                file_name="athlete_url_merge_log.csv",
+                mime="text/csv",
+            )
+
+    st.markdown("---")
     suggestions = build_gender_suggestions(raw_athletes, raw_starts, combined_results)
     if suggestions.empty:
         st.warning("No gender suggestions found yet. Import start lists with Gender = Men/Women first.")
@@ -3311,7 +3583,7 @@ elif page == "Gender Tools":
         manual_rows = []
         for _, r in manual.iterrows():
             g = normalize_gender(first_col(r, ["gender", "Gender", "sex", "Sex"]))
-            url = clean_str(first_col(r, ["athlete_url", "Athlete URL", "url", "URL"]))
+            url = canonical_athlete_url(first_col(r, ["athlete_url", "Athlete URL", "url", "URL"]))
             name = clean_str(first_col(r, ["athlete_name", "Athlete", "Name", "athlete"]))
             if g in ["Men", "Women"] and (url or name):
                 manual_rows.append({
