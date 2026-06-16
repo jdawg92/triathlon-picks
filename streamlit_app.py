@@ -77,8 +77,9 @@ def apply_dashboard_theme() -> None:
             height: 2.25rem;
             border-radius: 0.8rem;
             margin-right: 0.5rem;
-            background: linear-gradient(135deg, var(--ptn-red), var(--ptn-orange));
-            box-shadow: 0 0 30px rgba(239, 68, 68, 0.35);
+            background: rgba(30, 41, 59, 0.9);
+            border: 1px solid rgba(148, 163, 184, 0.20);
+            box-shadow: none;
         }
 
         .ptn-sidebar-brand .title {
@@ -229,12 +230,39 @@ def apply_dashboard_theme() -> None:
         }
 
         .stButton > button, .stDownloadButton > button {
-            border-radius: 999px;
-            border: 1px solid rgba(248, 113, 113, 0.45);
-            background: linear-gradient(135deg, rgba(239, 68, 68, 0.9), rgba(249, 115, 22, 0.9));
+            border-radius: 0.75rem;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            background: rgba(15, 23, 42, 0.72);
+            color: var(--ptn-text);
+            font-weight: 750;
+            box-shadow: none;
+        }
+
+        .stButton > button:hover, .stDownloadButton > button:hover {
+            border-color: rgba(148, 163, 184, 0.42);
+            background: rgba(30, 41, 59, 0.82);
             color: white;
-            font-weight: 800;
-            box-shadow: 0 10px 30px rgba(239, 68, 68, 0.25);
+        }
+
+        [data-testid="stSidebar"] .stButton > button {
+            justify-content: flex-start;
+            text-align: left;
+            padding-left: 0.85rem;
+            background: rgba(15, 23, 42, 0.66) !important;
+            border-color: rgba(148, 163, 184, 0.16) !important;
+            box-shadow: none !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button:hover {
+            background: rgba(30, 41, 59, 0.86) !important;
+            border-color: rgba(148, 163, 184, 0.34) !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button[kind="primary"],
+        [data-testid="stSidebar"] .stButton button[data-testid="baseButton-primary"] {
+            background: rgba(59, 130, 246, 0.16) !important;
+            border-color: rgba(96, 165, 250, 0.44) !important;
+            color: #EAF2FF !important;
         }
 
         .stSelectbox, .stSlider, .stRadio, .stFileUploader, .stCheckbox {
@@ -3247,7 +3275,15 @@ elif page == "Gender Tools":
         with b1:
             batch_size = st.number_input("Profile lookup batch size", min_value=1, max_value=200, value=25, step=5)
         with b2:
-            delay = st.number_input("Delay between profile checks, seconds", min_value=0.25, max_value=5.0, value=0.75, step=0.25)
+            delay = st.number_input(
+                "Delay between profile checks, seconds",
+                min_value=0.0,
+                max_value=5.0,
+                value=0.25,
+                step=0.25,
+                help="Optional throttle so the cleanup tool does not hit PTN too fast. Use 0 for no pause on small permissioned batches; 0.25–0.75 is safer for larger batches.",
+            )
+        st.caption("Delay is optional. It is just a throttle between profile requests so this stays a controlled missing-only cleanup instead of hammering PTN.")
         st.warning("This should be a permissioned, missing-only cleanup tool. Do not schedule it to crawl the whole database daily.")
         if st.button("Run permissioned profile gender backfill", type="primary"):
             log_df = apply_profile_gender_backfill(candidates, batch_size=int(batch_size), delay_seconds=float(delay))
