@@ -893,11 +893,18 @@ def build_split_audit(
                 "race_type": rt,
                 "gender": r.get("gender"),
                 "sof": safe_float(r.get("sof")),
+                # IMPORTANT: this is the number of rows currently imported for this race,
+                # not necessarily the full ProTriNews race field. Until we import/cache full race
+                # fields, treat this as sample coverage, not true field size.
                 "field_size": field_size,
+                "sample_size": field_size,
+                "field_source": "imported_sample",
+                "coverage_note": "Imported sample only; not full ProTriNews field",
                 "split_seconds": int(split_sec),
                 "split": format_seconds(split_sec),
                 "split_rank": idx,
                 "rank_display": f"{idx}/{field_size}",
+                "sample_rank_display": f"{idx}/{field_size}",
                 "pct_behind_fastest": pct_behind,
                 "gap_when_fastest_pct": gap_second,
                 "closeness_score": cs,
@@ -1292,7 +1299,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
         c1.metric("Start list athletes", len(start_athletes))
         c2.metric("Result rows in window", len(results_window))
         c3.metric("Overrides", len(overrides) if not overrides.empty else 0)
-        c4.metric("Low-sample threshold", min_field_size)
+        c4.metric("Low-sample warning threshold", min_field_size)
 
         with st.expander("Split data health", expanded=False):
             health = []
@@ -1316,7 +1323,15 @@ elif page in {"Race Dashboard", "Split Audit"}:
                     "Included start-list rows": start_included,
                 })
             st.dataframe(pd.DataFrame(health), use_container_width=True, hide_index=True)
-            st.caption("Included rows now require at least two same-race split rows. Small fields are included but capped/weighted down. If included start-list rows are 0, check split parsing, athlete URL/name matching, or DNF/status filters.")
+            st.caption("Important: sample size is the number of imported rows we currently have for that race, not the full ProTriNews field. Small imported samples are included but capped/weighted down until full race-field caching is added.")
+            with st.expander("Why sample size may not match ProTriNews field size", expanded=False):
+                st.write(
+                    "The dashboard currently scores split ranks using the rows imported into Supabase. "
+                    "So if IRONMAN 70.3 Warsaw 2025 has ~20 athletes on ProTriNews but only 3 of those athletes "
+                    "exist in our imported `athlete_results`, the audit will show sample size 3. "
+                    "That is not the true field size yet. The next data upgrade is to import/cache full race fields "
+                    "from every race URL so ranks and % behind fastest are computed against the actual field."
+                )
 
         st.subheader("Overall Picks")
         overall = score_overall(results_window, start_athletes, overrides, selected_date, target_year, recent_n, drop_worst)
@@ -1326,6 +1341,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
         )
 
         st.divider()
+        st.info("Split ranks currently use imported sample coverage, not full ProTriNews race fields. Use this MVP to validate logic; the next upgrade is full race-field import/caching.")
         tabs = st.tabs(["Fastest Swim", "Fastest Bike", "Fastest Run"])
         for tab, disc, title in zip(tabs, ["swim", "bike", "run"], ["Fastest Swim", "Fastest Bike", "Fastest Run"]):
             with tab:
@@ -1368,7 +1384,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                         ev = aud[mask].sort_values("race_date", ascending=False).head(5)
                         display_table(
                             ev,
-                            ["race_date", "race_name", "race_type", "sof", "field_size", "split", "rank_display", "pct_behind_fastest", "evidence_score", "final_cap", "included", "reason"],
+                            ["race_date", "race_name", "race_type", "sof", "sample_size", "split", "sample_rank_display", "pct_behind_fastest", "evidence_score", "final_cap", "included", "coverage_note", "reason"],
                         )
 
     else:
@@ -1395,7 +1411,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
             view = view.sort_values(["athlete_name", "race_date"], ascending=[True, False])
             display_table(
                 view,
-                ["athlete_name", "race_date", "race_name", "race_type", "sof", "field_size", "split", "rank_display", "pct_behind_fastest", "gap_when_fastest_pct", "closeness_score", "rank_score", "raw_score", "sof_cap", "field_cap", "race_type_cap", "final_cap", "evidence_score", "evidence_weight", "included", "reason"],
+                ["athlete_name", "race_date", "race_name", "race_type", "sof", "sample_size", "field_source", "split", "sample_rank_display", "pct_behind_fastest", "gap_when_fastest_pct", "closeness_score", "rank_score", "raw_score", "sof_cap", "field_cap", "race_type_cap", "final_cap", "evidence_score", "evidence_weight", "included", "coverage_note", "reason"],
                 height=650,
             )
 
