@@ -2828,12 +2828,23 @@ def add_split_openrank_scores(audit: pd.DataFrame) -> pd.DataFrame:
     if audit is None or audit.empty:
         return pd.DataFrame() if audit is None else audit
     out = audit.copy()
+
+    # Pandas/Arrow can infer an all-empty column as float64.  The tier column
+    # later receives text values such as Gold/Silver/Bronze, so force it to an
+    # object/string-safe dtype before row assignment.
+    if "openrank_tier" not in out.columns:
+        out["openrank_tier"] = ""
+    else:
+        out["openrank_tier"] = out["openrank_tier"].fillna("").astype("object")
+
     for c in [
-        "openrank_tier", "openrank_position_score", "openrank_sof_score",
+        "openrank_position_score", "openrank_sof_score",
         "openrank_time_score", "split_openrank_score", "baseline_split"
     ]:
         if c not in out.columns:
             out[c] = np.nan
+        else:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
     if "race_key_calc" not in out.columns:
         out["race_key_calc"] = (
             out.get("race_name", pd.Series("", index=out.index)).fillna("").astype(str)
