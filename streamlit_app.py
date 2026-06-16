@@ -823,18 +823,47 @@ def championship_result_score(row: pd.Series) -> float:
         return base
     return base * 0.8
 
-def json_safe_row(row: pd.Series) -> Dict[str, Any]:
-    out = {}
-    for k, v in row.to_dict().items():
+def json_safe_value(v: Any) -> Any:
+    """Convert Python/Pandas/Numpy values into JSON-safe Supabase values."""
+    if isinstance(v, dict):
+        return {str(k): json_safe_value(val) for k, val in v.items()}
+    if isinstance(v, (list, tuple, set)):
+        return [json_safe_value(x) for x in v]
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if isinstance(v, (pd.Timestamp, datetime, date)):
+        return v.isoformat()
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        f = float(v)
+        return None if math.isnan(f) else f
+    if isinstance(v, (np.bool_, bool)):
+        return bool(v)
+    if isinstance(v, (int, float, str)):
         if isinstance(v, float) and math.isnan(v):
-            out[str(k)] = None
-        elif isinstance(v, (np.integer,)):
-            out[str(k)] = int(v)
-        elif isinstance(v, (np.floating,)):
-            out[str(k)] = float(v)
-        else:
-            out[str(k)] = None if pd.isna(v) else str(v)
-    return out
+            return None
+        return v
+    return str(v)
+
+
+def json_safe_row(row: Any) -> Dict[str, Any]:
+    """Convert a Series or dict into a JSON-safe dict for model_cache.rows."""
+    if isinstance(row, pd.Series):
+        items = row.to_dict().items()
+    elif isinstance(row, dict):
+        items = row.items()
+    else:
+        try:
+            items = dict(row).items()
+        except Exception:
+            return {}
+    return {str(k): json_safe_value(v) for k, v in items}
 
 
 def parse_raw_payload(value: Any) -> Dict[str, Any]:
@@ -3363,7 +3392,7 @@ def cache_safe_rows(df: pd.DataFrame, limit: Optional[int] = None) -> List[Dict[
     out = df.copy()
     if isinstance(limit, int) and limit > 0:
         out = out.head(limit).copy()
-    return [json_safe_row(row.to_dict()) for _, row in out.iterrows()]
+    return [json_safe_row(row) for _, row in out.iterrows()]
 
 
 def cache_rows_to_df(rows: Any) -> pd.DataFrame:
@@ -3438,6 +3467,24 @@ def clear_model_cache(cache_kind: Optional[str] = None) -> None:
         supabase.table("model_cache").delete().eq("cache_kind", cache_kind).execute()
     else:
         supabase.table("model_cache").delete().neq("cache_key", "__never__").execute()
+
+
+def distinct_start_list_races(starts: pd.DataFrame) -> pd.DataFrame:
+    """Return one row per imported race/date/gender for cache rebuilds."""
+    if starts is None or starts.empty:
+        return pd.DataFrame()
+    df = starts.copy()
+    for col in ["race_name", "race_date", "gender"]:
+        if col not in df.columns:
+            return pd.DataFrame()
+    df = df[df["race_name"].notna() & (df["race_name"].astype(str).str.strip() != "")].copy()
+    if df.empty:
+        return pd.DataFrame()
+    df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
+    df["gender"] = df["gender"].map(lambda x: normalize_gender(x) or clean_str(x))
+    df = df[df["gender"].isin(["Men", "Women"])].copy()
+    df = df.drop_duplicates(subset=["race_name", "race_date", "gender"]).copy()
+    return df.sort_values(["race_date", "race_name", "gender"], na_position="last")
 
 
 def ranking_view_to_kind(view_label: str) -> str:
@@ -4105,6 +4152,50 @@ elif page == "Model Cache":
 
     with tab_manage:
         st.subheader("Manage Cache")
+        st.caption("Refresh database cache only clears Streamlit's in-memory data. It does not rebuild saved model outputs. Use the rebuild buttons below to regenerate saved rankings/predictions.")
+
+        with st.expander("Rebuild everything", expanded=True):
+            st.warning("This rebuilds all athlete ranking caches and all imported start-list race prediction caches. It can take several minutes on large data sets.")
+            b1, b2, b3, b4 = st.columns(4)
+            all_as_of = b1.date_input("As of date", value=date.today(), key="cache_all_asof")
+            all_top_n = b2.slider("Top scores used", 3, 8, 4, key="cache_all_topn")
+            all_min_field = b3.slider("Low-sample warning", 3, 15, 5, key="cache_all_minfield")
+            all_sof = b4.slider("Strong SOF", 55, 90, 70, key="cache_all_sof")
+            race_rebuilds = distinct_start_list_races(starts)
+            ranking_total = len(["Men", "Women"]) * len(RANKING_FAMILIES) * len(["overall", "swim", "bike", "run"])
+            race_total = len(race_rebuilds)
+            st.caption(f"Will rebuild {ranking_total} ranking caches and {race_total} race prediction caches.")
+            if st.button("Rebuild everything now", type="primary", width="stretch"):
+                progress = st.progress(0, text="Starting full model cache rebuild...")
+                total = max(ranking_total + race_total, 1)
+                done = 0
+                logs = []
+                for g in ["Men", "Women"]:
+                    for fam in RANKING_FAMILIES:
+                        for vk in ["overall", "swim", "bike", "run"]:
+                            try:
+                                rows, metrics = save_athlete_ranking_cache(results, overrides, g, fam, pd.Timestamp(all_as_of), all_top_n, vk)
+                                logs.append({"Cache": "athlete_ranking", "Gender": g, "Race Family": fam, "View": vk, "Race": "", "Rows Saved": rows, "Status": "saved", **metrics})
+                            except Exception as e:
+                                logs.append({"Cache": "athlete_ranking", "Gender": g, "Race Family": fam, "View": vk, "Race": "", "Rows Saved": 0, "Status": f"error: {e}"})
+                            done += 1
+                            progress.progress(done / total, text=f"Built {done}/{total}: rankings · {g} · {fam} · {vk}")
+                for _, r in race_rebuilds.iterrows():
+                    race_name = r.get("race_name")
+                    race_date = r.get("race_date")
+                    race_gender = r.get("gender")
+                    try:
+                        rows, meta, _ = save_race_prediction_cache(results, starts, overrides, race_name, race_date, race_gender, all_top_n, all_min_field, all_sof)
+                        logs.append({"Cache": "race_prediction", "Gender": race_gender, "Race Family": meta.get("prediction_scope", ""), "View": "all", "Race": race_name, "Rows Saved": rows, "Status": "saved", **meta})
+                    except Exception as e:
+                        logs.append({"Cache": "race_prediction", "Gender": race_gender, "Race Family": "", "View": "all", "Race": race_name, "Rows Saved": 0, "Status": f"error: {e}"})
+                    done += 1
+                    progress.progress(done / total, text=f"Built {done}/{total}: race prediction · {race_gender} · {race_name}")
+                progress.empty()
+                clear_cache()
+                st.success("Finished full model cache rebuild.")
+                display_table(pd.DataFrame(logs), ["Cache", "Gender", "Race Family", "View", "Race", "Rows Saved", "Status", "rows_after_gender", "rows_after_family", "athletes_ranked", "start_list_athletes", "rows_used", "prediction_scope"], height=520)
+
         try:
             cache_df = load_table("model_cache")
         except Exception:
