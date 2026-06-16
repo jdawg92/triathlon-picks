@@ -104,6 +104,24 @@ def is_bad_status(status: Any, place: Any = None) -> bool:
     return any(token in combined for token in ["DNF", "DNS", "DSQ", "DQ", "DNQ"])
 
 
+def is_excluded_for_split_status(status: Any, place: Any = None, discipline: str = "") -> bool:
+    """Return whether a result status should exclude a discipline split.
+
+    Overall scoring should never use DNF/DNS/DSQ. Split scoring is more
+    nuanced: if an athlete DNF'd after the swim or bike, the completed split
+    can still be useful for fastest-split prediction. DNS/DSQ/DQ/DNQ remain
+    excluded for every discipline. Run splits from DNF rows are excluded by
+    default because a final DNF usually means the run was incomplete or not
+    comparable.
+    """
+    combined = " ".join([clean_str(status) or "", clean_str(place) or ""]).upper()
+    if any(token in combined for token in ["DNS", "DSQ", "DQ", "DNQ"]):
+        return True
+    if "DNF" in combined:
+        return discipline == "run"
+    return False
+
+
 def parse_place(value: Any) -> Optional[str]:
     s = clean_str(value)
     if not s:
@@ -563,6 +581,83 @@ def normalize_scoring_settings(df: pd.DataFrame) -> List[Dict[str, Any]]:
         })
     return rows
 
+
+
+def normalized_race_identity_name(value: Any) -> str:
+    """Normalize race names enough to group the same race across athletes."""
+    txt = clean_str(value) or ""
+    txt = txt.lower()
+    txt = re.sub(r"[—–-]\\s*(men|mens|women|womens|male|female)('s)?\\b", "", txt)
+    txt = re.sub(r"\\b(men|mens|women|womens|male|female)('s)?\\b", "", txt)
+    txt = re.sub(r"[^a-z0-9]+", " ", txt)
+    txt = re.sub(r"\\s+", " ", txt).strip()
+    return txt
+
+
+def build_race_sof_fill_key(row: pd.Series, include_gender: bool = True) -> str:
+    """Create a stable key for race-level SOF backfill.
+
+    PTN sometimes stores SOF on some athletes' rows for the same race but leaves
+    it blank on other athletes' rows. SOF is race-level evidence, not athlete-
+    level evidence, so we should copy the canonical race SOF to the missing rows.
+    """
+    race_url = clean_str(row.get("race_url"))
+    date_part = "" if pd.isna(row.get("race_date")) else str(pd.to_datetime(row.get("race_date")).date())
+    gender_part = normalize_gender(row.get("gender")) if include_gender else None
+    gender_part = gender_part or "unknown"
+    if race_url:
+        return "|".join(["url", race_url, gender_part])
+    name_part = normalized_race_identity_name(row.get("race_name"))
+    distance_part = clean_str(row.get("distance")) or ""
+    type_part = clean_str(row.get("race_type")) or ""
+    return "|".join(["name", name_part, date_part, distance_part, type_part, gender_part])
+
+
+def fill_missing_sof_from_same_race(results: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing SOF from other athletes in the same race.
+
+    This fixes cases such as one athlete's IRONMAN 70.3 Aix-en-Provence row
+    having blank SOF while other athletes from the same race have SOF 81.5.
+    It also records the source so the audit can show whether SOF was original
+    or filled from the race-level canonical value.
+    """
+    if results.empty or "sof" not in results.columns:
+        return results
+
+    out = results.copy()
+    out["sof_original"] = out["sof"]
+    out["sof_source"] = np.where(out["sof"].notna(), "original", "missing")
+
+    valid_sof = pd.to_numeric(out["sof"], errors="coerce")
+    valid_mask = valid_sof.between(1, 100, inclusive="both")
+    out.loc[~valid_mask, "sof"] = np.nan
+
+    # First try same race + same known gender. This avoids using women's SOF as
+    # a men's race SOF when both share similar naming.
+    out["_sof_fill_key_gender"] = out.apply(lambda r: build_race_sof_fill_key(r, include_gender=True), axis=1)
+    med_by_gender = out.loc[out["sof"].notna()].groupby("_sof_fill_key_gender")["sof"].median()
+    missing = out["sof"].isna()
+    if missing.any():
+        fill_vals = out.loc[missing, "_sof_fill_key_gender"].map(med_by_gender)
+        fill_mask = fill_vals.notna()
+        idx = fill_vals[fill_mask].index
+        out.loc[idx, "sof"] = fill_vals.loc[idx].astype(float)
+        out.loc[idx, "sof_source"] = "filled_same_race_gender"
+
+    # If gender is unknown on some rows, fallback to same race ignoring gender.
+    out["_sof_fill_key_all"] = out.apply(lambda r: build_race_sof_fill_key(r, include_gender=False), axis=1)
+    med_all = out.loc[out["sof"].notna()].groupby("_sof_fill_key_all")["sof"].median()
+    missing = out["sof"].isna()
+    if missing.any():
+        fill_vals = out.loc[missing, "_sof_fill_key_all"].map(med_all)
+        fill_mask = fill_vals.notna()
+        idx = fill_vals[fill_mask].index
+        out.loc[idx, "sof"] = fill_vals.loc[idx].astype(float)
+        out.loc[idx, "sof_source"] = "filled_same_race"
+
+    out = out.drop(columns=["_sof_fill_key_gender", "_sof_fill_key_all"], errors="ignore")
+    return out
+
 # ============================================================
 # Scoring helpers
 # ============================================================
@@ -611,6 +706,11 @@ def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
         for col in ["sof", "ors"]:
             if col in results.columns:
                 results[col] = pd.to_numeric(results[col], errors="coerce")
+
+        # SOF is race-level evidence. PTN/imported CSV rows can have SOF blank
+        # for one athlete while other athletes from the exact same race have it.
+        # Fill missing SOF from the canonical same-race value before scoring.
+        results = fill_missing_sof_from_same_race(results)
 
         # Guarantee split columns exist and recover missing values from raw CSV payloads.
         # Force float dtype before assignment. Pandas 3.x raises if object/NA
@@ -730,7 +830,9 @@ def race_type_cap(race_type: str, discipline: str) -> float:
     if rt in {"70.3", "challenge middle", "t100"}:
         return 100
     if rt == "full":
-        return 75 if discipline in {"swim", "bike"} else 70
+        # Full-distance races transfer very well for swim/bike strength.
+        # The run is a different fatigue profile, so keep it lower for 70.3.
+        return 95 if discipline == "swim" else 92 if discipline == "bike" else 70
     if rt == "wtcs":
         return 95 if discipline == "swim" else 70 if discipline == "run" else 0
     if "world triathlon cup" in rt:
@@ -749,7 +851,9 @@ def race_type_weight(race_type: str, discipline: str) -> float:
     if rt in {"70.3", "challenge middle", "t100"}:
         return 1.0
     if rt == "full":
-        return 0.75 if discipline in {"swim", "bike"} else 0.70
+        # Full IM swim/bike are high-value non-draft evidence for 70.3.
+        # Full IM run transfers less directly to 70.3 run speed.
+        return 0.95 if discipline == "swim" else 0.90 if discipline == "bike" else 0.55
     if rt == "wtcs":
         return 0.90 if discipline == "swim" else 0.65 if discipline == "run" else 0.0
     if "world triathlon cup" in rt:
@@ -779,23 +883,24 @@ def recency_weight(race_date: Any, target_date: pd.Timestamp) -> float:
 def is_strong_split_evidence(row: pd.Series, discipline: str, strong_sof_threshold: float = 70.0) -> bool:
     """Return whether this split row should drive rankings.
 
-    Low-SOF wins are useful audit evidence, but they should not outrank athletes
-    who are consistently close in T100 / WTCS swim / high-SOF 70.3 fields.
-    This function creates the quality gate used by the split ranking model.
+    Strong evidence should be the races that actually translate to the target
+    70.3 prediction. For split picks, full-distance swim/bike with good SOF is
+    strong evidence. Full-distance run is useful but not strong by default
+    because the marathon fatigue profile does not transfer cleanly to a 70.3
+    half-marathon split.
     """
     rt = (clean_str(row.get("race_type")) or "").lower()
     sof = safe_float(row.get("sof"))
 
-    # T100 / PTO fields are almost always relevant for 70.3 split forecasting.
     if rt == "t100":
         return True
 
-    # True WTCS is high-value for swim. It is excluded for bike elsewhere,
-    # and its run carries less 70.3 relevance, so don't auto-promote run.
     if discipline == "swim" and rt == "wtcs":
         return True
 
-    # For normal non-draft races, SOF is the main quality gate.
+    if rt == "full":
+        return discipline in {"swim", "bike"} and sof is not None and sof >= strong_sof_threshold
+
     if sof is not None and sof >= strong_sof_threshold:
         return True
 
@@ -809,6 +914,8 @@ def evidence_quality_label(row: pd.Series, discipline: str, strong_sof_threshold
         if rt == "t100" or (discipline == "swim" and rt == "wtcs") or (sof is not None and sof >= 80):
             return "Premium"
         return "Strong"
+    if rt == "full" and discipline == "run":
+        return "Medium" if sof is not None and sof >= 70 else "Low/unknown"
     if sof is not None and sof >= 60:
         return "Medium"
     if rt in {"world triathlon cup", "continental cup", "sprint", "olympic"}:
@@ -886,6 +993,7 @@ def build_split_audit(
     if discipline == "bike":
         draft_bike_mask = df["race_type"].fillna("").str.lower().str.contains("wtcs|world triathlon|continental|draft")
     df["draft_bike_excluded"] = draft_bike_mask
+    df["split_status_excluded"] = df.apply(lambda r: is_excluded_for_split_status(r.get("status"), r.get("place"), discipline), axis=1)
 
     if df.empty:
         return pd.DataFrame()
@@ -898,7 +1006,7 @@ def build_split_audit(
         # Rank and fastest calculations use only rows that are eligible for scoring.
         # Bad-status rows and draft-legal bike rows remain visible, but they do not
         # create/alter the race-relative split ranking.
-        scoring_g = g[(~g.get("bad_status", False).astype(bool)) & (~g["draft_bike_excluded"].astype(bool))].copy()
+        scoring_g = g[(~g.get("split_status_excluded", False).astype(bool)) & (~g["draft_bike_excluded"].astype(bool))].copy()
         scoring_g = scoring_g.sort_values(split_col, ascending=True)
 
         fastest = safe_float(scoring_g[split_col].min()) if not scoring_g.empty else None
@@ -914,6 +1022,7 @@ def build_split_audit(
 
             rt = clean_str(r.get("race_type")) or "Unknown"
             bad_status = bool(r.get("bad_status", False))
+            split_status_excluded = bool(r.get("split_status_excluded", False))
             draft_bike = bool(r.get("draft_bike_excluded", False))
             excluded_override, override_mult, override_reason = match_override(r, overrides, discipline)
 
@@ -956,8 +1065,10 @@ def build_split_audit(
                     ew *= 0.65
 
             reason = []
-            if bad_status:
-                reason.append("bad status excluded")
+            if split_status_excluded:
+                reason.append("status excluded for this split")
+            elif bad_status:
+                reason.append("DNF row allowed for completed split")
             if draft_bike:
                 reason.append("draft-legal bike excluded")
             if field_size < 1:
@@ -986,7 +1097,10 @@ def build_split_audit(
                 "place": r.get("place"),
                 "status": r.get("status"),
                 "bad_status": bad_status,
+                "split_status_excluded": split_status_excluded,
                 "sof": safe_float(r.get("sof")),
+                "sof_source": r.get("sof_source"),
+                "sof_original": safe_float(r.get("sof_original")),
                 "field_size": field_size,
                 "sample_size": field_size,
                 "field_source": "imported_sample",
@@ -1010,7 +1124,7 @@ def build_split_audit(
                 "final_cap": final_cap,
                 "evidence_score": final_score,
                 "evidence_weight": ew,
-                "included": bool(included and not bad_status and not draft_bike),
+                "included": bool(included and not split_status_excluded and not draft_bike),
                 "reason": "; ".join(reason),
             })
 
@@ -1530,7 +1644,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
         )
 
         st.divider()
-        st.info("Split ranks now prioritize strong-field evidence: T100, high-SOF races, and true WTCS swim. Low-SOF wins are included as supporting evidence but capped so they do not outrank repeated strong-field proof. Imported sample coverage is still not the full ProTriNews field yet.")
+        st.info("Split ranks use each discipline's own recent valid split rows — not the athlete's top overall races. Swim uses recent swim evidence, bike uses recent bike evidence, and run uses recent run evidence. Full-distance swim/bike now count as high-value non-draft evidence; full-distance run is weighted lower because it transfers less directly to 70.3 speed. Imported sample coverage is still not the full ProTriNews field yet.")
         tabs = st.tabs(["Fastest Swim", "Fastest Bike", "Fastest Run"])
         for tab, disc, title in zip(tabs, ["swim", "bike", "run"], ["Fastest Swim", "Fastest Bike", "Fastest Run"]):
             with tab:
@@ -1542,7 +1656,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                     ["Rank", "Athlete", "Score", "Confidence", "Strong Evidence Count", "Evidence Count", "Strong Field Score", "Strong Avg Behind %", "Strong Top 3 %", "Strong Fastest %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
                     key=f"split_pick_table_{disc}",
                 )
-                st.caption("Click an athlete row above to show their last 5 valid split rows. Score is based on recent race-relative split performance; % behind fastest is the main metric.")
+                st.caption("Click an athlete row above to show the recent split rows used for that discipline. These are not the athlete's best overall races; each split is scored from its own swim/bike/run evidence.")
 
                 if not scored_top.empty:
                     aud = audit_by_disc[disc]
@@ -1576,12 +1690,22 @@ elif page in {"Race Dashboard", "Split Audit"}:
                             mask = url_mask | name_mask
                         else:
                             mask = name_mask
-                        ev = aud[mask].sort_values("race_date", ascending=False).head(5)
+                        athlete_audit = aud[mask].sort_values("race_date", ascending=False)
+                        evidence_view = st.radio(
+                            f"{selected_athlete} evidence rows",
+                            ["Used in score", "All evaluated rows"],
+                            horizontal=True,
+                            key=f"evidence_view_{disc}_{selected_athlete}",
+                        )
+                        if evidence_view == "Used in score":
+                            ev = athlete_audit[athlete_audit["included"]].head(5)
+                        else:
+                            ev = athlete_audit.head(8)
                         if ev.empty:
-                            st.warning("No split evidence found for the selected athlete. Check athlete URL/name matching in the imported CSVs.")
+                            st.warning("No included split evidence found for the selected athlete. Switch to 'All evaluated rows' to see excluded DNF/DNS/DSQ, draft-legal, or invalid rows.")
                         display_table(
                             ev,
-                            ["race_date", "race_name", "race_type", "quality_tier", "strong_evidence", "sof", "sample_size", "split", "sample_rank_display", "pct_behind_fastest", "evidence_score", "final_cap", "included", "coverage_note", "reason"],
+                            ["race_date", "race_name", "race_type", "quality_tier", "strong_evidence", "place", "status", "bad_status", "split_status_excluded", "sof", "sof_source", "sample_size", "split", "sample_rank_display", "pct_behind_fastest", "evidence_score", "final_cap", "included", "coverage_note", "reason"],
                         )
 
     else:
@@ -1608,7 +1732,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
             view = view.sort_values(["athlete_name", "race_date"], ascending=[True, False])
             display_table(
                 view,
-                ["athlete_name", "race_date", "race_name", "race_type", "quality_tier", "strong_evidence", "place", "status", "bad_status", "sof", "sample_size", "field_source", "split", "sample_rank_display", "pct_behind_fastest", "gap_when_fastest_pct", "closeness_score", "rank_score", "raw_score", "sof_cap", "field_cap", "race_type_cap", "final_cap", "evidence_score", "evidence_weight", "included", "coverage_note", "reason"],
+                ["athlete_name", "race_date", "race_name", "race_type", "quality_tier", "strong_evidence", "place", "status", "bad_status", "split_status_excluded", "sof", "sof_source", "sof_original", "sample_size", "field_source", "split", "sample_rank_display", "pct_behind_fastest", "gap_when_fastest_pct", "closeness_score", "rank_score", "raw_score", "sof_cap", "field_cap", "race_type_cap", "final_cap", "evidence_score", "evidence_weight", "included", "coverage_note", "reason"],
                 height=650,
             )
 
@@ -1624,7 +1748,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                         st.caption("This is the full imported career data in the analysis window. It explains why rows may not appear as included scoring rows: DNF/DNS/DSQ, missing split, draft-legal bike, or invalid split parsing.")
                         display_table(
                             raw,
-                            ["race_date", "race_name", "race_type", "distance", "place", "status", "bad_status", "sof", "ors", f"{disc}_split", "swim_seconds", "bike_seconds", "run_seconds"],
+                            ["race_date", "race_name", "race_type", "distance", "place", "status", "bad_status", "sof", "sof_source", "sof_original", "ors", f"{disc}_split", "swim_seconds", "bike_seconds", "run_seconds"],
                             height=400,
                         )
 
