@@ -284,6 +284,52 @@ def json_safe_row(row: pd.Series) -> Dict[str, Any]:
     return out
 
 
+def parse_raw_payload(value: Any) -> Dict[str, Any]:
+    """Return the original imported CSV row stored in athlete_results.raw.
+
+    Supabase may return jsonb as a dict, but older imports or previews can come
+    back as JSON strings. This lets the dashboard re-parse split times without
+    requiring a full CSV re-import.
+    """
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    if isinstance(value, float) and math.isnan(value):
+        return {}
+    if isinstance(value, str):
+        try:
+            data = json.loads(value)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def first_from_mapping(mapping: Dict[str, Any], aliases: Iterable[str]) -> Any:
+    if not mapping:
+        return None
+    normalized = {str(k).strip().lower(): k for k in mapping.keys()}
+    for alias in aliases:
+        key = alias.strip().lower()
+        if key in normalized:
+            return mapping[normalized[key]]
+    return None
+
+
+def recover_split_from_raw(row: pd.Series, discipline: str) -> Optional[int]:
+    raw = parse_raw_payload(row.get("raw"))
+    if not raw:
+        return None
+    aliases = {
+        "swim": ["Swim", "Swim Split", "swim", "swim_seconds"],
+        "bike": ["Bike", "Bike Split", "bike", "bike_seconds"],
+        "run": ["Run", "Run Split", "run", "run_seconds"],
+    }[discipline]
+    value = first_from_mapping(raw, aliases)
+    return parse_split_seconds(value, discipline, clean_str(row.get("race_type")))
+
+
 def read_uploaded_csv(uploaded_file) -> pd.DataFrame:
     try:
         return pd.read_csv(uploaded_file)
@@ -528,9 +574,22 @@ def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
             lambda r: normalize_race_type(r.get("race_name"), r.get("race_type"), r.get("distance")),
             axis=1,
         )
-        for col in ["sof", "ors", "swim_seconds", "bike_seconds", "run_seconds"]:
+        for col in ["sof", "ors"]:
             if col in results.columns:
                 results[col] = pd.to_numeric(results[col], errors="coerce")
+
+        # Guarantee split columns exist and recover missing values from raw CSV payloads.
+        # This avoids needing to re-import if the first importer missed a split value.
+        for disc in ["swim", "bike", "run"]:
+            col = f"{disc}_seconds"
+            if col not in results.columns:
+                results[col] = np.nan
+            results[col] = pd.to_numeric(results[col], errors="coerce")
+            missing = results[col].isna()
+            if missing.any() and "raw" in results.columns:
+                results.loc[missing, col] = results[missing].apply(lambda r, d=disc: recover_split_from_raw(r, d), axis=1)
+            results[col] = pd.to_numeric(results[col], errors="coerce")
+
         results["bad_status"] = results.apply(lambda r: is_bad_status(r.get("status"), r.get("place")), axis=1)
         results["place_num"] = results["place"].map(parse_place_number)
 
@@ -1150,6 +1209,30 @@ elif page in {"Race Dashboard", "Split Audit"}:
         c2.metric("Result rows in window", len(results_window))
         c3.metric("Overrides", len(overrides) if not overrides.empty else 0)
         c4.metric("Min field size", min_field_size)
+
+        with st.expander("Split data health", expanded=False):
+            health = []
+            for disc in ["swim", "bike", "run"]:
+                split_col = f"{disc}_seconds"
+                valid_rows = int(results_window[split_col].notna().sum()) if split_col in results_window.columns else 0
+                audit_rows = len(audit_by_disc.get(disc, pd.DataFrame()))
+                included_rows = int(audit_by_disc[disc]["included"].sum()) if not audit_by_disc.get(disc, pd.DataFrame()).empty and "included" in audit_by_disc[disc].columns else 0
+                start_included = 0
+                if not audit_by_disc.get(disc, pd.DataFrame()).empty:
+                    aud_tmp = audit_by_disc[disc]
+                    start_urls_tmp = set(start_athletes["athlete_url"].dropna().astype(str).tolist()) if "athlete_url" in start_athletes else set()
+                    start_names_tmp = set(start_athletes["athlete_name"].dropna().astype(str).str.lower().tolist()) if "athlete_name" in start_athletes else set()
+                    start_mask = (aud_tmp["athlete_url"].isin(start_urls_tmp)) | (aud_tmp["athlete_name"].fillna("").str.lower().isin(start_names_tmp))
+                    start_included = int((start_mask & aud_tmp["included"]).sum())
+                health.append({
+                    "Discipline": disc,
+                    "Valid result rows in window": valid_rows,
+                    "Audit rows": audit_rows,
+                    "Included audit rows": included_rows,
+                    "Included start-list rows": start_included,
+                })
+            st.dataframe(pd.DataFrame(health), use_container_width=True, hide_index=True)
+            st.caption("If included start-list rows are 0, the split picks will be blank. Lower the minimum same-race field size or check imported split columns/raw CSV values.")
 
         st.subheader("Overall Picks")
         overall = score_overall(results_window, start_athletes, overrides, selected_date, target_year, recent_n, drop_worst)
