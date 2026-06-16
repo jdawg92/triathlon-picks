@@ -1098,6 +1098,171 @@ def apply_gender_updates_from_rows(rows: List[Dict[str, Any]]) -> int:
 # ============================================================
 # CSV normalizers
 # ============================================================
+
+# ============================================================
+# Permissioned athlete-profile gender backfill
+# ============================================================
+def canonical_athlete_url(url: Any) -> Optional[str]:
+    """Normalize PTN athlete URLs enough for a one-time profile lookup."""
+    s = clean_str(url)
+    if not s:
+        return None
+    if s.startswith("/athletes/") or s.startswith("/en/athletes/"):
+        s = "https://protrinews.com" + s
+    if s.startswith("http://"):
+        s = "https://" + s[len("http://"):]
+    # Prefer English athlete URL if someone stored the non-/en/ path.
+    s = re.sub(r"https://protrinews\.com/athletes/", "https://protrinews.com/en/athletes/", s)
+    return s.rstrip("/")
+
+
+def extract_gender_from_profile_html(html: str) -> Tuple[Optional[str], str]:
+    """Extract Men/Women competition category from profile HTML when present.
+
+    This is intentionally conservative. It only returns a gender when the page
+    appears to include an explicit gender/sex/category field, not from the
+    athlete's name, image, country, or results.
+    """
+    if not html:
+        return None, "empty_html"
+
+    # JSON-style fields embedded by Next.js / app state.
+    json_patterns = [
+        r'"gender"\s*:\s*"(male|female|men|women|m|f)"',
+        r'"sex"\s*:\s*"(male|female|men|women|m|f)"',
+        r'"category"\s*:\s*"(male|female|men|women|m|f)"',
+        r'"division"\s*:\s*"(male|female|men|women|m|f)"',
+    ]
+    for pat in json_patterns:
+        m = re.search(pat, html, flags=re.I)
+        if m:
+            g = normalize_gender(m.group(1))
+            if g in ["Men", "Women"]:
+                return g, "profile_json_field"
+
+    # Label/value patterns after stripping tags.
+    text = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    label_patterns = [
+        r"\bGender\b\s*[:\-]?\s*(Male|Female|Men|Women)\b",
+        r"\bSex\b\s*[:\-]?\s*(Male|Female|Men|Women)\b",
+        r"\bCategory\b\s*[:\-]?\s*(Male|Female|Men|Women)\b",
+    ]
+    for pat in label_patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            g = normalize_gender(m.group(1))
+            if g in ["Men", "Women"]:
+                return g, "profile_visible_label"
+
+    return None, "not_found"
+
+
+def fetch_profile_gender(athlete_url: str, timeout: int = 15) -> Tuple[Optional[str], str, Optional[str]]:
+    """Fetch one permissioned athlete profile URL and return gender + source + error."""
+    url = canonical_athlete_url(athlete_url)
+    if not url:
+        return None, "bad_url", "Missing athlete URL"
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={
+                "User-Agent": "TriathlonPicksGenderBackfill/1.0 (permissioned; contact: dashboard owner)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        if resp.status_code != 200:
+            return None, "http_error", f"HTTP {resp.status_code}"
+        gender, source = extract_gender_from_profile_html(resp.text)
+        return gender, source, None
+    except Exception as e:
+        return None, "request_error", str(e)
+
+
+def missing_gender_athletes(athletes: pd.DataFrame, results: pd.DataFrame, starts: pd.DataFrame, limit: int = 200) -> pd.DataFrame:
+    """Build a priority list of athletes whose gender is still unknown."""
+    rows = []
+    frames = []
+    for df in [athletes, results, starts]:
+        if df is not None and not df.empty:
+            keep_cols = [c for c in ["athlete_url", "athlete_name", "gender", "race_date", "race_name"] if c in df.columns]
+            frames.append(df[keep_cols].copy())
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    if "athlete_url" not in combined.columns:
+        return pd.DataFrame()
+    combined["athlete_url"] = combined["athlete_url"].map(canonical_athlete_url)
+    combined["athlete_name"] = combined.get("athlete_name", pd.Series(dtype=object)).map(clean_str)
+    combined["gender_norm"] = combined.get("gender", pd.Series(dtype=object)).map(normalize_gender)
+    combined = combined[combined["athlete_url"].notna() | combined["athlete_name"].notna()].copy()
+
+    # Group by URL when possible, otherwise name. Prefer rows with URL because profile lookup needs it.
+    key = combined["athlete_url"].fillna(combined["athlete_name"])
+    for athlete_key, g in combined.groupby(key):
+        known = set(x for x in g["gender_norm"].dropna().unique() if x in ["Men", "Women"])
+        if known:
+            continue
+        url = clean_str(g["athlete_url"].dropna().iloc[0]) if g["athlete_url"].notna().any() else None
+        if not url:
+            continue
+        race_dates = pd.to_datetime(g.get("race_date"), errors="coerce") if "race_date" in g.columns else pd.Series(dtype="datetime64[ns]")
+        rows.append({
+            "Athlete": clean_str(g["athlete_name"].dropna().iloc[0]) if g["athlete_name"].notna().any() else athlete_key,
+            "Athlete URL": url,
+            "Rows": len(g),
+            "Last Race Date": format_date(race_dates.max()) if len(race_dates) and pd.notna(race_dates.max()) else "",
+            "Last Race": clean_str(g["race_name"].dropna().iloc[0]) if "race_name" in g.columns and g["race_name"].notna().any() else "",
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values(["Rows", "Last Race Date"], ascending=[False, False], na_position="last")
+    return out.head(limit)
+
+
+def apply_profile_gender_backfill(candidates: pd.DataFrame, batch_size: int = 25, delay_seconds: float = 0.75) -> pd.DataFrame:
+    """Rate-limited, missing-only gender backfill from permissioned PTN profile pages."""
+    if candidates is None or candidates.empty:
+        return pd.DataFrame()
+    work = candidates.head(batch_size).copy()
+    logs = []
+    progress = st.progress(0, text="Checking athlete profile pages...")
+    for i, (_, r) in enumerate(work.iterrows(), start=1):
+        url = clean_str(r.get("Athlete URL"))
+        name = clean_str(r.get("Athlete"))
+        gender, source, error = fetch_profile_gender(url)
+        updated = False
+        if gender in ["Men", "Women"]:
+            suggestions = pd.DataFrame([{
+                "Athlete URL": url,
+                "Athlete": name,
+                "Suggested Gender": gender,
+                "Confidence": "High",
+                "Conflict": "No",
+                "Sources": f"Permissioned athlete profile ({source})",
+                "Signal Count": 1,
+            }])
+            apply_gender_updates(suggestions, include_medium=False)
+            updated = True
+        logs.append({
+            "Athlete": name,
+            "Athlete URL": url,
+            "Detected Gender": gender or "",
+            "Source": source,
+            "Updated": "Yes" if updated else "No",
+            "Error": error or "",
+        })
+        progress.progress(i / max(len(work), 1), text=f"Checked {i:,} of {len(work):,} profile pages...")
+        if i < len(work) and delay_seconds > 0:
+            time.sleep(delay_seconds)
+    progress.empty()
+    clear_cache()
+    return pd.DataFrame(logs)
+
 def normalize_athlete_results(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     rows = []
     athletes = {}
@@ -2973,6 +3138,44 @@ elif page == "Gender Tools":
                 applied = apply_gender_updates(suggestions, include_medium=True)
                 st.success(f"Applied gender updates for {applied:,} athletes. Refreshing cache...")
                 st.rerun()
+
+    st.markdown("---")
+    st.subheader("Permissioned profile gender backfill")
+    st.caption("Use this only for missing-gender athletes and only in small batches. It does not scrape the whole database daily; it checks selected missing athlete profiles, rate-limited, and immediately propagates any explicit gender field found.")
+
+    max_candidates = st.number_input("Missing-gender candidates to preview", min_value=25, max_value=2000, value=250, step=25)
+    candidates = missing_gender_athletes(raw_athletes, combined_results, raw_starts, limit=int(max_candidates))
+    if candidates.empty:
+        st.success("No missing-gender athlete URLs found from the loaded tables.")
+    else:
+        st.write(f"Missing-gender athlete URL candidates found: {len(candidates):,}")
+        display_table(candidates.head(250), ["Athlete", "Athlete URL", "Rows", "Last Race Date", "Last Race"], height=360)
+        st.download_button(
+            "Download missing-gender candidates CSV",
+            data=candidates.to_csv(index=False).encode("utf-8"),
+            file_name="missing_gender_athletes.csv",
+            mime="text/csv",
+        )
+        b1, b2 = st.columns(2)
+        with b1:
+            batch_size = st.number_input("Profile lookup batch size", min_value=1, max_value=200, value=25, step=5)
+        with b2:
+            delay = st.number_input("Delay between profile checks, seconds", min_value=0.25, max_value=5.0, value=0.75, step=0.25)
+        st.warning("This should be a permissioned, missing-only cleanup tool. Do not schedule it to crawl the whole database daily.")
+        if st.button("Run permissioned profile gender backfill", type="primary"):
+            log_df = apply_profile_gender_backfill(candidates, batch_size=int(batch_size), delay_seconds=float(delay))
+            if log_df.empty:
+                st.warning("No rows checked.")
+            else:
+                found = int((log_df["Detected Gender"].isin(["Men", "Women"])).sum())
+                st.success(f"Checked {len(log_df):,} profiles. Found and applied {found:,} genders.")
+                display_table(log_df, ["Athlete", "Detected Gender", "Source", "Updated", "Error", "Athlete URL"], height=420)
+                st.download_button(
+                    "Download profile backfill log CSV",
+                    data=log_df.to_csv(index=False).encode("utf-8"),
+                    file_name="profile_gender_backfill_log.csv",
+                    mime="text/csv",
+                )
 
     st.markdown("---")
     st.subheader("Manual gender override upload")
