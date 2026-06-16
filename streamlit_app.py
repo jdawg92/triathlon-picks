@@ -920,6 +920,7 @@ def fill_missing_sof_from_same_race(results: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # Scoring helpers
 # ============================================================
+@st.cache_data(ttl=900, show_spinner="Loading and cleaning Supabase data...")
 def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     athlete_results = load_table("athlete_results")
     race_field_results = load_table("race_field_results")
@@ -1017,6 +1018,50 @@ def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
         overrides["race_date"] = pd.to_datetime(overrides["race_date"], errors="coerce")
 
     return results, starts, athletes, overrides
+
+
+def filter_results_to_startlist_races(
+    results_window: pd.DataFrame,
+    start_athletes: pd.DataFrame,
+    discipline: str,
+) -> pd.DataFrame:
+    """Keep only race rows needed to score one start list discipline.
+
+    The slow path was building split audits across every race in the 2-year
+    window. For a selected start list, we only need the races where one of the
+    selected athletes has a valid split, plus the other imported/full-field rows
+    from those same races so rank and % behind fastest can be calculated.
+
+    This usually cuts the audit source from tens of thousands of rows to a few
+    hundred/thousand rows and makes race switching much faster.
+    """
+    if results_window.empty or start_athletes.empty:
+        return results_window.head(0).copy()
+
+    split_col = f"{discipline}_seconds"
+    if split_col not in results_window.columns:
+        return results_window.head(0).copy()
+
+    start_urls = set(start_athletes.get("athlete_url", pd.Series(dtype=str)).dropna().astype(str).tolist())
+    start_names = set(start_athletes.get("athlete_name", pd.Series(dtype=str)).dropna().astype(str).str.lower().tolist())
+
+    url_mask = results_window.get("athlete_url", pd.Series(index=results_window.index, dtype=object)).astype(str).isin(start_urls)
+    name_mask = results_window.get("athlete_name", pd.Series(index=results_window.index, dtype=object)).fillna("").astype(str).str.lower().isin(start_names)
+    split_mask = results_window[split_col].notna()
+
+    athlete_rows = results_window[(url_mask | name_mask) & split_mask].copy()
+    if athlete_rows.empty:
+        return results_window.head(0).copy()
+
+    athlete_race_keys = set(athlete_rows.apply(race_key, axis=1).dropna().astype(str).tolist())
+    if not athlete_race_keys:
+        return results_window.head(0).copy()
+
+    out = results_window.copy()
+    out["_selected_race_key"] = out.apply(race_key, axis=1).astype(str)
+    out = out[out["_selected_race_key"].isin(athlete_race_keys)].copy()
+    out = out.drop(columns=["_selected_race_key"], errors="ignore")
+    return out
 
 
 def match_override(row: pd.Series, overrides: pd.DataFrame, applies_to: str) -> Tuple[bool, float, str]:
@@ -2221,8 +2266,15 @@ elif page in {"Race Dashboard", "Split Audit"}:
 
     render_race_card(selected_race, selected_gender, selected_date, window_start)
 
+    # Performance: build each split audit only from races relevant to the
+    # selected start-list athletes, not from every result row in the 2-year
+    # window. This is the main speed fix for switching start lists.
+    audit_source_by_disc = {
+        disc: filter_results_to_startlist_races(results_window, start_athletes, disc)
+        for disc in ["swim", "bike", "run"]
+    }
     audit_by_disc = {
-        disc: build_split_audit(results_window, start_athletes, overrides, selected_date, selected_gender, disc, min_field_size)
+        disc: build_split_audit(audit_source_by_disc[disc], start_athletes, overrides, selected_date, selected_gender, disc, min_field_size)
         for disc in ["swim", "bike", "run"]
     }
 
@@ -2247,9 +2299,11 @@ elif page in {"Race Dashboard", "Split Audit"}:
                     start_names_tmp = set(start_athletes["athlete_name"].dropna().astype(str).str.lower().tolist()) if "athlete_name" in start_athletes else set()
                     start_mask = (aud_tmp["athlete_url"].isin(start_urls_tmp)) | (aud_tmp["athlete_name"].fillna("").str.lower().isin(start_names_tmp))
                     start_included = int((start_mask & aud_tmp["included"]).sum())
+                source_rows = len(audit_source_by_disc.get(disc, pd.DataFrame()))
                 health.append({
                     "Discipline": disc,
                     "Valid result rows in window": valid_rows,
+                    "Rows scanned for selected race": source_rows,
                     "Audit rows": audit_rows,
                     "Included audit rows": included_rows,
                     "Included start-list rows": start_included,
