@@ -3646,15 +3646,34 @@ elif page == "Athlete Rankings":
     m2.metric("Rows after race-family filter", f"{len(ranking_results):,}")
     m3.metric("Athletes ranked", f"{start_all['athlete_name'].nunique():,}")
 
-    tabs = st.tabs(["🏆 Overall", "🏊 Swim", "🚴 Bike", "🏃 Run"])
-    with tabs[0]:
-        overall_all = score_overall(ranking_results, start_all, overrides, as_of_ts, year, top_n_rank)
-        display_table(overall_all.head(75), ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"], height=620)
-    for tab, disc in zip(tabs[1:], ["swim", "bike", "run"]):
-        with tab:
+    # Streamlit tabs eagerly execute every tab on every rerun. That made a simple
+    # filter change calculate Overall + Swim + Bike + Run every time. Use a
+    # segmented/radio selector so only the selected ranking view is computed.
+    ranking_view = st.radio(
+        "Ranking view",
+        ["🏆 Overall", "🏊 Swim", "🚴 Bike", "🏃 Run"],
+        horizontal=True,
+        key="athlete_rankings_view",
+    )
+
+    if ranking_view == "🏆 Overall":
+        with st.spinner("Calculating overall rankings..."):
+            overall_all = score_overall(ranking_results, start_all, overrides, as_of_ts, year, top_n_rank)
+        display_table(
+            overall_all.head(75),
+            ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"],
+            height=620,
+        )
+    else:
+        disc = {"🏊 Swim": "swim", "🚴 Bike": "bike", "🏃 Run": "run"}[ranking_view]
+        with st.spinner(f"Calculating {disc} rankings..."):
             aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, ranking_gender, disc, min_field_size=5)
             scored = score_splits_for_start_list(aud, start_all, as_of_ts, top_n_rank, strong_sof_threshold=70)
-            display_table(scored.head(75), ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"], height=620)
+        display_table(
+            scored.head(75),
+            ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"],
+            height=620,
+        )
 
 elif page == "Database Viewer":
     st.header("🗄️ Database Viewer")
