@@ -1123,28 +1123,72 @@ def recency_weight(race_date: Any, target_date: pd.Timestamp) -> float:
     return 0.65
 
 
-def is_strong_split_evidence(row: pd.Series, discipline: str, strong_sof_threshold: float = 70.0) -> bool:
-    """Return whether this split row should drive rankings.
+def is_premium_split_evidence(row: pd.Series, discipline: str, strong_sof_threshold: float = 70.0) -> bool:
+    """Return whether this row is true top-tier evidence for a 70.3 split pick.
 
-    Strong evidence should be the races that actually translate to the target
-    70.3 prediction. For split picks, full-distance swim/bike with good SOF is
-    strong evidence. Full-distance run is useful but not strong by default
-    because the marathon fatigue profile does not transfer cleanly to a 70.3
-    half-marathon split.
+    This is deliberately stricter than strong evidence. The top of the split
+    board should be driven by races that actually prove the athlete can split
+    well against championship/T100/high-SOF fields, not just normal 70.3 races
+    where our imported sample happens to show them 1st-3rd.
     """
     rt = (clean_str(row.get("race_type")) or "").lower()
+    race_name = (clean_str(row.get("race_name")) or "").lower()
     sof = safe_float(row.get("sof"))
 
-    if rt == "t100":
+    championship_name = any(k in race_name for k in [
+        "world championship",
+        "world championships",
+        "70.3 world",
+        "ironman world championship",
+        "olympic games",
+    ])
+
+    if rt == "t100" or "t100" in race_name or "pto" in race_name:
         return True
+
+    if championship_name:
+        # Championship swims are very predictive; championship bikes are also
+        # useful when non-draft. Championship runs are useful but less of an
+        # automatic 70.3-fastest-run signal.
+        return discipline in {"swim", "bike"}
 
     if discipline == "swim" and rt == "wtcs":
         return True
 
     if rt == "full":
+        return discipline in {"swim", "bike"} and sof is not None and sof >= 80
+
+    # Very high SOF non-championship races can still be premium evidence.
+    if sof is not None and sof >= 85:
+        return True
+
+    return False
+
+
+def is_strong_split_evidence(row: pd.Series, discipline: str, strong_sof_threshold: float = 70.0) -> bool:
+    """Return whether this split row is usable strong evidence.
+
+    Strong evidence can support the rating, but premium evidence is what should
+    drive the very top of the rankings. Normal high-SOF 70.3 races are strong;
+    T100/World Championship/very-high-SOF races are premium.
+    """
+    rt = (clean_str(row.get("race_type")) or "").lower()
+    sof = safe_float(row.get("sof"))
+
+    if is_premium_split_evidence(row, discipline, strong_sof_threshold):
+        return True
+
+    if rt == "full":
         return discipline in {"swim", "bike"} and sof is not None and sof >= strong_sof_threshold
 
-    if sof is not None and sof >= strong_sof_threshold:
+    if rt in {"70.3", "challenge middle"}:
+        return sof is not None and sof >= max(strong_sof_threshold, 72)
+
+    # WTCS run is useful, but not premium for a 70.3 half-marathon.
+    if rt == "wtcs" and discipline == "run":
+        return sof is not None and sof >= 75
+
+    if sof is not None and sof >= max(strong_sof_threshold, 75):
         return True
 
     return False
@@ -1153,9 +1197,9 @@ def is_strong_split_evidence(row: pd.Series, discipline: str, strong_sof_thresho
 def evidence_quality_label(row: pd.Series, discipline: str, strong_sof_threshold: float = 70.0) -> str:
     rt = (clean_str(row.get("race_type")) or "").lower()
     sof = safe_float(row.get("sof"))
+    if is_premium_split_evidence(row, discipline, strong_sof_threshold):
+        return "Premium"
     if is_strong_split_evidence(row, discipline, strong_sof_threshold):
-        if rt == "t100" or (discipline == "swim" and rt == "wtcs") or (sof is not None and sof >= 80):
-            return "Premium"
         return "Strong"
     if rt == "full" and discipline == "run":
         return "Medium" if sof is not None and sof >= 70 else "Low/unknown"
@@ -1164,7 +1208,6 @@ def evidence_quality_label(row: pd.Series, discipline: str, strong_sof_threshold
     if rt in {"world triathlon cup", "continental cup", "sprint", "olympic"}:
         return "Development/short-course"
     return "Low/unknown"
-
 
 def closeness_score(pct_behind: float, discipline: str) -> float:
     # Percent behind fastest is the core. A 1-min swim gap means very different things at 6 min vs 24 min.
@@ -1349,10 +1392,17 @@ def build_split_audit(
                 "field_source": "imported_sample",
                 "coverage_note": "Imported sample only; not full ProTriNews field",
                 "quality_tier": evidence_quality_label(pd.Series(r), discipline, 70.0),
+                "premium_evidence": bool(
+                    is_premium_split_evidence(pd.Series(r), discipline, 70.0)
+                    and not split_status_excluded
+                    and not draft_bike
+                    and field_size >= 2
+                ),
                 "strong_evidence": bool(
                     is_strong_split_evidence(pd.Series(r), discipline, 70.0)
                     and not split_status_excluded
                     and not draft_bike
+                    and field_size >= 2
                 ),
                 "split_seconds": int(split_sec),
                 "split": format_seconds(split_sec),
@@ -1397,9 +1447,12 @@ def score_splits_for_start_list(
 
     discipline = clean_str(df["discipline"].dropna().iloc[0]) if "discipline" in df.columns and df["discipline"].notna().any() else "swim"
 
-    # Recompute the strong-evidence flag from the sidebar threshold. This is
-    # intentionally stricter than "included". Included = usable evidence;
-    # strong_evidence = evidence allowed to drive the top rankings.
+    # Recompute quality flags using the current sidebar threshold. Premium =
+    # T100 / championship / very-high-SOF / elite-relevant evidence. Strong =
+    # useful evidence. The final score is anchored to premium first so normal
+    # low/medium-field wins cannot outrank athletes who repeatedly prove it in
+    # T100 / World Championship / very high SOF races.
+    df["premium_evidence"] = df.apply(lambda r: is_premium_split_evidence(r, discipline, strong_sof_threshold), axis=1)
     df["strong_evidence"] = df.apply(lambda r: is_strong_split_evidence(r, discipline, strong_sof_threshold), axis=1)
     df["quality_tier"] = df.apply(lambda r: evidence_quality_label(r, discipline, strong_sof_threshold), axis=1)
 
@@ -1421,8 +1474,16 @@ def score_splits_for_start_list(
         weights = recent_scored["evidence_weight"].astype(float).tolist()
         recent_score = weighted_avg(scores, weights) or 0
 
+        premium = recent_scored[recent_scored["premium_evidence"].astype(bool)].copy()
         strong = recent_scored[recent_scored["strong_evidence"].astype(bool)].copy()
         medium_or_better = recent_scored[recent_scored["quality_tier"].isin(["Premium", "Strong", "Medium"])].copy()
+
+        premium_score = weighted_avg(premium["evidence_score"].astype(float).tolist(), premium["evidence_weight"].astype(float).tolist()) if not premium.empty else 0
+        premium_weights = premium["evidence_weight"].astype(float).tolist() if not premium.empty else []
+        premium_top3_rate = weighted_avg((premium["split_rank"] <= 3).astype(float).tolist(), premium_weights) if not premium.empty else 0
+        premium_fastest_rate = weighted_avg((premium["split_rank"] == 1).astype(float).tolist(), premium_weights) if not premium.empty else 0
+        premium_avg_behind = weighted_avg(premium["pct_behind_fastest"].astype(float).tolist(), premium_weights) if not premium.empty else None
+        premium_count = len(premium)
 
         strong_score = weighted_avg(strong["evidence_score"].astype(float).tolist(), strong["evidence_weight"].astype(float).tolist()) if not strong.empty else 0
         strong_weights = strong["evidence_weight"].astype(float).tolist() if not strong.empty else []
@@ -1437,22 +1498,28 @@ def score_splits_for_start_list(
         evidence_count = len(recent_scored)
         count_score = min(100, evidence_count / 5 * 100)
 
-        # Low-SOF / development-field rows can support the profile, but they
-        # cannot be the main reason someone outranks Jamie/MVR-type athletes
-        # with strong-field evidence. So top rankings are anchored to strong
-        # rows first, then recent score, then all-row consistency.
-        if strong_count > 0:
+        if premium_count > 0:
             final = (
-                0.62 * strong_score
-                + 0.18 * recent_score
-                + 0.10 * (strong_top3_rate or 0) * 100
-                + 0.04 * (strong_fastest_rate or 0) * 100
-                + 0.06 * count_score
+                0.70 * premium_score
+                + 0.12 * strong_score
+                + 0.08 * recent_score
+                + 0.06 * (premium_top3_rate or 0) * 100
+                + 0.04 * count_score
+            )
+        elif strong_count > 0:
+            # Strong but not premium: can rank well, but should not outrank
+            # repeated T100/World/very-high-SOF proof unless the strong rows are
+            # exceptional and numerous.
+            final = (
+                0.55 * strong_score
+                + 0.20 * recent_score
+                + 0.12 * (strong_top3_rate or 0) * 100
+                + 0.05 * (strong_fastest_rate or 0) * 100
+                + 0.08 * count_score
             )
         else:
-            # No strong rows: useful but capped. This is where low-SOF wins and
-            # short-course/development races land unless the athlete also has
-            # high-SOF/T100/WTCS-swim proof.
+            # No strong rows: useful but capped. Low-SOF/development wins belong
+            # here unless the athlete also has premium/strong proof.
             final = (
                 0.45 * recent_score
                 + 0.18 * all_top3_rate * 100
@@ -1460,15 +1527,16 @@ def score_splits_for_start_list(
                 + 0.05 * count_score
             )
 
-        # Strong-field closeness gates. Being 8th but 1% down in a T100 swim is
-        # better than winning a weak race, but being repeatedly 5%+ back in
-        # strong fields should not rank high.
-        if strong_avg_behind is not None:
-            if strong_avg_behind > 6:
+        # Premium/strong-field closeness gates. Being close in a premium race
+        # matters more than winning a normal/weak race. Repeatedly being far back
+        # in premium/strong races should cap the athlete.
+        gate_behind = premium_avg_behind if premium_avg_behind is not None else strong_avg_behind
+        if gate_behind is not None:
+            if gate_behind > 6:
                 final = min(final, 55)
-            elif strong_avg_behind > 4:
+            elif gate_behind > 4:
                 final = min(final, 68)
-            elif strong_avg_behind > 2.5:
+            elif gate_behind > 2.5:
                 final = min(final, 78)
         elif avg_behind is not None:
             if avg_behind > 8:
@@ -1482,21 +1550,31 @@ def score_splits_for_start_list(
         if len(recent_scored) and not (recent_scored["split_rank"] <= 5).any() and (avg_behind is None or avg_behind > 2.5):
             final = min(final, 50)
 
-        # Strong-evidence confidence caps. One big race can be a strong signal,
-        # but the top of the board should favor athletes with repeated proof.
-        if strong_count == 0:
-            # A couple of medium rows can lift this slightly, but still below
-            # athletes with true strong-field evidence.
-            cap = 58 if len(medium_or_better) >= 3 else 52
-            final = min(final, cap)
-            confidence = "Low - no strong-field proof"
-        elif strong_count == 1:
-            final = min(final, 70)
-            confidence = "Medium - 1 strong row"
-        elif strong_count == 2:
-            confidence = "Good - 2 strong rows"
+        # Quality confidence caps. This is the main fix for "three nobodies ahead
+        # of Jamie". A normal high-SOF 70.3 win can support a profile, but the
+        # very top should require premium proof unless the athlete has multiple
+        # strong rows with excellent closeness.
+        if premium_count == 0:
+            if strong_count == 0:
+                cap = 56 if len(medium_or_better) >= 3 else 50
+                final = min(final, cap)
+                confidence = "Low - no strong-field proof"
+            elif strong_count == 1:
+                final = min(final, 60)
+                confidence = "Medium - 1 strong row, no premium"
+            elif strong_count == 2:
+                final = min(final, 64)
+                confidence = "Medium - strong rows, no premium"
+            else:
+                final = min(final, 68)
+                confidence = "Good - repeated strong rows, no premium"
+        elif premium_count == 1:
+            final = min(final, 72)
+            confidence = "Good - 1 premium row"
+        elif premium_count == 2:
+            confidence = "High - 2 premium rows"
         else:
-            confidence = "High - repeated strong proof"
+            confidence = "Elite - repeated premium proof"
 
         # Evidence-count confidence caps. A single validated split should not
         # rank beside athletes with several recent validated splits.
@@ -1505,10 +1583,10 @@ def score_splits_for_start_list(
             confidence = "Low - 1 split"
         elif evidence_count == 2:
             final = min(final, 60)
-            if strong_count < 2:
+            if premium_count < 2:
                 confidence = "Low - 2 splits"
-        elif evidence_count == 3 and strong_count == 0:
-            final = min(final, 58)
+        elif evidence_count == 3 and premium_count == 0 and strong_count == 0:
+            final = min(final, 56)
             confidence = "Low - 3 weak/medium splits"
 
         best_row = recent_scored.sort_values(["evidence_score", "race_date"], ascending=[False, False]).head(1)
@@ -1518,12 +1596,17 @@ def score_splits_for_start_list(
             "Athlete URL": g["athlete_url"].dropna().iloc[0] if g["athlete_url"].notna().any() else None,
             "Score": round(final, 1),
             "Confidence": confidence,
+            "Premium Evidence Count": premium_count,
             "Strong Evidence Count": strong_count,
             "Evidence Count": evidence_count,
+            "Premium Field Score": round(premium_score, 1),
             "Strong Field Score": round(strong_score, 1),
             "Recent Score": round(recent_score, 1),
+            "Premium Avg Behind %": None if premium_avg_behind is None else round(premium_avg_behind, 2),
             "Strong Avg Behind %": None if strong_avg_behind is None else round(strong_avg_behind, 2),
             "Recent Avg Behind %": None if avg_behind is None else round(avg_behind, 2),
+            "Premium Top 3 %": round((premium_top3_rate or 0) * 100, 1),
+            "Premium Fastest %": round((premium_fastest_rate or 0) * 100, 1),
             "Strong Top 3 %": round((strong_top3_rate or 0) * 100, 1),
             "Strong Fastest %": round((strong_fastest_rate or 0) * 100, 1),
             "Recent Top 3 %": round(all_top3_rate * 100, 1),
@@ -1533,10 +1616,13 @@ def score_splits_for_start_list(
             "Last Rank": clean_str(last_row["rank_display"].iloc[0]) if not last_row.empty else "",
             "Best Recent Split": clean_str(best_row["split"].iloc[0]) if not best_row.empty else "",
         })
-    out = pd.DataFrame(rows).sort_values("Score", ascending=False).reset_index(drop=True)
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values("Score", ascending=False).reset_index(drop=True)
     out.insert(0, "Rank", range(1, len(out) + 1))
     return out
-
 def score_overall(
     results: pd.DataFrame,
     start_athletes: pd.DataFrame,
@@ -2012,7 +2098,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                 scored_top = scored.head(12).copy()
                 selected_row = selectable_table(
                     scored_top,
-                    ["Rank", "Athlete", "Score", "Confidence", "Strong Evidence Count", "Evidence Count", "Strong Field Score", "Strong Avg Behind %", "Strong Top 3 %", "Strong Fastest %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
+                    ["Rank", "Athlete", "Score", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Premium Top 3 %", "Strong Top 3 %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
                     key=f"split_pick_table_{disc}",
                 )
                 st.caption("Click an athlete row above to show the recent split rows used for that discipline. These are not the athlete's best overall races; each split is scored from its own swim/bike/run evidence.")
@@ -2064,7 +2150,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                             st.warning("No included split evidence found for the selected athlete. Switch to 'All evaluated rows' to see excluded DNF/DNS/DSQ, draft-legal, or invalid rows.")
                         display_table(
                             ev,
-                            ["race_date", "race_name", "race_type", "quality_tier", "strong_evidence", "place", "status", "bad_status", "split_status_excluded", "sof", "sof_source", "sample_size", "split", "sample_rank_display", "pct_behind_fastest", "evidence_score", "final_cap", "included", "coverage_note", "reason"],
+                            ["race_date", "race_name", "race_type", "quality_tier", "premium_evidence", "strong_evidence", "place", "status", "bad_status", "split_status_excluded", "sof", "sof_source", "sample_size", "split", "sample_rank_display", "pct_behind_fastest", "evidence_score", "final_cap", "included", "coverage_note", "reason"],
                         )
 
     else:
@@ -2091,7 +2177,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
             view = view.sort_values(["athlete_name", "race_date"], ascending=[True, False])
             display_table(
                 view,
-                ["athlete_name", "race_date", "race_name", "race_type", "quality_tier", "strong_evidence", "place", "status", "bad_status", "split_status_excluded", "sof", "sof_source", "sof_original", "sample_size", "field_source", "split", "sample_rank_display", "pct_behind_fastest", "gap_when_fastest_pct", "closeness_score", "rank_score", "raw_score", "sof_cap", "field_cap", "race_type_cap", "final_cap", "evidence_score", "evidence_weight", "included", "coverage_note", "reason"],
+                ["athlete_name", "race_date", "race_name", "race_type", "quality_tier", "premium_evidence", "strong_evidence", "place", "status", "bad_status", "split_status_excluded", "sof", "sof_source", "sof_original", "sample_size", "field_source", "split", "sample_rank_display", "pct_behind_fastest", "gap_when_fastest_pct", "closeness_score", "rank_score", "raw_score", "sof_cap", "field_cap", "race_type_cap", "final_cap", "evidence_score", "evidence_weight", "included", "coverage_note", "reason"],
                 height=650,
             )
 
