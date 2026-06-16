@@ -399,6 +399,12 @@ def clamp(value: float, low: float, high: float) -> float:
 # Supabase data helpers
 # ============================================================
 def fetch_all(table_name: str, select: str = "*", page_size: int = 1000) -> List[Dict[str, Any]]:
+    """Fetch every row from Supabase using explicit pagination.
+
+    Supabase/PostgREST responses are range-limited, so a single select can
+    silently look like it only has the first page. This helper keeps paging
+    until the table is exhausted.
+    """
     all_rows: List[Dict[str, Any]] = []
     start = 0
     while True:
@@ -410,6 +416,15 @@ def fetch_all(table_name: str, select: str = "*", page_size: int = 1000) -> List
             break
         start += page_size
     return all_rows
+
+
+def count_rows(table_name: str) -> Optional[int]:
+    """Return an exact Supabase table count when available."""
+    try:
+        res = supabase.table(table_name).select("id", count="exact").limit(1).execute()
+        return int(res.count or 0)
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=60)
@@ -598,16 +613,23 @@ def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
                 results[col] = pd.to_numeric(results[col], errors="coerce")
 
         # Guarantee split columns exist and recover missing values from raw CSV payloads.
-        # This avoids needing to re-import if the first importer missed a split value.
+        # Force float dtype before assignment. Pandas 3.x raises if object/NA
+        # recovered values are assigned into an integer-backed column.
         for disc in ["swim", "bike", "run"]:
             col = f"{disc}_seconds"
             if col not in results.columns:
                 results[col] = np.nan
-            results[col] = pd.to_numeric(results[col], errors="coerce")
+
+            results[col] = pd.to_numeric(results[col], errors="coerce").astype("float64")
             missing = results[col].isna()
+
             if missing.any() and "raw" in results.columns:
-                results.loc[missing, col] = results[missing].apply(lambda r, d=disc: recover_split_from_raw(r, d), axis=1)
-            results[col] = pd.to_numeric(results[col], errors="coerce")
+                recovered = results.loc[missing].apply(lambda r, d=disc: recover_split_from_raw(r, d), axis=1)
+                recovered = pd.to_numeric(recovered, errors="coerce").astype("float64")
+                # Assign plain numpy values to avoid dtype/index alignment issues.
+                results.loc[missing, col] = recovered.to_numpy()
+
+            results[col] = pd.to_numeric(results[col], errors="coerce").astype("float64")
 
         results["bad_status"] = results.apply(lambda r: is_bad_status(r.get("status"), r.get("place")), axis=1)
         results["place_num"] = results["place"].map(parse_place_number)
@@ -1173,6 +1195,12 @@ if page == "Connection":
         result = supabase.table("athletes").select("id", count="exact").limit(1).execute()
         st.success("Connected to Supabase.")
         st.metric("Athletes", result.count or 0)
+
+        st.subheader("Table counts")
+        count_rows_data = []
+        for table_name in ["athletes", "athlete_results", "start_lists", "race_overrides", "scoring_settings", "model_runs", "split_audit"]:
+            count_rows_data.append({"Table": table_name, "Rows in Supabase": count_rows(table_name)})
+        st.dataframe(pd.DataFrame(count_rows_data), use_container_width=True, hide_index=True)
     except Exception as e:
         st.error("Could not read from Supabase. Make sure tables exist and secrets are correct.")
         st.exception(e)
@@ -1195,12 +1223,15 @@ elif page == "Import CSVs":
             try:
                 if table_choice == "Athlete Results":
                     rows, athlete_rows = normalize_athlete_results(df)
+                    before_count = count_rows("athlete_results")
                     if replace:
                         delete_all("athlete_results")
                     insert_chunks("athlete_results", rows)
                     upsert_chunks("athletes", athlete_rows, on_conflict="athlete_url")
                     clear_cache()
+                    after_count = count_rows("athlete_results")
                     st.success(f"Imported {len(rows):,} athlete result rows and upserted {len(athlete_rows):,} athletes.")
+                    st.info(f"Supabase athlete_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
 
                 elif table_choice == "Start Lists":
                     rows, athlete_rows = normalize_start_lists(df)
@@ -1233,11 +1264,23 @@ elif page == "Import CSVs":
 elif page == "Database Viewer":
     st.header("Database Viewer")
     table = st.selectbox("Table", ["athletes", "athlete_results", "start_lists", "race_overrides", "scoring_settings", "model_runs", "split_audit"])
-    limit = st.slider("Rows", 10, 5000, 500)
+    exact_count = count_rows(table)
+    if exact_count is not None:
+        st.metric("Rows in Supabase", f"{exact_count:,}")
+    limit_max = max(5000, min(100000, int(exact_count or 50000)))
+    limit = st.slider("Rows to display", 10, limit_max, min(5000, limit_max))
     try:
-        df = pd.DataFrame(fetch_all(table, page_size=1000)).head(limit)
-        st.write(f"Showing {len(df):,} rows")
-        st.dataframe(df, use_container_width=True)
+        all_rows = fetch_all(table, page_size=1000)
+        df_all = pd.DataFrame(all_rows)
+        st.write(f"Fetched {len(df_all):,} rows from Supabase. Showing first {min(limit, len(df_all)):,}.")
+        st.dataframe(df_all.head(limit), use_container_width=True)
+        if not df_all.empty:
+            st.download_button(
+                label=f"Download all {table} rows as CSV",
+                data=df_all.to_csv(index=False).encode("utf-8"),
+                file_name=f"{table}.csv",
+                mime="text/csv",
+            )
     except Exception as e:
         st.error("Could not load table.")
         st.exception(e)
