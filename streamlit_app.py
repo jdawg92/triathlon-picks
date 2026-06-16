@@ -3486,6 +3486,108 @@ def load_model_cache_df(cache_kind: str, cache_key: str) -> Tuple[pd.DataFrame, 
         return pd.DataFrame(), None
 
 
+def _json_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _cache_param_equal(key: str, left: Any, right: Any) -> bool:
+    if key in {"top_n", "min_field_size"}:
+        try:
+            return int(left) == int(right)
+        except Exception:
+            return clean_str(left) == clean_str(right)
+    if key == "strong_sof_threshold":
+        try:
+            return abs(float(left) - float(right)) < 0.0001
+        except Exception:
+            return clean_str(left) == clean_str(right)
+    return clean_str(left) == clean_str(right)
+
+
+def load_race_prediction_cache_best_match(
+    selected_race: str,
+    selected_date: pd.Timestamp,
+    selected_gender: str,
+    top_n: int,
+    min_field_size: int,
+    strong_sof_threshold: float,
+    prediction_scope: str,
+) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]], str, List[str]]:
+    """Load an exact race-prediction cache, falling back to the latest saved cache for the same race.
+
+    Race Dashboard sliders can differ from the settings used during a bulk rebuild.
+    Exact cache keys are still preferred, but this fallback keeps the dashboard fast and makes
+    the settings difference visible instead of silently dropping to live calculation.
+    """
+    target = race_prediction_cache_params(
+        selected_race,
+        selected_date,
+        selected_gender,
+        top_n,
+        min_field_size,
+        strong_sof_threshold,
+        prediction_scope,
+    )
+    exact_key = make_cache_key("race_prediction", target)
+    exact_df, exact_meta = load_model_cache_df("race_prediction", exact_key)
+    if exact_df is not None and not exact_df.empty:
+        return exact_df, exact_meta, "exact", []
+
+    try:
+        res = (
+            supabase.table("model_cache")
+            .select("cache_kind,cache_key,cache_label,params,rows,row_count,computed_at")
+            .eq("cache_kind", "race_prediction")
+            .order("computed_at", desc=True)
+            .limit(1000)
+            .execute()
+        )
+        candidates = res.data or []
+    except Exception:
+        return pd.DataFrame(), None, "missing", []
+
+    target_race = clean_str(target.get("race_name"))
+    target_date = clean_str(target.get("race_date"))
+    target_gender = normalize_gender(target.get("gender")) or clean_str(target.get("gender"))
+    target_scope = clean_str(target.get("prediction_scope"))
+
+    for row in candidates:
+        params = _json_dict(row.get("params"))
+        row_race = clean_str(params.get("race_name"))
+        row_date = clean_str(params.get("race_date"))
+        row_gender = normalize_gender(params.get("gender")) or clean_str(params.get("gender"))
+        row_scope = clean_str(params.get("prediction_scope"))
+        if row_race != target_race or row_date != target_date or row_gender != target_gender:
+            continue
+        # Prefer same prediction scope, but allow old caches with a missing scope.
+        if row_scope and target_scope and row_scope != target_scope:
+            continue
+        cached_df = cache_rows_to_df(row.get("rows"))
+        if cached_df is None or cached_df.empty:
+            continue
+        diffs = []
+        labels = {
+            "top_n": "Top scores used",
+            "min_field_size": "Low-sample warning",
+            "strong_sof_threshold": "Strong SOF",
+            "prediction_scope": "Prediction profile",
+        }
+        for key, label in labels.items():
+            if not _cache_param_equal(key, params.get(key), target.get(key)):
+                diffs.append(f"{label}: cached {params.get(key, '—')} / current {target.get(key, '—')}")
+        return cached_df, row, ("settings_mismatch" if diffs else "race_match"), diffs
+
+    return pd.DataFrame(), None, "missing", []
+
+
 def save_model_cache_df(cache_kind: str, cache_key: str, cache_label: str, params: Dict[str, Any], df: pd.DataFrame, limit: Optional[int] = None) -> int:
     rows = cache_safe_rows(df, limit=limit)
     payload = {
@@ -4900,14 +5002,31 @@ elif page in {"Race Dashboard", "Split Audit"}:
 
     if page == "Race Dashboard" and use_model_cache:
         cache_prediction_scope = prediction_scope_from_race(selected_race, None, None)
-        cache_params = race_prediction_cache_params(selected_race, selected_date, selected_gender, top_n, min_field_size, strong_sof_threshold, cache_prediction_scope)
-        cache_key = make_cache_key("race_prediction", cache_params)
-        cached_prediction, cached_meta = load_model_cache_df("race_prediction", cache_key)
+        cached_prediction, cached_meta, cache_match, cache_diffs = load_race_prediction_cache_best_match(
+            selected_race,
+            selected_date,
+            selected_gender,
+            top_n,
+            min_field_size,
+            strong_sof_threshold,
+            cache_prediction_scope,
+        )
         if cached_prediction is not None and not cached_prediction.empty:
+            if cache_match == "settings_mismatch":
+                st.warning(
+                    "Loaded the latest saved cache for this race, but the current sidebar settings do not exactly match the cache. "
+                    "Rebuild this race cache if you want the current settings saved.\n\n"
+                    + "\n".join(f"- {d}" for d in cache_diffs)
+                )
+            elif cache_match == "race_match":
+                st.info("Loaded a saved race cache for this race.")
             display_cached_race_prediction(cached_prediction, cached_meta)
             st.stop()
         else:
-            st.warning("No saved race prediction cache for this exact race/settings yet. Showing live calculation. Use ⚡ Model Cache → Race Prediction Cache to save it for fast loading next time.")
+            st.warning(
+                "No saved race prediction cache found for this race. Showing live calculation. "
+                "Use ⚡ Model Cache → Race Prediction Cache to save this race, or run Rebuild everything."
+            )
 
     # Performance: build each split audit only from races relevant to the
     # selected start-list athletes, not from every result row in the 2-year
