@@ -29,189 +29,201 @@ supabase = get_supabase()
 # Visual styling
 # ============================================================
 def apply_dashboard_theme() -> None:
-    """Stripe-inspired UI styling that keeps the app distinct from PTN."""
+    """Dark, Stripe-inspired dashboard styling."""
     st.markdown(
         """
         <style>
         :root {
-            --ptn-bg: #F6F9FC;
-            --ptn-panel: #FFFFFF;
-            --ptn-panel-2: #F7FAFC;
-            --ptn-border: #E3E8EF;
-            --ptn-text: #0A2540;
-            --ptn-muted: #5F6B7A;
-            --ptn-red: #635BFF;
-            --ptn-orange: #00D4FF;
-            --ptn-blue: #635BFF;
-            --ptn-green: #00A878;
-            --ptn-purple: #7A5CFA;
-            --stripe-navy: #0A2540;
-            --stripe-purple: #635BFF;
-            --stripe-cyan: #00D4FF;
-            --stripe-slate: #425466;
-            --stripe-soft: #F6F9FC;
+            --tri-bg: #070B16;
+            --tri-bg-2: #0B1020;
+            --tri-panel: rgba(15, 23, 42, 0.88);
+            --tri-panel-solid: #111827;
+            --tri-panel-2: #151E33;
+            --tri-border: rgba(148, 163, 184, 0.18);
+            --tri-border-strong: rgba(99, 91, 255, 0.38);
+            --tri-text: #F7FAFF;
+            --tri-muted: #9AA8C7;
+            --tri-subtle: #64748B;
+            --tri-primary: #7C5CFF;
+            --tri-primary-2: #635BFF;
+            --tri-cyan: #00D4FF;
+            --tri-green: #19D3A2;
+            --tri-warn: #F5A524;
+            --tri-danger: #FF5C8A;
+            --tri-shadow: rgba(0, 0, 0, 0.38);
+            --tri-shadow-soft: rgba(2, 6, 23, 0.42);
         }
 
         .stApp {
             background:
-                radial-gradient(circle at 10% -10%, rgba(99, 91, 255, 0.15), transparent 28rem),
-                radial-gradient(circle at 90% 0%, rgba(0, 212, 255, 0.14), transparent 30rem),
-                linear-gradient(180deg, #FFFFFF 0%, #F6F9FC 34%, #EEF4FB 100%);
-            color: var(--ptn-text);
+                radial-gradient(circle at 4% -8%, rgba(99, 91, 255, 0.34), transparent 28rem),
+                radial-gradient(circle at 100% 0%, rgba(0, 212, 255, 0.20), transparent 30rem),
+                radial-gradient(circle at 62% 18%, rgba(124, 92, 255, 0.12), transparent 25rem),
+                linear-gradient(180deg, #050816 0%, #070B16 46%, #0B1020 100%);
+            color: var(--tri-text);
+        }
+
+        .block-container {
+            padding-top: 1.3rem;
+            padding-bottom: 3rem;
         }
 
         [data-testid="stSidebar"] {
-            background: rgba(255, 255, 255, 0.92);
-            border-right: 1px solid var(--ptn-border);
-            box-shadow: 10px 0 30px rgba(10, 37, 64, 0.04);
+            background: linear-gradient(180deg, rgba(8, 13, 28, 0.98), rgba(11, 16, 32, 0.96));
+            border-right: 1px solid var(--tri-border);
+            box-shadow: 18px 0 55px rgba(0, 0, 0, 0.25);
         }
 
         [data-testid="stSidebar"] h1,
         [data-testid="stSidebar"] h2,
         [data-testid="stSidebar"] h3,
         [data-testid="stSidebar"] p,
-        [data-testid="stSidebar"] label {
-            color: var(--ptn-text);
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] span,
+        [data-testid="stSidebar"] div {
+            color: var(--tri-text);
         }
 
-        .ptn-sidebar-brand {
-            padding: 0.85rem 0.35rem 1rem 0.35rem;
-            margin-bottom: 0.5rem;
-            border-bottom: 1px solid var(--ptn-border);
+        .tri-sidebar-brand {
+            padding: 0.9rem 0.3rem 1rem 0.3rem;
+            margin-bottom: 0.45rem;
+            border-bottom: 1px solid var(--tri-border);
         }
 
-        .ptn-sidebar-brand .logo {
+        .tri-sidebar-brand .logo {
             display: inline-flex;
             align-items: center;
             justify-content: center;
             width: 2.2rem;
             height: 2.2rem;
-            border-radius: 0.75rem;
-            margin-right: 0.5rem;
+            border-radius: 0.8rem;
+            margin-right: 0.55rem;
             color: white;
-            background: linear-gradient(135deg, #635BFF, #00D4FF);
-            box-shadow: 0 10px 24px rgba(99, 91, 255, 0.18);
+            background: linear-gradient(135deg, #7C5CFF 0%, #00D4FF 100%);
+            box-shadow: 0 14px 34px rgba(99, 91, 255, 0.32);
         }
 
-        .ptn-sidebar-brand .title {
-            font-weight: 800;
-            font-size: 1.05rem;
-            color: var(--stripe-navy);
+        .tri-sidebar-brand .title {
+            font-weight: 850;
+            font-size: 1.02rem;
+            color: var(--tri-text);
             letter-spacing: -0.025em;
         }
 
-        .ptn-sidebar-brand .subtitle {
-            color: var(--ptn-muted);
-            font-size: 0.78rem;
-            margin-top: 0.15rem;
+        .tri-sidebar-brand .subtitle {
+            color: var(--tri-muted);
+            font-size: 0.76rem;
+            margin-top: 0.18rem;
         }
 
-        .ptn-sidebar-section {
-            color: #697386;
-            font-size: 0.68rem;
-            font-weight: 900;
+        .tri-sidebar-section {
+            color: var(--tri-subtle);
+            font-size: 0.67rem;
+            font-weight: 850;
             letter-spacing: 0.16em;
             text-transform: uppercase;
-            margin: 1.05rem 0 0.35rem 0;
-            padding-top: 0.55rem;
-            border-top: 1px solid var(--ptn-border);
+            margin: 1rem 0 0.35rem 0;
+            padding-top: 0.58rem;
+            border-top: 1px solid var(--tri-border);
         }
 
-        .ptn-hero {
+        .tri-hero {
             position: relative;
             overflow: hidden;
             padding: 1.45rem 1.6rem;
-            border: 1px solid rgba(99, 91, 255, 0.16);
+            border: 1px solid rgba(124, 92, 255, 0.26);
             border-radius: 1.35rem;
             background:
-                linear-gradient(135deg, rgba(99, 91, 255, 0.10), rgba(0, 212, 255, 0.08)),
-                #FFFFFF;
-            box-shadow: 0 24px 65px rgba(10, 37, 64, 0.08);
+                linear-gradient(135deg, rgba(124, 92, 255, 0.22), rgba(0, 212, 255, 0.08)),
+                rgba(15, 23, 42, 0.86);
+            box-shadow: 0 24px 70px rgba(0, 0, 0, 0.32);
+            backdrop-filter: blur(14px);
             margin: 0.25rem 0 1.2rem 0;
         }
 
-        .ptn-hero:after {
+        .tri-hero:after {
             content: "";
             position: absolute;
-            width: 18rem;
-            height: 18rem;
-            right: -7rem;
-            top: -8rem;
-            background: radial-gradient(circle, rgba(99, 91, 255, 0.18), transparent 64%);
+            width: 20rem;
+            height: 20rem;
+            right: -8rem;
+            top: -9rem;
+            background: radial-gradient(circle, rgba(0, 212, 255, 0.18), transparent 65%);
             pointer-events: none;
         }
 
-        .ptn-hero .eyebrow,
-        .ptn-race-card .eyebrow {
-            color: var(--stripe-purple);
-            font-size: 0.74rem;
+        .tri-hero .eyebrow,
+        .tri-race-card .eyebrow {
+            color: var(--tri-cyan);
+            font-size: 0.72rem;
             font-weight: 900;
             letter-spacing: 0.15em;
             text-transform: uppercase;
             margin-bottom: 0.35rem;
         }
 
-        .ptn-hero h1 {
-            color: var(--stripe-navy);
-            font-size: 2.15rem;
+        .tri-hero h1 {
+            color: var(--tri-text);
+            font-size: 2.12rem;
             line-height: 1.05;
             margin: 0;
             letter-spacing: -0.045em;
         }
 
-        .ptn-hero p {
-            color: var(--ptn-muted);
+        .tri-hero p {
+            color: var(--tri-muted);
             margin: 0.55rem 0 0 0;
-            font-size: 1rem;
+            font-size: 0.98rem;
         }
 
-        .ptn-race-card,
+        .tri-race-card,
         [data-testid="stMetric"],
         div[data-testid="stExpander"] {
-            background: rgba(255, 255, 255, 0.88);
-            border: 1px solid var(--ptn-border);
-            box-shadow: 0 18px 45px rgba(10, 37, 64, 0.06);
+            background: var(--tri-panel);
+            border: 1px solid var(--tri-border);
+            box-shadow: 0 18px 48px var(--tri-shadow-soft);
+            backdrop-filter: blur(12px);
         }
 
-        .ptn-race-card {
+        .tri-race-card {
             padding: 1.15rem 1.25rem;
             border-radius: 1.15rem;
             margin: 0.35rem 0 1rem 0;
         }
 
-        .ptn-race-card h2 {
+        .tri-race-card h2 {
             margin: 0;
-            color: var(--stripe-navy);
-            font-size: 1.55rem;
+            color: var(--tri-text);
+            font-size: 1.52rem;
             letter-spacing: -0.035em;
         }
 
-        .ptn-race-card .meta {
-            color: var(--ptn-muted);
+        .tri-race-card .meta {
+            color: var(--tri-muted);
             margin-top: 0.4rem;
             font-size: 0.92rem;
         }
 
-        .ptn-section-title {
+        .tri-section-title {
             display: flex;
             align-items: center;
             gap: 0.55rem;
-            color: var(--stripe-navy);
+            color: var(--tri-text);
             font-weight: 850;
-            font-size: 1.3rem;
+            font-size: 1.28rem;
             letter-spacing: -0.03em;
             margin: 1.25rem 0 0.7rem 0;
         }
 
-        .ptn-pill {
+        .tri-pill {
             display: inline-block;
             padding: 0.22rem 0.55rem;
             border-radius: 999px;
             font-size: 0.76rem;
-            font-weight: 750;
-            color: #3B2DBF;
-            background: rgba(99, 91, 255, 0.10);
-            border: 1px solid rgba(99, 91, 255, 0.18);
+            font-weight: 760;
+            color: #DDE7FF;
+            background: rgba(124, 92, 255, 0.18);
+            border: 1px solid rgba(124, 92, 255, 0.34);
         }
 
         [data-testid="stMetric"] {
@@ -220,12 +232,12 @@ def apply_dashboard_theme() -> None:
         }
 
         [data-testid="stMetricLabel"] p {
-            color: var(--ptn-muted) !important;
-            font-weight: 750;
+            color: var(--tri-muted) !important;
+            font-weight: 760;
         }
 
         [data-testid="stMetricValue"] {
-            color: var(--stripe-navy);
+            color: var(--tri-text);
             font-weight: 900;
         }
 
@@ -233,13 +245,20 @@ def apply_dashboard_theme() -> None:
         [data-testid="stDataFrame"] {
             border-radius: 1rem;
             overflow: hidden;
-            border: 1px solid var(--ptn-border);
-            box-shadow: 0 14px 34px rgba(10, 37, 64, 0.05);
+            border: 1px solid var(--tri-border);
+            box-shadow: 0 14px 38px rgba(0, 0, 0, 0.24);
+            background: var(--tri-panel-solid);
         }
 
         div[data-testid="stExpander"] {
             border-radius: 1rem;
             overflow: hidden;
+        }
+
+        div[data-testid="stExpander"] summary,
+        div[data-testid="stExpander"] p,
+        div[data-testid="stExpander"] span {
+            color: var(--tri-text) !important;
         }
 
         .stTabs [data-baseweb="tab-list"] {
@@ -250,56 +269,65 @@ def apply_dashboard_theme() -> None:
             height: 2.65rem;
             border-radius: 999px;
             padding: 0 1rem;
-            background: #FFFFFF;
-            color: var(--stripe-slate);
-            border: 1px solid var(--ptn-border);
+            background: rgba(15, 23, 42, 0.78);
+            color: var(--tri-muted);
+            border: 1px solid var(--tri-border);
         }
 
         .stTabs [aria-selected="true"] {
-            background: rgba(99, 91, 255, 0.10);
-            border-color: rgba(99, 91, 255, 0.32);
-            color: var(--stripe-purple);
+            background: rgba(124, 92, 255, 0.20);
+            border-color: rgba(124, 92, 255, 0.42);
+            color: var(--tri-text);
         }
 
         .stButton > button,
         .stDownloadButton > button {
-            border-radius: 0.72rem;
-            border: 1px solid var(--ptn-border);
-            background: #FFFFFF;
-            color: var(--stripe-navy);
+            border-radius: 0.78rem;
+            border: 1px solid var(--tri-border);
+            background: rgba(15, 23, 42, 0.84);
+            color: var(--tri-text);
             font-weight: 760;
-            box-shadow: 0 8px 18px rgba(10, 37, 64, 0.04);
+            box-shadow: 0 10px 22px rgba(0, 0, 0, 0.16);
         }
 
         .stButton > button:hover,
         .stDownloadButton > button:hover {
-            border-color: rgba(99, 91, 255, 0.34);
-            background: #F7F9FF;
-            color: var(--stripe-purple);
+            border-color: rgba(0, 212, 255, 0.44);
+            background: rgba(25, 35, 60, 0.96);
+            color: white;
         }
 
         [data-testid="stSidebar"] .stButton > button {
             justify-content: flex-start;
             text-align: left;
             padding-left: 0.85rem;
-            background: #FFFFFF !important;
-            border-color: #E6EBF2 !important;
-            color: #344054 !important;
+            background: rgba(15, 23, 42, 0.42) !important;
+            border-color: rgba(148, 163, 184, 0.16) !important;
+            color: #CBD5E1 !important;
             box-shadow: none !important;
         }
 
         [data-testid="stSidebar"] .stButton > button:hover {
-            background: #F6F9FC !important;
-            border-color: rgba(99, 91, 255, 0.28) !important;
-            color: var(--stripe-purple) !important;
+            background: rgba(30, 41, 59, 0.82) !important;
+            border-color: rgba(0, 212, 255, 0.32) !important;
+            color: #FFFFFF !important;
         }
 
         [data-testid="stSidebar"] .stButton > button[kind="primary"],
         [data-testid="stSidebar"] .stButton button[data-testid="baseButton-primary"] {
-            background: rgba(99, 91, 255, 0.09) !important;
-            border-color: rgba(99, 91, 255, 0.34) !important;
-            color: #3B2DBF !important;
-            box-shadow: none !important;
+            background: linear-gradient(135deg, rgba(124, 92, 255, 0.34), rgba(0, 212, 255, 0.16)) !important;
+            border-color: rgba(124, 92, 255, 0.56) !important;
+            color: #FFFFFF !important;
+            box-shadow: 0 12px 28px rgba(99, 91, 255, 0.20) !important;
+        }
+
+        div[data-baseweb="select"] > div,
+        div[data-baseweb="input"] > div,
+        textarea,
+        input {
+            background-color: rgba(15, 23, 42, 0.86) !important;
+            color: var(--tri-text) !important;
+            border-color: var(--tri-border) !important;
         }
 
         .stSelectbox,
@@ -316,13 +344,23 @@ def apply_dashboard_theme() -> None:
 
         div[data-testid="stAlert"] {
             border-radius: 1rem;
-            border: 1px solid var(--ptn-border);
+            border: 1px solid var(--tri-border);
+            background: rgba(15, 23, 42, 0.90);
+            color: var(--tri-text);
+        }
+
+        code,
+        pre {
+            background: rgba(2, 6, 23, 0.72) !important;
+            color: #DDE7FF !important;
+            border: 1px solid var(--tri-border) !important;
+            border-radius: 0.75rem !important;
         }
 
         h1,
         h2,
         h3 {
-            color: var(--stripe-navy);
+            color: var(--tri-text);
             letter-spacing: -0.035em;
         }
         </style>
@@ -330,10 +368,11 @@ def apply_dashboard_theme() -> None:
         unsafe_allow_html=True,
     )
 
+
 def render_app_hero(page_name: str) -> None:
     st.markdown(
         f"""
-        <div class="ptn-hero">
+        <div class="tri-hero">
             <div class="eyebrow">Triathlon Picks Lab</div>
             <h1>🏁 {page_name}</h1>
             <p>Race predictions, split picks, evidence drilldowns, and scoring audits powered by Supabase.</p>
@@ -346,7 +385,7 @@ def render_app_hero(page_name: str) -> None:
 def render_race_card(race_name: str, gender: str, race_date: Any, window_start: Any) -> None:
     st.markdown(
         f"""
-        <div class="ptn-race-card">
+        <div class="tri-race-card">
             <div class="eyebrow">Selected Race</div>
             <h2>{race_name}</h2>
             <div class="meta">{gender} · Race date {format_date(race_date)} · Analysis window {format_date(window_start)} to {format_date(race_date)}</div>
@@ -357,7 +396,7 @@ def render_race_card(race_name: str, gender: str, race_date: Any, window_start: 
 
 
 def section_title(icon: str, title: str) -> None:
-    st.markdown(f'<div class="ptn-section-title"><span>{icon}</span><span>{title}</span></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="tri-section-title"><span>{icon}</span><span>{title}</span></div>', unsafe_allow_html=True)
 
 # ============================================================
 # Basic helpers
@@ -1464,7 +1503,7 @@ def apply_gender_updates_from_rows(rows: List[Dict[str, Any]]) -> int:
 def canonical_athlete_url(url: Any) -> Optional[str]:
     """Normalize athlete profile URLs so imports merge instead of duplicating.
 
-    PTN URLs can arrive as /athletes/slug, /en/athletes/slug, http vs https,
+    Source athlete URLs can arrive as /athletes/slug, /en/athletes/slug, http vs https,
     or with trailing slashes/query strings. The database should store one stable
     key: https://protrinews.com/athletes/<slug>.
     """
@@ -1498,7 +1537,7 @@ def canonicalize_athlete_url_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def athlete_profile_url_candidates(url: Any) -> List[str]:
-    """Return a small set of allowed URL variants for the same PTN athlete.
+    """Return a small set of allowed URL variants for the same athlete.
 
     Some imported rows use /athletes/slug and some use /en/athletes/slug. The
     profile payload is not always identical, so the backfill checks both variants
@@ -1667,7 +1706,7 @@ def missing_gender_athletes(athletes: pd.DataFrame, results: pd.DataFrame, start
 
 
 def apply_profile_gender_backfill(candidates: pd.DataFrame, batch_size: int = 25, delay_seconds: float = 0.75) -> pd.DataFrame:
-    """Rate-limited, missing-only gender backfill from permissioned PTN profile pages."""
+    """Rate-limited, missing-only gender backfill from permissioned profile pages."""
     if candidates is None or candidates.empty:
         return pd.DataFrame()
     work = candidates.head(batch_size).copy()
@@ -1840,7 +1879,7 @@ def normalized_race_identity_name(value: Any) -> str:
 def build_race_sof_fill_key(row: pd.Series, include_gender: bool = True) -> str:
     """Create a stable key for race-level SOF backfill.
 
-    PTN sometimes stores SOF on some athletes' rows for the same race but leaves
+    Imported rows sometimes store SOF on some athletes' rows for the same race but leave
     it blank on other athletes' rows. SOF is race-level evidence, not athlete-
     level evidence, so we should copy the canonical race SOF to the missing rows.
     """
@@ -2010,7 +2049,7 @@ def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
         results["ors"] = pd.to_numeric(results["ors"], errors="coerce")
         results["sof"] = pd.to_numeric(results["sof"], errors="coerce")
 
-        # SOF is race-level evidence. PTN/imported CSV rows can have SOF blank
+        # SOF is race-level evidence. Imported CSV rows can have SOF blank
         # for one athlete while other athletes from the exact same race have it.
         # Fill missing SOF from the canonical same-race value before scoring.
         results = fill_missing_sof_from_same_race(results)
@@ -2851,7 +2890,7 @@ def openrank_tier_for_row(row: pd.Series, discipline: Optional[str] = None) -> s
 
     This mirrors the public OpenRank idea: race quality is not just branding;
     championship status, race family, and SOF determine how much a result can
-    move a ranking. The exact PTN tier labels are not always present in our CSV,
+    move a ranking. The exact source tier labels are not always present in our CSV,
     so this is a deterministic local approximation.
     """
     race = (clean_str(row.get("race_name")) or "").lower()
@@ -2938,7 +2977,7 @@ def openrank_sof_score(row: pd.Series, tier: str) -> float:
 def openrank_time_score(split_seconds: Any, baseline_split_seconds: Any, tier: str, sof_score: float) -> float:
     """OpenRank-style split-time score.
 
-    PTN OpenRank uses a race baseline score and then deducts/adds 6 points per
+    OpenRank uses a race baseline score and then deducts/adds 6 points per
     1 percentage point slower/faster than baseline. We apply the same concept
     to swim/bike/run split times inside that same race/sample.
     """
@@ -3730,7 +3769,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 with st.sidebar:
     st.markdown(
         """
-        <div class="ptn-sidebar-brand">
+        <div class="tri-sidebar-brand">
             <div><span class="logo">🏁</span><span class="title">Triathlon Picks</span></div>
             <div class="subtitle">Supabase scoring engine · Streamlit dashboard</div>
         </div>
@@ -3739,7 +3778,7 @@ with st.sidebar:
     )
 
     for section, items in NAV_GROUPS:
-        st.markdown(f'<div class="ptn-sidebar-section">{section}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="tri-sidebar-section">{section}</div>', unsafe_allow_html=True)
         for label, page_name in items:
             active = st.session_state["page_label"] == label
             if st.button(label, key=f"nav_{page_name}", type="primary" if active else "secondary", width="stretch"):
@@ -4019,9 +4058,9 @@ elif page == "Gender Tools":
                 max_value=5.0,
                 value=0.25,
                 step=0.25,
-                help="Optional throttle so the cleanup tool does not hit PTN too fast. Use 0 for no pause on small permissioned batches; 0.25–0.75 is safer for larger batches.",
+                help="Optional throttle so the cleanup tool does not send requests too fast. Use 0 for no pause on small permissioned batches; 0.25–0.75 is safer for larger batches.",
             )
-        st.caption("Delay is optional. It is just a throttle between profile requests so this stays a controlled missing-only cleanup instead of hammering PTN.")
+        st.caption("Delay is optional. It is just a throttle between profile requests so this stays a controlled missing-only cleanup instead of sending requests too aggressively.")
         st.warning("This should be a permissioned, missing-only cleanup tool. Do not schedule it to crawl the whole database daily.")
         if st.button("Run permissioned profile gender backfill", type="primary"):
             log_df = apply_profile_gender_backfill(candidates, batch_size=int(batch_size), delay_seconds=float(delay))
