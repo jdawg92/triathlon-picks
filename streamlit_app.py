@@ -2412,8 +2412,7 @@ def score_splits_for_start_list(
     audit: pd.DataFrame,
     start_athletes: pd.DataFrame,
     target_date: pd.Timestamp,
-    recent_n: int,
-    drop_worst: int,
+    top_n: int,
     strong_sof_threshold: float,
 ) -> pd.DataFrame:
     if audit.empty:
@@ -2440,13 +2439,8 @@ def score_splits_for_start_list(
     rows = []
     for athlete_key, g in df.groupby(df["athlete_url"].fillna(df["athlete_name"])):
         g = g.sort_values("race_date", ascending=False).copy()
-        recent = g.head(recent_n).copy()
-        if len(recent) > drop_worst + 2 and drop_worst > 0:
-            # Drop worst by evidence score so one bad/mechanical day doesn't wreck the current estimate.
-            drop_idx = recent.sort_values("evidence_score", ascending=True).head(drop_worst).index
-            recent_scored = recent.drop(index=drop_idx)
-        else:
-            recent_scored = recent
+        recent = g.head(top_n).copy()
+        recent_scored = recent
 
         if recent_scored.empty:
             continue
@@ -2636,8 +2630,7 @@ def score_overall(
     overrides: pd.DataFrame,
     target_date: pd.Timestamp,
     target_year: int,
-    recent_n: int,
-    drop_worst: int,
+    top_n: int,
 ) -> pd.DataFrame:
     if results.empty or start_athletes.empty:
         return pd.DataFrame()
@@ -2666,12 +2659,8 @@ def score_overall(
         if not scored_rows:
             continue
         gg = pd.DataFrame(scored_rows).sort_values("race_date", ascending=False)
-        recent = gg.head(recent_n).copy()
-        if len(recent) > drop_worst + 2 and drop_worst > 0:
-            drop_idx = recent.sort_values("ors", ascending=True).head(drop_worst).index
-            recent_scored = recent.drop(index=drop_idx)
-        else:
-            recent_scored = recent
+        recent = gg.head(top_n).copy()
+        recent_scored = recent
         current_year = gg[gg["race_date"].dt.year == target_year]
         strong = recent_scored[(recent_scored["sof"].fillna(0) >= 70) | (recent_scored["race_type"].isin(["T100", "WTCS"]))]
         championship_score = 0.0
@@ -2895,8 +2884,7 @@ def score_splits_for_start_list(
     audit: pd.DataFrame,
     start_athletes: pd.DataFrame,
     target_date: pd.Timestamp,
-    recent_n: int,
-    drop_worst: int,
+    top_n: int,
     strong_sof_threshold: float,
 ) -> pd.DataFrame:
     if audit is None or audit.empty:
@@ -2924,8 +2912,8 @@ def score_splits_for_start_list(
     for athlete_key, g in df.groupby(df["athlete_url"].fillna(df["athlete_name"])):
         g = g.sort_values("race_date", ascending=False).copy()
         score_values = pd.to_numeric(g.get("split_openrank_score"), errors="coerce").dropna().tolist()
-        openrank_score, best4_scores = best4_openrank_average(score_values, 4)
-        recent = g.head(max(5, recent_n)).copy()
+        openrank_score, best_scores = best4_openrank_average(score_values, top_n)
+        recent = g.head(max(5, top_n)).copy()
         premium = g[g["premium_evidence"].astype(bool)]
         strong = g[g["strong_evidence"].astype(bool)]
         recent_weights = g.get("evidence_weight", pd.Series(1.0, index=g.index)).astype(float).tolist()
@@ -2964,7 +2952,7 @@ def score_splits_for_start_list(
             "Athlete URL": g["athlete_url"].dropna().iloc[0] if g["athlete_url"].notna().any() else None,
             "Score": round(final, 1),
             "OpenRank Split Score": round(openrank_score, 1),
-            "Best 4 Split Scores": ", ".join([f"{x:.1f}" for x in best4_scores]),
+            "Best Split Scores Used": ", ".join([f"{x:.1f}" for x in best_scores]),
             "Confidence": confidence,
             "Premium Evidence Count": premium_count,
             "Strong Evidence Count": strong_count,
@@ -3001,8 +2989,7 @@ def score_overall(
     overrides: pd.DataFrame,
     target_date: pd.Timestamp,
     target_year: int,
-    recent_n: int,
-    drop_worst: int,
+    top_n: int,
 ) -> pd.DataFrame:
     if results is None or results.empty or start_athletes is None or start_athletes.empty:
         return pd.DataFrame()
@@ -3030,7 +3017,7 @@ def score_overall(
         if not scored_rows:
             continue
         gg = pd.DataFrame(scored_rows).sort_values("race_date", ascending=False)
-        rank_score_val, best4_scores = best4_openrank_average(gg["ors_for_rank"].tolist(), 4)
+        rank_score_val, best_scores = best4_openrank_average(gg["ors_for_rank"].tolist(), top_n)
         current_year = gg[gg["race_date"].dt.year == target_year]
         current_year_score = pd.to_numeric(current_year.get("ors_for_rank", pd.Series(dtype=float)), errors="coerce").mean() if not current_year.empty else None
         strong = gg[(gg["sof"].fillna(0) >= 70) | (gg["race_type"].isin(["T100", "WTCS"]))]
@@ -3044,13 +3031,13 @@ def score_overall(
             "Athlete URL": url,
             "Score": round(rank_score_val, 1),
             "OpenRank Score": round(rank_score_val, 1),
-            "Best 4 ORS": ", ".join([f"{x:.1f}" for x in best4_scores]),
+            "Best Scores Used": ", ".join([f"{x:.1f}" for x in best_scores]),
             "Recent Form ORS": round(rank_score_val, 1),
             "Current Year ORS": round(float(current_year_score), 1) if current_year_score is not None and not pd.isna(current_year_score) else None,
-            "Best Recent ORS": round(max(best4_scores), 1) if best4_scores else 0,
+            "Best Recent ORS": round(max(best_scores), 1) if best_scores else 0,
             "Strong Field ORS": round(float(strong_score), 1) if strong_score is not None and not pd.isna(strong_score) else 0,
             "Championship Score": round(championship_result_score(gg.sort_values("race_date", ascending=False).iloc[0]), 1) if not gg.empty else 0,
-            "Recent Races Used": len([x for x in best4_scores if x > 0]),
+            "Recent Races Used": len([x for x in best_scores if x > 0]),
             "OpenRank": open_rank,
             "Last Race": clean_str(gg.iloc[0].get("race_name")) if len(gg) else "",
             "Last Race Date": format_date(gg.iloc[0].get("race_date")) if len(gg) else "",
@@ -3612,7 +3599,7 @@ elif page == "Athlete Rankings":
         st.warning("No athlete results found. Import Athlete Results first.")
         st.stop()
 
-    c1, c2, c3, c4, c5 = st.columns([1.1, 1.3, 1.1, 1.1, 1.1])
+    c1, c2, c3, c4 = st.columns([1.1, 1.3, 1.1, 1.1])
     ranking_gender = c1.selectbox("Gender", ["Men", "Women"], index=0)
     ranking_scope = c2.selectbox(
         "Race family",
@@ -3621,8 +3608,7 @@ elif page == "Athlete Rankings":
         help="Use 70.3/Middle for normal 70.3-style rankings, or T100/PTO for that race family only.",
     )
     as_of = c3.date_input("As of date", value=date.today())
-    recent_n_rank = c4.slider("Recent races used", 3, 8, 5, key="rank_recent_n")
-    drop_worst_rank = c5.slider("Drop worst", 0, 2, 1, key="rank_drop_worst")
+    top_n_rank = c4.slider("Top scores used", 3, 8, 4, key="rank_top_n", help="OpenRank-style scoring uses the best X valid scores in the trailing 52 weeks. Missing scores are padded as zero.")
     as_of_ts = pd.Timestamp(as_of)
     year = int(as_of_ts.year)
     window_start_rank = pd.Timestamp(date(year - 2, 1, 1))
@@ -3651,13 +3637,13 @@ elif page == "Athlete Rankings":
 
     tabs = st.tabs(["🏆 Overall", "🏊 Swim", "🚴 Bike", "🏃 Run"])
     with tabs[0]:
-        overall_all = score_overall(ranking_results, start_all, overrides, as_of_ts, year, recent_n_rank, drop_worst_rank)
-        display_table(overall_all.head(75), ["Rank", "Athlete", "Score", "OpenRank Score", "Best 4 ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"], height=620)
+        overall_all = score_overall(ranking_results, start_all, overrides, as_of_ts, year, top_n_rank)
+        display_table(overall_all.head(75), ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"], height=620)
     for tab, disc in zip(tabs[1:], ["swim", "bike", "run"]):
         with tab:
             aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, ranking_gender, disc, min_field_size=5)
-            scored = score_splits_for_start_list(aud, start_all, as_of_ts, recent_n_rank, drop_worst_rank, strong_sof_threshold=70)
-            display_table(scored.head(75), ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best 4 Split Scores", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"], height=620)
+            scored = score_splits_for_start_list(aud, start_all, as_of_ts, top_n_rank, strong_sof_threshold=70)
+            display_table(scored.head(75), ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"], height=620)
 
 elif page == "Database Viewer":
     st.header("🗄️ Database Viewer")
@@ -3703,8 +3689,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
 
     with st.sidebar:
         selected_label = st.selectbox("Race / Gender", labels, index=max(0, len(labels) - 1))
-        recent_n = st.slider("Recent races used", 3, 8, 5)
-        drop_worst = st.slider("Drop worst recent result", 0, 2, 1)
+        top_n = st.slider("Top scores used", 3, 8, 4, help="OpenRank-style scoring uses the best X valid scores in the trailing 52 weeks. Missing scores are padded as zero.")
         min_field_size = st.slider("Low-sample warning threshold", 3, 15, 5)
         strong_sof_threshold = st.slider("Strong-field SOF threshold", 55, 90, 70)
 
@@ -3792,10 +3777,10 @@ elif page in {"Race Dashboard", "Split Audit"}:
                 )
 
         section_title("🏆", "Overall Picks")
-        overall = score_overall(results_window, start_athletes, overrides, selected_date, target_year, recent_n, drop_worst)
+        overall = score_overall(results_window, start_athletes, overrides, selected_date, target_year, top_n)
         display_table(
             overall.head(15),
-            ["Rank", "Athlete", "Score", "OpenRank Score", "Best 4 ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "OpenRank", "Last Race", "Last Race Date"],
+            ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "OpenRank", "Last Race", "Last Race Date"],
         )
 
         if not overall.empty:
@@ -3820,19 +3805,19 @@ elif page in {"Race Dashboard", "Split Audit"}:
                             )
 
         st.divider()
-        st.info("Split ranks use each discipline's own recent valid split rows — not the athlete's top overall races. Swim uses recent swim evidence, bike uses recent bike evidence, and run uses recent run evidence. Full-distance swim/bike now count as high-value non-draft evidence; full-distance run is weighted lower because it transfers less directly to 70.3 speed. Imported sample coverage is still not the full ProTriNews field yet.")
+        st.info("Split ranks use each discipline's own best valid split scores from the trailing 52 weeks — not the athlete's top overall races. Swim uses recent swim evidence, bike uses recent bike evidence, and run uses recent run evidence. Full-distance swim/bike now count as high-value non-draft evidence; full-distance run is weighted lower because it transfers less directly to 70.3 speed. Imported sample coverage is still not the full ProTriNews field yet.")
         tabs = st.tabs(["🏊 Fastest Swim", "🚴 Fastest Bike", "🏃 Fastest Run"])
         for tab, disc, title in zip(tabs, ["swim", "bike", "run"], ["Fastest Swim", "Fastest Bike", "Fastest Run"]):
             with tab:
                 section_title("🏊" if disc == "swim" else "🚴" if disc == "bike" else "🏃", title)
-                scored = score_splits_for_start_list(audit_by_disc[disc], start_athletes, selected_date, recent_n, drop_worst, strong_sof_threshold)
+                scored = score_splits_for_start_list(audit_by_disc[disc], start_athletes, selected_date, top_n, strong_sof_threshold)
                 scored_top = scored.head(12).copy()
                 display_table(
                     scored_top,
-                    ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best 4 Split Scores", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Premium Top 3 %", "Strong Top 3 %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
+                    ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Premium Top 3 %", "Strong Top 3 %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
                     height=360,
                 )
-                st.caption("Open an athlete below to see the exact recent split rows used for this discipline. These are not the athlete's best overall races; each split is scored from its own swim/bike/run evidence.")
+                st.caption("Open an athlete below to see the exact split rows considered for this discipline. These are not the athlete's best overall races; each split is scored from its own swim/bike/run evidence.")
 
                 if not scored_top.empty:
                     aud = audit_by_disc[disc]
