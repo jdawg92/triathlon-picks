@@ -815,25 +815,37 @@ def build_split_audit(
     discipline: str,
     min_field_size: int,
 ) -> pd.DataFrame:
+    """Build split audit rows.
+
+    Important: this table is a scoring audit, not a full career-result list.
+    It now keeps DNF/DNS/DSQ rows in the audit as excluded rows instead of
+    silently dropping them, so the user can see why a recent result was not used.
+    Rows with no valid split for the selected discipline still cannot be ranked,
+    so use the raw career diagnostic in the Split Audit page to inspect those.
+    """
     split_col = f"{discipline}_seconds"
     if results.empty or split_col not in results.columns:
         return pd.DataFrame()
 
-    # Same-gender only when known. Unknown-gender rows are allowed when the race
-    # name does not clearly indicate the opposite gender. This prevents partial
-    # imported fields from collapsing to 1-2 athletes and making Included only blank.
     start_urls = set(start_athletes["athlete_url"].dropna().astype(str).tolist()) if "athlete_url" in start_athletes else set()
     df = results.copy()
     df = df[(df["race_date"].notna()) & (df["race_date"] <= target_date)]
-    df = df[(df[split_col].notna()) & (~df["bad_status"])]
+
+    # Keep rows with a parsed split even if they are DNF/DNS/DSQ. They will be
+    # marked excluded below. Previously we filtered them out before the audit,
+    # which made it look like recent races were missing.
+    df = df[df[split_col].notna()]
 
     gender_known_match = df["gender"].eq(gender)
     gender_unknown_ok = df["gender"].isna() & df["race_name"].map(lambda x: race_gender_compatible(x, gender))
     start_list_match = df["athlete_url"].isin(start_urls)
     df = df[gender_known_match | gender_unknown_ok | start_list_match]
 
+    # Draft-legal bike rows should be visible in the audit, but excluded from scoring.
+    draft_bike_mask = pd.Series(False, index=df.index)
     if discipline == "bike":
-        df = df[~df["race_type"].fillna("").str.lower().str.contains("wtcs|world triathlon|continental|draft")]
+        draft_bike_mask = df["race_type"].fillna("").str.lower().str.contains("wtcs|world triathlon|continental|draft")
+    df["draft_bike_excluded"] = draft_bike_mask
 
     if df.empty:
         return pd.DataFrame()
@@ -842,58 +854,75 @@ def build_split_audit(
     audit_rows = []
 
     for _, g in df.groupby("race_key"):
-        g = g.copy().sort_values(split_col, ascending=True)
-        # Re-rank after filtering invalid rows.
-        fastest = safe_float(g[split_col].min())
-        if fastest is None or fastest <= 0:
-            continue
-        field_size = len(g)
-        if field_size < min_field_size:
-            # still show in audit as excluded
-            pass
-        sorted_splits = g[split_col].dropna().sort_values().tolist()
-        second = sorted_splits[1] if len(sorted_splits) > 1 else None
+        g = g.copy()
+        # Rank and fastest calculations use only rows that are eligible for scoring.
+        # Bad-status rows and draft-legal bike rows remain visible, but they do not
+        # create/alter the race-relative split ranking.
+        scoring_g = g[(~g.get("bad_status", False).astype(bool)) & (~g["draft_bike_excluded"].astype(bool))].copy()
+        scoring_g = scoring_g.sort_values(split_col, ascending=True)
 
-        for idx, (_, r) in enumerate(g.iterrows(), start=1):
+        fastest = safe_float(scoring_g[split_col].min()) if not scoring_g.empty else None
+        field_size = len(scoring_g)
+        sorted_splits = scoring_g[split_col].dropna().sort_values().tolist() if not scoring_g.empty else []
+        second = sorted_splits[1] if len(sorted_splits) > 1 else None
+        rank_map = {row_idx: rank for rank, row_idx in enumerate(scoring_g.index.tolist(), start=1)}
+
+        for row_idx, r in g.iterrows():
             split_sec = safe_float(r.get(split_col))
             if split_sec is None:
                 continue
-            pct_behind = ((split_sec - fastest) / fastest) * 100
-            gap_second = None
-            if idx == 1 and second:
-                gap_second = ((second - fastest) / fastest) * 100
-            rs = rank_score(idx, field_size)
-            cs = closeness_score(pct_behind, discipline)
-            ds = dominance_score(gap_second, discipline)
-            raw_score = 0.70 * cs + 0.20 * rs + 0.10 * ds
+
             rt = clean_str(r.get("race_type")) or "Unknown"
+            bad_status = bool(r.get("bad_status", False))
+            draft_bike = bool(r.get("draft_bike_excluded", False))
+            excluded_override, override_mult, override_reason = match_override(r, overrides, discipline)
+
+            idx = rank_map.get(row_idx)
+            pct_behind = None
+            gap_second = None
+            rs = 0
+            cs = 0
+            ds = 0
+            raw_score = 0
             s_cap = sof_cap(r.get("sof"), rt, discipline)
             f_cap = field_cap(field_size)
             t_cap = race_type_cap(rt, discipline)
             final_cap = min(s_cap, f_cap, t_cap)
-            # Include any valid race-relative sample with at least two athletes.
-            # Small fields are handled by low field caps/weights instead of being
-            # hidden completely. The min_field_size slider is now informational
-            # for low-sample warnings, not a hard include/exclude gate.
-            included = field_size >= 2 and final_cap > 0
+            final_score = 0
+            ew = 0
+            included = False
 
-            excluded_override, override_mult, override_reason = match_override(r, overrides, discipline)
-            if excluded_override:
-                included = False
-            final_score = min(raw_score, final_cap)
-            ew = race_type_weight(rt, discipline) * recency_weight(r.get("race_date"), target_date) * override_mult
-            if field_size < 15:
-                ew *= 0.75
-            sof_val = safe_float(r.get("sof"))
-            if sof_val is not None and sof_val >= 80:
-                ew *= 1.15
-            elif sof_val is not None and sof_val < 60:
-                ew *= 0.75
-            elif sof_val is None:
-                ew *= 0.65
+            if idx is not None and fastest is not None and fastest > 0:
+                pct_behind = ((split_sec - fastest) / fastest) * 100
+                if idx == 1 and second:
+                    gap_second = ((second - fastest) / fastest) * 100
+                rs = rank_score(idx, field_size)
+                cs = closeness_score(pct_behind, discipline)
+                ds = dominance_score(gap_second, discipline)
+                raw_score = 0.70 * cs + 0.20 * rs + 0.10 * ds
+                included = field_size >= 2 and final_cap > 0
+                if excluded_override:
+                    included = False
+                final_score = min(raw_score, final_cap)
+                ew = race_type_weight(rt, discipline) * recency_weight(r.get("race_date"), target_date) * override_mult
+                if field_size < 15:
+                    ew *= 0.75
+                sof_val = safe_float(r.get("sof"))
+                if sof_val is not None and sof_val >= 80:
+                    ew *= 1.15
+                elif sof_val is not None and sof_val < 60:
+                    ew *= 0.75
+                elif sof_val is None:
+                    ew *= 0.65
 
             reason = []
-            if field_size < 2:
+            if bad_status:
+                reason.append("bad status excluded")
+            if draft_bike:
+                reason.append("draft-legal bike excluded")
+            if field_size < 1:
+                reason.append("no scoring field")
+            elif field_size < 2:
                 reason.append("field<2")
             elif field_size < min_field_size:
                 reason.append(f"low sample field<{min_field_size}")
@@ -914,10 +943,10 @@ def build_split_audit(
                 "race_name": r.get("race_name"),
                 "race_type": rt,
                 "gender": r.get("gender"),
+                "place": r.get("place"),
+                "status": r.get("status"),
+                "bad_status": bad_status,
                 "sof": safe_float(r.get("sof")),
-                # IMPORTANT: this is the number of rows currently imported for this race,
-                # not necessarily the full ProTriNews race field. Until we import/cache full race
-                # fields, treat this as sample coverage, not true field size.
                 "field_size": field_size,
                 "sample_size": field_size,
                 "field_source": "imported_sample",
@@ -925,8 +954,8 @@ def build_split_audit(
                 "split_seconds": int(split_sec),
                 "split": format_seconds(split_sec),
                 "split_rank": idx,
-                "rank_display": f"{idx}/{field_size}",
-                "sample_rank_display": f"{idx}/{field_size}",
+                "rank_display": f"{idx}/{field_size}" if idx else "—",
+                "sample_rank_display": f"{idx}/{field_size}" if idx else "—",
                 "pct_behind_fastest": pct_behind,
                 "gap_when_fastest_pct": gap_second,
                 "closeness_score": cs,
@@ -939,12 +968,11 @@ def build_split_audit(
                 "final_cap": final_cap,
                 "evidence_score": final_score,
                 "evidence_weight": ew,
-                "included": bool(included),
+                "included": bool(included and not bad_status and not draft_bike),
                 "reason": "; ".join(reason),
             })
 
     return pd.DataFrame(audit_rows)
-
 
 def score_splits_for_start_list(
     audit: pd.DataFrame,
@@ -1479,7 +1507,23 @@ elif page in {"Race Dashboard", "Split Audit"}:
             view = view.sort_values(["athlete_name", "race_date"], ascending=[True, False])
             display_table(
                 view,
-                ["athlete_name", "race_date", "race_name", "race_type", "sof", "sample_size", "field_source", "split", "sample_rank_display", "pct_behind_fastest", "gap_when_fastest_pct", "closeness_score", "rank_score", "raw_score", "sof_cap", "field_cap", "race_type_cap", "final_cap", "evidence_score", "evidence_weight", "included", "coverage_note", "reason"],
+                ["athlete_name", "race_date", "race_name", "race_type", "place", "status", "bad_status", "sof", "sample_size", "field_source", "split", "sample_rank_display", "pct_behind_fastest", "gap_when_fastest_pct", "closeness_score", "rank_score", "raw_score", "sof_cap", "field_cap", "race_type_cap", "final_cap", "evidence_score", "evidence_weight", "included", "coverage_note", "reason"],
                 height=650,
             )
+
+            if athlete_filter != "All":
+                with st.expander(f"Raw imported career rows for {athlete_filter}", expanded=False):
+                    raw = results_window[results_window["athlete_name"].fillna("").eq(athlete_filter)].copy()
+                    if raw.empty:
+                        st.info("No raw imported result rows found for this athlete in the current analysis window.")
+                    else:
+                        split_col = f"{disc}_seconds"
+                        raw[f"{disc}_split"] = raw[split_col].map(format_seconds) if split_col in raw.columns else "—"
+                        raw = raw.sort_values("race_date", ascending=False)
+                        st.caption("This is the full imported career data in the analysis window. It explains why rows may not appear as included scoring rows: DNF/DNS/DSQ, missing split, draft-legal bike, or invalid split parsing.")
+                        display_table(
+                            raw,
+                            ["race_date", "race_name", "race_type", "distance", "place", "status", "bad_status", "sof", "ors", f"{disc}_split", "swim_seconds", "bike_seconds", "run_seconds"],
+                            height=400,
+                        )
 
