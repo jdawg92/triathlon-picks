@@ -2015,6 +2015,350 @@ def score_overall(
 
 
 
+# ============================================================
+# OpenRank-aligned scoring overrides
+# ============================================================
+def openrank_tier_for_row(row: pd.Series, discipline: Optional[str] = None) -> str:
+    """Map our imported race row to the OpenRank-style tier model.
+
+    This mirrors the public OpenRank idea: race quality is not just branding;
+    championship status, race family, and SOF determine how much a result can
+    move a ranking. The exact PTN tier labels are not always present in our CSV,
+    so this is a deterministic local approximation.
+    """
+    race = (clean_str(row.get("race_name")) or "").lower()
+    rt = (clean_str(row.get("race_type")) or "").lower()
+    sof = safe_float(row.get("sof"))
+
+    if "ironman world championship" in race and "70.3" not in race:
+        return "Diamond"
+    if any(x in race for x in ["70.3 world championship", "world championship", "championship final", "olympic games"]):
+        return "Platinum"
+    if rt == "t100" or "t100" in race or "pto" in race:
+        return "Gold"
+    if sof is not None and sof >= 85:
+        return "Gold"
+    if rt == "wtcs":
+        # WTCS is elite for swim/run short-course predictions, but bike is excluded elsewhere.
+        return "Gold" if discipline in {"swim", "run", None} else "Bronze"
+    if rt in {"70.3", "challenge middle", "full"}:
+        if sof is not None and sof >= 75:
+            return "Silver"
+        return "Bronze"
+    if "world triathlon cup" in rt or "world triathlon cup" in race:
+        return "Silver" if discipline == "swim" else "Bronze"
+    if "continental" in rt or "continental" in race:
+        return "Bronze"
+    if rt in {"olympic", "sprint"}:
+        return "Bronze"
+    if sof is not None and sof >= 75:
+        return "Silver"
+    return "Bronze"
+
+
+def openrank_tier_params(tier: str) -> Tuple[float, float]:
+    t = (tier or "Bronze").title()
+    params = {
+        "Diamond": (100.0, 0.02),
+        "Platinum": (95.0, 0.02),
+        "Gold": (90.0, 0.05),
+        "Silver": (80.0, 0.08),
+        "Bronze": (70.0, 0.11),
+    }
+    return params.get(t, params["Bronze"])
+
+
+def openrank_position_score(rank: Any, tier: str) -> float:
+    r = parse_int(rank)
+    if not r or r < 1:
+        return 0.0
+    base, drop = openrank_tier_params(tier)
+    return float(base * ((1.0 - drop) ** (r - 1)))
+
+
+def openrank_baseline_count(field_size: int) -> int:
+    """OpenRank-style baseline group size by field/sample size."""
+    n = int(field_size or 0)
+    if n <= 0:
+        return 0
+    if n <= 4:
+        return 1
+    if n <= 8:
+        return 2
+    if n <= 12:
+        return 3
+    if n <= 16:
+        return 4
+    return 5
+
+
+def openrank_sof_score(row: pd.Series, tier: str) -> float:
+    """Use race SOF when available; otherwise use conservative tier seed."""
+    sof = safe_float(row.get("sof"))
+    if sof is not None:
+        return clamp(sof, 0, 100)
+    seeds = {
+        "Diamond": 90.0,
+        "Platinum": 85.0,
+        "Gold": 75.0,
+        "Silver": 60.0,
+        "Bronze": 45.0,
+    }
+    return seeds.get((tier or "Bronze").title(), 45.0)
+
+
+def openrank_time_score(split_seconds: Any, baseline_split_seconds: Any, tier: str, sof_score: float) -> float:
+    """OpenRank-style split-time score.
+
+    PTN OpenRank uses a race baseline score and then deducts/adds 6 points per
+    1 percentage point slower/faster than baseline. We apply the same concept
+    to swim/bike/run split times inside that same race/sample.
+    """
+    split = safe_float(split_seconds)
+    baseline = safe_float(baseline_split_seconds)
+    if split is None or baseline is None or baseline <= 0:
+        return 0.0
+    base, _ = openrank_tier_params(tier)
+    baseline_score = (base + (safe_float(sof_score) or 0.0)) / 2.0
+    pct_slower = ((split - baseline) / baseline) * 100.0
+    return clamp(baseline_score - (pct_slower * 6.0), 0, 120)
+
+
+def add_split_openrank_scores(audit: pd.DataFrame) -> pd.DataFrame:
+    """Add OpenRank-like split score columns to the audit table.
+
+    Split score = 35% position + 35% SOF + 30% split-time quality.
+    Athlete ranking then uses best 4 split scores in a rolling 52-week window,
+    padding missing scores with zero exactly like OpenRank's best-4 model.
+    """
+    if audit is None or audit.empty:
+        return pd.DataFrame() if audit is None else audit
+    out = audit.copy()
+    for c in [
+        "openrank_tier", "openrank_position_score", "openrank_sof_score",
+        "openrank_time_score", "split_openrank_score", "baseline_split"
+    ]:
+        if c not in out.columns:
+            out[c] = np.nan
+    if "race_key_calc" not in out.columns:
+        out["race_key_calc"] = (
+            out.get("race_name", pd.Series("", index=out.index)).fillna("").astype(str)
+            + "|" + out.get("race_date", pd.Series("", index=out.index)).astype(str)
+            + "|" + out.get("race_type", pd.Series("", index=out.index)).fillna("").astype(str)
+        )
+    discipline = clean_str(out["discipline"].dropna().iloc[0]) if "discipline" in out.columns and out["discipline"].notna().any() else None
+
+    for _, g in out.groupby("race_key_calc"):
+        scoring = g[g.get("included", False).astype(bool)].copy()
+        scoring["split_seconds_num"] = pd.to_numeric(scoring.get("split_seconds"), errors="coerce")
+        scoring = scoring[scoring["split_seconds_num"].notna()].sort_values("split_seconds_num", ascending=True)
+        field_size = len(scoring)
+        n = openrank_baseline_count(field_size)
+        baseline = float(scoring["split_seconds_num"].head(n).mean()) if n and not scoring.empty else None
+        for row_idx, r in g.iterrows():
+            split_rank = parse_int(r.get("split_rank"))
+            tier = openrank_tier_for_row(r, discipline)
+            sof_score = openrank_sof_score(r, tier)
+            pos_score = openrank_position_score(split_rank, tier)
+            time_score = openrank_time_score(r.get("split_seconds"), baseline, tier, sof_score)
+            score = 0.35 * pos_score + 0.35 * sof_score + 0.30 * time_score
+            # Keep the confidence/cap logic from the audit so small imported samples
+            # or low-quality race types cannot overstate the proof.
+            cap = safe_float(r.get("final_cap"))
+            if cap is not None:
+                score = min(score, cap)
+            if not bool(r.get("included", False)):
+                score = 0.0
+            out.at[row_idx, "openrank_tier"] = tier
+            out.at[row_idx, "openrank_position_score"] = round(pos_score, 3)
+            out.at[row_idx, "openrank_sof_score"] = round(sof_score, 3)
+            out.at[row_idx, "openrank_time_score"] = round(time_score, 3)
+            out.at[row_idx, "split_openrank_score"] = round(score, 3)
+            out.at[row_idx, "baseline_split"] = baseline
+    return out.drop(columns=["race_key_calc"], errors="ignore")
+
+
+def best4_openrank_average(values: Iterable[Any], divisor: int = 4) -> Tuple[float, List[float]]:
+    vals = [float(v) for v in values if safe_float(v) is not None]
+    vals = sorted(vals, reverse=True)[:divisor]
+    padded = vals + [0.0] * max(0, divisor - len(vals))
+    return (sum(padded) / divisor if divisor else 0.0), padded
+
+
+# Override previous split scoring with OpenRank-aligned split scoring.
+def score_splits_for_start_list(
+    audit: pd.DataFrame,
+    start_athletes: pd.DataFrame,
+    target_date: pd.Timestamp,
+    recent_n: int,
+    drop_worst: int,
+    strong_sof_threshold: float,
+) -> pd.DataFrame:
+    if audit is None or audit.empty:
+        return pd.DataFrame()
+    start_urls = set(start_athletes.get("athlete_url", pd.Series(dtype=str)).dropna().astype(str).tolist())
+    start_names = set(start_athletes.get("athlete_name", pd.Series(dtype=str)).dropna().astype(str).str.lower().tolist())
+    df = add_split_openrank_scores(audit)
+    df = df[df.get("included", False).astype(bool)].copy()
+    df = df[(df["athlete_url"].isin(start_urls)) | (df["athlete_name"].fillna("").str.lower().isin(start_names))]
+    if df.empty:
+        return pd.DataFrame()
+
+    discipline = clean_str(df["discipline"].dropna().iloc[0]) if "discipline" in df.columns and df["discipline"].notna().any() else "swim"
+    window_start = pd.to_datetime(target_date) - pd.Timedelta(days=365)
+    df = df[(df["race_date"].notna()) & (df["race_date"] >= window_start) & (df["race_date"] <= target_date)].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    # Recompute quality flags using the current sidebar threshold.
+    df["premium_evidence"] = df.apply(lambda r: is_premium_split_evidence(r, discipline, strong_sof_threshold), axis=1)
+    df["strong_evidence"] = df.apply(lambda r: is_strong_split_evidence(r, discipline, strong_sof_threshold), axis=1)
+    df["quality_tier"] = df.apply(lambda r: evidence_quality_label(r, discipline, strong_sof_threshold), axis=1)
+
+    rows = []
+    for athlete_key, g in df.groupby(df["athlete_url"].fillna(df["athlete_name"])):
+        g = g.sort_values("race_date", ascending=False).copy()
+        score_values = pd.to_numeric(g.get("split_openrank_score"), errors="coerce").dropna().tolist()
+        openrank_score, best4_scores = best4_openrank_average(score_values, 4)
+        recent = g.head(max(5, recent_n)).copy()
+        premium = g[g["premium_evidence"].astype(bool)]
+        strong = g[g["strong_evidence"].astype(bool)]
+        recent_weights = g.get("evidence_weight", pd.Series(1.0, index=g.index)).astype(float).tolist()
+        avg_behind = weighted_avg(pd.to_numeric(g.get("pct_behind_fastest"), errors="coerce").dropna().tolist(), None)
+        premium_avg_behind = weighted_avg(pd.to_numeric(premium.get("pct_behind_fastest", pd.Series(dtype=float)), errors="coerce").dropna().tolist(), None) if not premium.empty else None
+        strong_avg_behind = weighted_avg(pd.to_numeric(strong.get("pct_behind_fastest", pd.Series(dtype=float)), errors="coerce").dropna().tolist(), None) if not strong.empty else None
+        premium_count = len(premium)
+        strong_count = len(strong)
+        evidence_count = len(g)
+        # Confidence caps: OpenRank best-4 already pads missing races with zero,
+        # but keep a light cap for one-off samples so a single perfect split does
+        # not dominate a board.
+        final = float(openrank_score)
+        if evidence_count <= 1:
+            final = min(final, 45)
+            confidence = "Low - 1 split"
+        elif evidence_count == 2:
+            final = min(final, 62)
+            confidence = "Medium - 2 splits"
+        elif premium_count >= 2:
+            confidence = "High - repeated premium proof"
+        elif premium_count == 1:
+            confidence = "Good - 1 premium row"
+        elif strong_count >= 2:
+            confidence = "Good - repeated strong proof"
+        elif strong_count == 1:
+            confidence = "Medium - 1 strong row"
+        else:
+            final = min(final, 50)
+            confidence = "Low - weak/medium evidence"
+
+        best_row = g.sort_values(["split_openrank_score", "race_date"], ascending=[False, False]).head(1)
+        last_row = g.sort_values("race_date", ascending=False).head(1)
+        rows.append({
+            "Athlete": g["athlete_name"].dropna().iloc[0] if g["athlete_name"].notna().any() else athlete_key,
+            "Athlete URL": g["athlete_url"].dropna().iloc[0] if g["athlete_url"].notna().any() else None,
+            "Score": round(final, 1),
+            "OpenRank Split Score": round(openrank_score, 1),
+            "Best 4 Split Scores": ", ".join([f"{x:.1f}" for x in best4_scores]),
+            "Confidence": confidence,
+            "Premium Evidence Count": premium_count,
+            "Strong Evidence Count": strong_count,
+            "Evidence Count": evidence_count,
+            "Premium Field Score": round(pd.to_numeric(premium.get("split_openrank_score", pd.Series(dtype=float)), errors="coerce").mean(), 1) if not premium.empty else 0,
+            "Strong Field Score": round(pd.to_numeric(strong.get("split_openrank_score", pd.Series(dtype=float)), errors="coerce").mean(), 1) if not strong.empty else 0,
+            "Recent Score": round(pd.to_numeric(recent.get("split_openrank_score", pd.Series(dtype=float)), errors="coerce").mean(), 1) if not recent.empty else 0,
+            "Premium Avg Behind %": None if premium_avg_behind is None else round(premium_avg_behind, 2),
+            "Strong Avg Behind %": None if strong_avg_behind is None else round(strong_avg_behind, 2),
+            "Recent Avg Behind %": None if avg_behind is None else round(avg_behind, 2),
+            "Premium Top 3 %": round(((premium["split_rank"] <= 3).mean() * 100), 1) if not premium.empty else 0,
+            "Premium Fastest %": round(((premium["split_rank"] == 1).mean() * 100), 1) if not premium.empty else 0,
+            "Strong Top 3 %": round(((strong["split_rank"] <= 3).mean() * 100), 1) if not strong.empty else 0,
+            "Strong Fastest %": round(((strong["split_rank"] == 1).mean() * 100), 1) if not strong.empty else 0,
+            "Recent Top 3 %": round(((g["split_rank"] <= 3).mean() * 100), 1),
+            "Recent Fastest %": round(((g["split_rank"] == 1).mean() * 100), 1),
+            "Last Race": clean_str(last_row["race_name"].iloc[0]) if not last_row.empty else "",
+            "Last Race Date": format_date(last_row["race_date"].iloc[0]) if not last_row.empty else "",
+            "Last Rank": clean_str(last_row["rank_display"].iloc[0]) if not last_row.empty else "",
+            "Best Recent Split": clean_str(best_row["split"].iloc[0]) if not best_row.empty else "",
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values("Score", ascending=False).reset_index(drop=True)
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    return out
+
+
+# Override previous overall scoring with OpenRank's best-4-in-52-weeks model.
+def score_overall(
+    results: pd.DataFrame,
+    start_athletes: pd.DataFrame,
+    overrides: pd.DataFrame,
+    target_date: pd.Timestamp,
+    target_year: int,
+    recent_n: int,
+    drop_worst: int,
+) -> pd.DataFrame:
+    if results is None or results.empty or start_athletes is None or start_athletes.empty:
+        return pd.DataFrame()
+    start_urls = set(start_athletes.get("athlete_url", pd.Series(dtype=str)).dropna().astype(str).tolist())
+    start_names = set(start_athletes.get("athlete_name", pd.Series(dtype=str)).dropna().astype(str).str.lower().tolist())
+    df = results.copy()
+    window_start = pd.to_datetime(target_date) - pd.Timedelta(days=365)
+    df = df[(df["race_date"].notna()) & (df["race_date"] >= window_start) & (df["race_date"] <= target_date) & (~df["bad_status"])]
+    df = df[(df["athlete_url"].isin(start_urls)) | (df["athlete_name"].fillna("").str.lower().isin(start_names))]
+    df = df[df["ors"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    start_lookup, name_start_lookup = start_lookup_maps(start_athletes)
+    rows = []
+    for athlete_key, g in df.groupby(df["athlete_url"].fillna(df["athlete_name"])):
+        scored_rows = []
+        for _, r in g.sort_values("race_date", ascending=False).iterrows():
+            excluded, mult, reason = match_override(r, overrides, "Overall")
+            if excluded:
+                continue
+            rr = r.copy()
+            rr["ors_for_rank"] = (safe_float(r.get("ors")) or 0.0) * mult
+            scored_rows.append(rr)
+        if not scored_rows:
+            continue
+        gg = pd.DataFrame(scored_rows).sort_values("race_date", ascending=False)
+        rank_score_val, best4_scores = best4_openrank_average(gg["ors_for_rank"].tolist(), 4)
+        current_year = gg[gg["race_date"].dt.year == target_year]
+        current_year_score = pd.to_numeric(current_year.get("ors_for_rank", pd.Series(dtype=float)), errors="coerce").mean() if not current_year.empty else None
+        strong = gg[(gg["sof"].fillna(0) >= 70) | (gg["race_type"].isin(["T100", "WTCS"]))]
+        strong_score = pd.to_numeric(strong.get("ors_for_rank", pd.Series(dtype=float)), errors="coerce").mean() if not strong.empty else 0
+        name = g["athlete_name"].dropna().iloc[0] if g["athlete_name"].notna().any() else str(athlete_key)
+        url = g["athlete_url"].dropna().iloc[0] if g["athlete_url"].notna().any() else None
+        start_row = start_lookup.get(url) if url else name_start_lookup.get(name.lower())
+        open_rank = parse_int(start_row.get("open_rank")) if isinstance(start_row, dict) else None
+        rows.append({
+            "Athlete": name,
+            "Athlete URL": url,
+            "Score": round(rank_score_val, 1),
+            "OpenRank Score": round(rank_score_val, 1),
+            "Best 4 ORS": ", ".join([f"{x:.1f}" for x in best4_scores]),
+            "Recent Form ORS": round(rank_score_val, 1),
+            "Current Year ORS": round(float(current_year_score), 1) if current_year_score is not None and not pd.isna(current_year_score) else None,
+            "Best Recent ORS": round(max(best4_scores), 1) if best4_scores else 0,
+            "Strong Field ORS": round(float(strong_score), 1) if strong_score is not None and not pd.isna(strong_score) else 0,
+            "Championship Score": round(championship_result_score(gg.sort_values("race_date", ascending=False).iloc[0]), 1) if not gg.empty else 0,
+            "Recent Races Used": len([x for x in best4_scores if x > 0]),
+            "OpenRank": open_rank,
+            "Last Race": clean_str(gg.iloc[0].get("race_name")) if len(gg) else "",
+            "Last Race Date": format_date(gg.iloc[0].get("race_date")) if len(gg) else "",
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values("Score", ascending=False).reset_index(drop=True)
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    return out
+
+
+
 DISPLAY_LABELS = {
     "athlete_name": "Athlete",
     "athlete_url": "Athlete URL",
@@ -2064,6 +2408,12 @@ DISPLAY_LABELS = {
     "included": "Included",
     "reason": "Reason",
     "gender": "Gender",
+    "openrank_tier": "ORS Tier",
+    "openrank_position_score": "ORS Position",
+    "openrank_sof_score": "ORS SOF",
+    "openrank_time_score": "ORS Time",
+    "split_openrank_score": "Split ORS",
+    "baseline_split": "Baseline Split",
 }
 
 
@@ -2088,7 +2438,9 @@ def humanize_dataframe_for_display(show: pd.DataFrame) -> pd.DataFrame:
     numeric_cols = [
         "evidence_score", "evidence_weight", "closeness_score", "rank_score",
         "dominance_score", "raw_score", "sof_cap", "field_cap", "race_type_cap",
-        "final_cap", "SOF", "ORS", "Score"
+        "final_cap", "SOF", "ORS", "Score", "OpenRank Score",
+        "OpenRank Split Score", "split_openrank_score", "openrank_position_score",
+        "openrank_sof_score", "openrank_time_score", "baseline_split"
     ]
     for col in numeric_cols:
         if col in show.columns:
@@ -2178,233 +2530,6 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
         st.dataframe(show, width="stretch", hide_index=True)
     return None
 
-
-# ============================================================
-# Gender cleanup helpers
-# ============================================================
-GENDER_BACKFILL_SQL = """
--- Backfill athlete/result gender without scraping athlete profile pages.
--- Run in Supabase SQL Editor. This uses only your imported start lists and race-name hints.
-
--- 1) Normalize start-list genders onto athletes when an athlete appears in only one gender.
-with start_gender as (
-  select
-    athlete_url,
-    max(case
-      when lower(gender) like 'm%' then 'Men'
-      when lower(gender) like 'w%' or lower(gender) like 'f%' then 'Women'
-      else null
-    end) as gender
-  from public.start_lists
-  where athlete_url is not null
-    and athlete_url <> ''
-    and gender is not null
-    and gender <> ''
-  group by athlete_url
-  having count(distinct case
-      when lower(gender) like 'm%' then 'Men'
-      when lower(gender) like 'w%' or lower(gender) like 'f%' then 'Women'
-      else null
-    end) = 1
-)
-update public.athletes a
-set gender = sg.gender
-from start_gender sg
-where a.athlete_url = sg.athlete_url
-  and sg.gender in ('Men', 'Women')
-  and (a.gender is null or a.gender = '');
-
--- 2) Use obvious race-name hints on athlete_results.
-update public.athlete_results
-set gender = 'Women'
-where (gender is null or gender = '')
-  and (
-    race_name ilike '%women%'
-    or race_name ilike '%female%'
-    or race_name ilike '%ladies%'
-  );
-
-update public.athlete_results
-set gender = 'Men'
-where (gender is null or gender = '')
-  and (
-    race_name ilike '%men%'
-    or race_name ilike '%male%'
-  )
-  and not (
-    race_name ilike '%women%'
-    or race_name ilike '%female%'
-    or race_name ilike '%ladies%'
-  );
-
--- 3) Use obvious race-name hints on race_field_results.
-update public.race_field_results
-set gender = 'Women'
-where (gender is null or gender = '')
-  and (
-    race_name ilike '%women%'
-    or race_name ilike '%female%'
-    or race_name ilike '%ladies%'
-  );
-
-update public.race_field_results
-set gender = 'Men'
-where (gender is null or gender = '')
-  and (
-    race_name ilike '%men%'
-    or race_name ilike '%male%'
-  )
-  and not (
-    race_name ilike '%women%'
-    or race_name ilike '%female%'
-    or race_name ilike '%ladies%'
-  );
-
--- 4) Infer athlete gender from any consistent known row across start lists/results/field results.
-with known_gender as (
-  select athlete_url, gender
-  from public.start_lists
-  where athlete_url is not null and athlete_url <> '' and gender in ('Men', 'Women')
-  union all
-  select athlete_url, gender
-  from public.athlete_results
-  where athlete_url is not null and athlete_url <> '' and gender in ('Men', 'Women')
-  union all
-  select athlete_url, gender
-  from public.race_field_results
-  where athlete_url is not null and athlete_url <> '' and gender in ('Men', 'Women')
-), resolved as (
-  select athlete_url, max(gender) as gender
-  from known_gender
-  group by athlete_url
-  having count(distinct gender) = 1
-)
-update public.athletes a
-set gender = r.gender
-from resolved r
-where a.athlete_url = r.athlete_url
-  and r.gender in ('Men', 'Women')
-  and (a.gender is null or a.gender = '');
-
--- 5) Propagate known athlete gender back to every result row for that athlete.
-update public.athlete_results ar
-set gender = a.gender
-from public.athletes a
-where ar.athlete_url = a.athlete_url
-  and a.gender in ('Men', 'Women')
-  and (ar.gender is null or ar.gender = '');
-
-update public.race_field_results rfr
-set gender = a.gender
-from public.athletes a
-where rfr.athlete_url = a.athlete_url
-  and a.gender in ('Men', 'Women')
-  and (rfr.gender is null or rfr.gender = '');
-
--- 6) Quick verification counts.
-select 'athletes' as table_name, count(*) as total_rows, count(*) filter (where gender in ('Men','Women')) as gender_known, count(*) filter (where gender is null or gender = '') as gender_missing from public.athletes
-union all
-select 'athlete_results', count(*), count(*) filter (where gender in ('Men','Women')), count(*) filter (where gender is null or gender = '') from public.athlete_results
-union all
-select 'race_field_results', count(*), count(*) filter (where gender in ('Men','Women')), count(*) filter (where gender is null or gender = '') from public.race_field_results;
-"""
-
-
-def gender_counts_frame() -> pd.DataFrame:
-    rows = []
-    for table_name in ["athletes", "athlete_results", "race_field_results", "start_lists"]:
-        df = load_table(table_name)
-        if df.empty or "gender" not in df.columns:
-            rows.append({"Table": table_name, "Total Rows": len(df), "Known Gender": 0, "Missing Gender": len(df), "Men": 0, "Women": 0})
-            continue
-        genders = df["gender"].map(normalize_gender)
-        rows.append({
-            "Table": table_name,
-            "Total Rows": len(df),
-            "Known Gender": int(genders.isin(["Men", "Women"]).sum()),
-            "Missing Gender": int((~genders.isin(["Men", "Women"])).sum()),
-            "Men": int((genders == "Men").sum()),
-            "Women": int((genders == "Women").sum()),
-        })
-    return pd.DataFrame(rows)
-
-
-def build_gender_suggestions(results: pd.DataFrame, starts: pd.DataFrame, athletes: pd.DataFrame) -> pd.DataFrame:
-    suggestions: Dict[str, Dict[str, Any]] = {}
-
-    def add(url: Any, name: Any, gender: Any, source: str, confidence: str, evidence: str):
-        u = clean_str(url)
-        if not u:
-            return
-        g = normalize_gender(gender)
-        if g not in ["Men", "Women"]:
-            return
-        current = suggestions.get(u)
-        priority = {"Start list": 3, "Consistent imported rows": 2, "Race-name hint": 1}.get(source, 0)
-        if current and current.get("priority", 0) > priority:
-            return
-        if current and current.get("Suggested Gender") != g:
-            current["Suggested Gender"] = "CONFLICT"
-            current["Confidence"] = "Do not apply"
-            current["Evidence"] = (current.get("Evidence", "") + "; conflict with " + evidence).strip("; ")
-            return
-        suggestions[u] = {
-            "Athlete URL": u,
-            "Athlete": clean_str(name),
-            "Suggested Gender": g,
-            "Source": source,
-            "Confidence": confidence,
-            "Evidence": evidence,
-            "priority": priority,
-        }
-
-    if starts is not None and not starts.empty and {"athlete_url", "gender"}.issubset(starts.columns):
-        for u, g in starts.dropna(subset=["athlete_url"]).groupby("athlete_url"):
-            gs = sorted(set([x for x in g["gender"].map(normalize_gender).dropna().tolist() if x in ["Men", "Women"]]))
-            if len(gs) == 1:
-                name = g["athlete_name"].dropna().iloc[0] if "athlete_name" in g and g["athlete_name"].notna().any() else ""
-                add(u, name, gs[0], "Start list", "High", f"{len(g)} start-list row(s) all {gs[0]}")
-
-    combined = []
-    for table_name, df in [("athlete_results", results), ("race_field_results", load_table("race_field_results"))]:
-        if df is None or df.empty or "athlete_url" not in df.columns:
-            continue
-        tmp = df.copy()
-        if "gender" in tmp.columns:
-            tmp["_gender_norm"] = tmp["gender"].map(normalize_gender)
-        else:
-            tmp["_gender_norm"] = None
-        # Add race-name hint gender where the result row has no gender.
-        def race_hint(row):
-            existing = row.get("_gender_norm")
-            if existing in ["Men", "Women"]:
-                return existing
-            race = clean_str(row.get("race_name")) or ""
-            low = race.lower()
-            if any(x in low for x in ["women", "female", "ladies"]):
-                return "Women"
-            if any(x in low for x in ["men", "male"]) and not any(x in low for x in ["women", "female", "ladies"]):
-                return "Men"
-            return None
-        tmp["_hint_gender"] = tmp.apply(race_hint, axis=1)
-        combined.append(tmp[[c for c in ["athlete_url", "athlete_name", "race_name", "_hint_gender"] if c in tmp.columns]].assign(_table=table_name))
-
-    if combined:
-        all_rows = pd.concat(combined, ignore_index=True)
-        all_rows = all_rows[all_rows["_hint_gender"].isin(["Men", "Women"])]
-        for u, g in all_rows.groupby("athlete_url"):
-            gs = sorted(set(g["_hint_gender"].dropna().tolist()))
-            if len(gs) == 1:
-                name = g["athlete_name"].dropna().iloc[0] if "athlete_name" in g and g["athlete_name"].notna().any() else ""
-                source = "Consistent imported rows"
-                confidence = "Medium" if len(g) >= 2 else "Low"
-                add(u, name, gs[0], source, confidence, f"{len(g)} imported row(s) all {gs[0]}")
-
-    out = pd.DataFrame([v for v in suggestions.values() if v.get("Suggested Gender") in ["Men", "Women"]])
-    if out.empty:
-        return pd.DataFrame(columns=["Athlete", "Athlete URL", "Suggested Gender", "Source", "Confidence", "Evidence"])
-    return out.drop(columns=["priority"], errors="ignore").sort_values(["Confidence", "Source", "Athlete"], ascending=[True, True, True])
-
 # ============================================================
 # UI
 # ============================================================
@@ -2414,7 +2539,6 @@ PAGE_OPTIONS = {
     "🏆 Race Dashboard": "Race Dashboard",
     "🥇 Athlete Rankings": "Athlete Rankings",
     "👤 Athletes": "Athletes",
-    "🧬 Gender Tools": "Gender Tools",
     "🔎 Split Audit": "Split Audit",
     "📥 Import CSVs": "Import CSVs",
     "🗄️ Database Viewer": "Database Viewer",
@@ -2570,32 +2694,6 @@ elif page == "Athletes":
         st.subheader(f"Recent career rows for {selected}")
         display_table(raw.head(25), ["race_date", "race_name", "race_type", "distance", "place", "status", "sof", "sof_source", "ors", "swim_split", "bike_split", "run_split", "data_source"], height=420)
 
-elif page == "Gender Tools":
-    st.header("🧬 Gender Tools")
-    st.write("Use this to backfill missing Men/Women values from your imported start lists and race-name hints. This avoids scraping athlete profile pages.")
-
-    results, starts, athletes, overrides = prepare_dataframes()
-
-    st.subheader("Current gender coverage")
-    display_table(gender_counts_frame(), ["Table", "Total Rows", "Known Gender", "Missing Gender", "Men", "Women"], height=220)
-
-    st.subheader("Suggested athlete gender map")
-    suggestions = build_gender_suggestions(results, starts, athletes)
-    if suggestions.empty:
-        st.info("No gender suggestions found from the currently imported data.")
-    else:
-        high = suggestions[suggestions["Confidence"].isin(["High", "Medium"])]
-        st.write(f"Suggestions found: {len(suggestions):,} | High/Medium confidence: {len(high):,}")
-        display_table(suggestions.head(300), ["Athlete", "Suggested Gender", "Source", "Confidence", "Evidence", "Athlete URL"], height=430)
-        csv = suggestions.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download gender suggestions CSV", csv, "gender_suggestions.csv", "text/csv")
-
-    st.subheader("Bulk backfill SQL")
-    st.warning("Run this once in Supabase → SQL Editor. Then click Refresh database cache in the sidebar.")
-    st.code(GENDER_BACKFILL_SQL, language="sql")
-
-    st.caption("Why not scrape athlete profile URLs? The ProTriNews HTML you imported contains a legal notice prohibiting automated access/scraping. The safer workflow is to use your own imported start lists, race names, or an official/permissioned data feed.")
-
 elif page == "Athlete Rankings":
     st.header("🥇 Athlete Rankings")
     st.caption("Global rankings are now gender-strict and can be filtered by race family, so Men/Women and 70.3/T100 profiles do not get blended together.")
@@ -2644,12 +2742,12 @@ elif page == "Athlete Rankings":
     tabs = st.tabs(["🏆 Overall", "🏊 Swim", "🚴 Bike", "🏃 Run"])
     with tabs[0]:
         overall_all = score_overall(ranking_results, start_all, overrides, as_of_ts, year, recent_n_rank, drop_worst_rank)
-        display_table(overall_all.head(75), ["Rank", "Athlete", "Score", "Recent Form ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Championship Score", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"], height=620)
+        display_table(overall_all.head(75), ["Rank", "Athlete", "Score", "OpenRank Score", "Best 4 ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"], height=620)
     for tab, disc in zip(tabs[1:], ["swim", "bike", "run"]):
         with tab:
             aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, ranking_gender, disc, min_field_size=5)
             scored = score_splits_for_start_list(aud, start_all, as_of_ts, recent_n_rank, drop_worst_rank, strong_sof_threshold=70)
-            display_table(scored.head(75), ["Rank", "Athlete", "Score", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"], height=620)
+            display_table(scored.head(75), ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best 4 Split Scores", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"], height=620)
 
 elif page == "Database Viewer":
     st.header("🗄️ Database Viewer")
@@ -2787,7 +2885,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
         overall = score_overall(results_window, start_athletes, overrides, selected_date, target_year, recent_n, drop_worst)
         display_table(
             overall.head(15),
-            ["Rank", "Athlete", "Score", "Recent Form ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Championship Score", "Recent Races Used", "OpenRank", "Last Race", "Last Race Date"],
+            ["Rank", "Athlete", "Score", "OpenRank Score", "Best 4 ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "OpenRank", "Last Race", "Last Race Date"],
         )
 
         if not overall.empty:
@@ -2821,7 +2919,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                 scored_top = scored.head(12).copy()
                 display_table(
                     scored_top,
-                    ["Rank", "Athlete", "Score", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Premium Top 3 %", "Strong Top 3 %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
+                    ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best 4 Split Scores", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Premium Top 3 %", "Strong Top 3 %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
                     height=360,
                 )
                 st.caption("Open an athlete below to see the exact recent split rows used for this discipline. These are not the athlete's best overall races; each split is scored from its own swim/bike/run evidence.")
