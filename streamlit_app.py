@@ -605,6 +605,61 @@ def normalize_race_type(race_name: Optional[str], race_type: Optional[str], dist
     return clean_str(race_type) or clean_str(distance)
 
 
+def filter_rankings_by_gender(df: pd.DataFrame, selected_gender: str) -> pd.DataFrame:
+    """Strict gender filter for global athlete rankings.
+
+    Rankings should not mix Men/Women. Rows with unknown gender are excluded
+    here because global rankings are not tied to a single start list where we
+    can safely infer gender. A small race-name fallback is used only when the
+    race title explicitly says Men/Women.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+
+    gender = normalize_gender(selected_gender)
+    if not gender:
+        return df.copy()
+
+    out = df.copy()
+    if "gender" not in out.columns:
+        out["gender"] = None
+    out["__gender_norm"] = out["gender"].map(normalize_gender)
+
+    # Last-resort explicit race-name hints only. This avoids bringing women into
+    # the men's ranking just because gender is missing, while still rescuing
+    # rows named like "IRONMAN World Championship — Men's".
+    if "race_name" in out.columns:
+        names = out["race_name"].map(lambda x: (clean_str(x) or "").lower())
+        explicit_men = names.str.contains(r"\bmen\b|men's|male", regex=True, na=False)
+        explicit_women = names.str.contains(r"\bwomen\b|women's|female", regex=True, na=False)
+        missing = out["__gender_norm"].isna()
+        out.loc[missing & explicit_men, "__gender_norm"] = "Men"
+        out.loc[missing & explicit_women, "__gender_norm"] = "Women"
+
+    out = out[out["__gender_norm"].eq(gender)].copy()
+    return out.drop(columns=["__gender_norm"], errors="ignore")
+
+
+def ranking_scope_mask(df: pd.DataFrame, scope: str) -> pd.Series:
+    """Return a boolean mask for the selected race-family ranking scope."""
+    if df is None or df.empty:
+        return pd.Series([], dtype=bool)
+    rt = df.get("race_type", pd.Series([None] * len(df), index=df.index)).map(lambda x: (clean_str(x) or "").lower())
+    race = df.get("race_name", pd.Series([None] * len(df), index=df.index)).map(lambda x: (clean_str(x) or "").lower())
+    dist = df.get("distance", pd.Series([None] * len(df), index=df.index)).map(lambda x: (clean_str(x) or "").lower())
+    txt = (rt + " " + race + " " + dist)
+
+    if scope == "IRONMAN 70.3 / Middle":
+        return txt.str.contains("70.3|middle|challenge", regex=True, na=False) & ~txt.str.contains("t100|pto", regex=True, na=False)
+    if scope == "T100 / PTO":
+        return txt.str.contains("t100|pto", regex=True, na=False)
+    if scope == "Full IRONMAN":
+        return txt.str.contains("full|140.6", regex=True, na=False) | ((txt.str.contains("ironman", na=False)) & ~txt.str.contains("70.3", na=False))
+    if scope == "Short Course / WTCS":
+        return txt.str.contains("wtcs|world triathlon|continental|olympic|sprint", regex=True, na=False)
+    return pd.Series([True] * len(df), index=df.index)
+
+
 def json_safe_row(row: pd.Series) -> Dict[str, Any]:
     out = {}
     for k, v in row.to_dict().items():
@@ -1962,6 +2017,12 @@ def humanize_dataframe_for_display(show: pd.DataFrame) -> pd.DataFrame:
             show[col] = show[col].map(lambda x: "Yes" if bool(x) else "No")
 
     show = show.rename(columns={c: DISPLAY_LABELS.get(c, c) for c in show.columns})
+
+    # Streamlit/pyarrow is strict about mixed object columns. Display tables can
+    # safely be rendered as strings after humanizing so blanks, floats, and text
+    # do not crash pages like Athlete Rankings.
+    for col in show.columns:
+        show[col] = show[col].map(lambda x: "" if x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x) else str(x))
     return show
 
 def display_table(df: pd.DataFrame, columns: List[str], height: Optional[int] = None):
@@ -1975,7 +2036,7 @@ def display_table(df: pd.DataFrame, columns: List[str], height: Optional[int] = 
     # Streamlit 1.58+ rejects height=None. Only pass height when it is a
     # positive integer, otherwise let Streamlit choose its default height.
     kwargs = {
-        "use_container_width": True,
+        "width": "stretch",
         "hide_index": True,
     }
     if isinstance(height, int) and height > 0:
@@ -2028,7 +2089,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
     except TypeError:
         # Older Streamlit fallback. Current Cloud version should support row
         # selection, but this keeps the dashboard from crashing if API changes.
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.dataframe(show, width="stretch", hide_index=True)
     return None
 
 # ============================================================
