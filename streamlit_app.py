@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 from supabase import create_client
 
-st.set_page_config(page_title="Triathlon Picks", layout="wide")
+st.set_page_config(page_title="Triathlon Picks", page_icon="🏁", layout="wide")
 
 # ============================================================
 # Supabase connection
@@ -21,6 +21,254 @@ def get_supabase():
     return create_client(url, key)
 
 supabase = get_supabase()
+
+# ============================================================
+# Visual styling
+# ============================================================
+def apply_dashboard_theme() -> None:
+    """Polished dark UI styling for the Streamlit dashboard."""
+    st.markdown(
+        """
+        <style>
+        :root {
+            --ptn-bg: #070B12;
+            --ptn-panel: rgba(18, 24, 38, 0.88);
+            --ptn-panel-2: rgba(23, 31, 48, 0.92);
+            --ptn-border: rgba(148, 163, 184, 0.18);
+            --ptn-text: #E5ECF8;
+            --ptn-muted: #94A3B8;
+            --ptn-red: #EF4444;
+            --ptn-orange: #F97316;
+            --ptn-blue: #38BDF8;
+            --ptn-green: #22C55E;
+            --ptn-purple: #8B5CF6;
+        }
+
+        .stApp {
+            background:
+                radial-gradient(circle at top left, rgba(56, 189, 248, 0.12), transparent 30rem),
+                radial-gradient(circle at top right, rgba(239, 68, 68, 0.12), transparent 28rem),
+                linear-gradient(135deg, #050816 0%, #08111F 45%, #070B12 100%);
+            color: var(--ptn-text);
+        }
+
+        [data-testid="stSidebar"] {
+            background: linear-gradient(180deg, rgba(8, 13, 25, 0.98), rgba(15, 23, 42, 0.98));
+            border-right: 1px solid var(--ptn-border);
+        }
+
+        [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3, [data-testid="stSidebar"] p {
+            color: var(--ptn-text);
+        }
+
+        .ptn-sidebar-brand {
+            padding: 0.85rem 0.35rem 1rem 0.35rem;
+            margin-bottom: 0.5rem;
+            border-bottom: 1px solid var(--ptn-border);
+        }
+
+        .ptn-sidebar-brand .logo {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 2.25rem;
+            height: 2.25rem;
+            border-radius: 0.8rem;
+            margin-right: 0.5rem;
+            background: linear-gradient(135deg, var(--ptn-red), var(--ptn-orange));
+            box-shadow: 0 0 30px rgba(239, 68, 68, 0.35);
+        }
+
+        .ptn-sidebar-brand .title {
+            font-weight: 800;
+            font-size: 1.05rem;
+            letter-spacing: -0.02em;
+        }
+
+        .ptn-sidebar-brand .subtitle {
+            color: var(--ptn-muted);
+            font-size: 0.78rem;
+            margin-top: 0.15rem;
+        }
+
+        .ptn-hero {
+            padding: 1.35rem 1.5rem;
+            border: 1px solid var(--ptn-border);
+            border-radius: 1.25rem;
+            background:
+                linear-gradient(135deg, rgba(239, 68, 68, 0.16), rgba(56, 189, 248, 0.08)),
+                rgba(15, 23, 42, 0.82);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+            margin: 0.25rem 0 1.2rem 0;
+        }
+
+        .ptn-hero .eyebrow, .ptn-race-card .eyebrow {
+            color: #FCA5A5;
+            font-size: 0.75rem;
+            font-weight: 800;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            margin-bottom: 0.35rem;
+        }
+
+        .ptn-hero h1 {
+            font-size: 2.15rem;
+            line-height: 1.05;
+            margin: 0;
+            letter-spacing: -0.04em;
+        }
+
+        .ptn-hero p {
+            color: var(--ptn-muted);
+            margin: 0.55rem 0 0 0;
+            font-size: 1rem;
+        }
+
+        .ptn-race-card {
+            padding: 1.15rem 1.25rem;
+            border: 1px solid var(--ptn-border);
+            border-radius: 1.15rem;
+            background: linear-gradient(135deg, rgba(15, 23, 42, 0.94), rgba(30, 41, 59, 0.72));
+            box-shadow: 0 18px 50px rgba(0, 0, 0, 0.22);
+            margin: 0.35rem 0 1rem 0;
+        }
+
+        .ptn-race-card h2 {
+            margin: 0;
+            font-size: 1.55rem;
+            letter-spacing: -0.03em;
+        }
+
+        .ptn-race-card .meta {
+            color: var(--ptn-muted);
+            margin-top: 0.4rem;
+            font-size: 0.92rem;
+        }
+
+        .ptn-section-title {
+            display: flex;
+            align-items: center;
+            gap: 0.55rem;
+            font-weight: 800;
+            font-size: 1.3rem;
+            letter-spacing: -0.02em;
+            margin: 1.25rem 0 0.7rem 0;
+        }
+
+        .ptn-pill {
+            display: inline-block;
+            padding: 0.22rem 0.55rem;
+            border-radius: 999px;
+            font-size: 0.76rem;
+            font-weight: 700;
+            color: #FEE2E2;
+            background: rgba(239, 68, 68, 0.16);
+            border: 1px solid rgba(239, 68, 68, 0.26);
+        }
+
+        [data-testid="stMetric"] {
+            background: rgba(15, 23, 42, 0.78);
+            border: 1px solid var(--ptn-border);
+            border-radius: 1rem;
+            padding: 0.9rem 1rem;
+            box-shadow: 0 14px 40px rgba(0, 0, 0, 0.18);
+        }
+
+        [data-testid="stMetricLabel"] p {
+            color: var(--ptn-muted) !important;
+            font-weight: 700;
+        }
+
+        [data-testid="stMetricValue"] {
+            color: var(--ptn-text);
+            font-weight: 900;
+        }
+
+        .stDataFrame, [data-testid="stDataFrame"] {
+            border-radius: 1rem;
+            overflow: hidden;
+            border: 1px solid var(--ptn-border);
+        }
+
+        div[data-testid="stExpander"] {
+            border: 1px solid var(--ptn-border);
+            border-radius: 1rem;
+            background: rgba(15, 23, 42, 0.56);
+            overflow: hidden;
+        }
+
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 0.5rem;
+        }
+
+        .stTabs [data-baseweb="tab"] {
+            height: 2.75rem;
+            border-radius: 999px;
+            padding: 0 1rem;
+            background: rgba(15, 23, 42, 0.68);
+            border: 1px solid var(--ptn-border);
+        }
+
+        .stTabs [aria-selected="true"] {
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.26), rgba(249, 115, 22, 0.18));
+            border-color: rgba(248, 113, 113, 0.55);
+        }
+
+        .stButton > button, .stDownloadButton > button {
+            border-radius: 999px;
+            border: 1px solid rgba(248, 113, 113, 0.45);
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.9), rgba(249, 115, 22, 0.9));
+            color: white;
+            font-weight: 800;
+            box-shadow: 0 10px 30px rgba(239, 68, 68, 0.25);
+        }
+
+        .stSelectbox, .stSlider, .stRadio, .stFileUploader, .stCheckbox {
+            color: var(--ptn-text);
+        }
+
+        div[data-testid="stAlert"] {
+            border-radius: 1rem;
+            border: 1px solid var(--ptn-border);
+        }
+
+        h1, h2, h3 {
+            letter-spacing: -0.03em;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_app_hero(page_name: str) -> None:
+    st.markdown(
+        f"""
+        <div class="ptn-hero">
+            <div class="eyebrow">Triathlon Picks Lab</div>
+            <h1>🏁 {page_name}</h1>
+            <p>Race predictions, split picks, evidence drilldowns, and scoring audits powered by Supabase.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_race_card(race_name: str, gender: str, race_date: Any, window_start: Any) -> None:
+    st.markdown(
+        f"""
+        <div class="ptn-race-card">
+            <div class="eyebrow">Selected Race</div>
+            <h2>{race_name}</h2>
+            <div class="meta">{gender} · Race date {format_date(race_date)} · Analysis window {format_date(window_start)} to {format_date(race_date)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def section_title(icon: str, title: str) -> None:
+    st.markdown(f'<div class="ptn-section-title"><span>{icon}</span><span>{title}</span></div>', unsafe_allow_html=True)
 
 # ============================================================
 # Basic helpers
@@ -1527,21 +1775,42 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # UI
 # ============================================================
-st.title("Triathlon Picks Dashboard")
-st.caption("Supabase + Streamlit MVP")
+apply_dashboard_theme()
+
+PAGE_OPTIONS = {
+    "🏆 Race Dashboard": "Race Dashboard",
+    "🔎 Split Audit": "Split Audit",
+    "📥 Import CSVs": "Import CSVs",
+    "🗄️ Database Viewer": "Database Viewer",
+    "🔌 Connection": "Connection",
+}
 
 with st.sidebar:
-    page = st.radio(
-        "Page",
-        ["Race Dashboard", "Split Audit", "Import CSVs", "Database Viewer", "Connection"],
-        index=0,
+    st.markdown(
+        """
+        <div class="ptn-sidebar-brand">
+            <div><span class="logo">🏁</span><span class="title">Triathlon Picks</span></div>
+            <div class="subtitle">Supabase scoring engine · Streamlit dashboard</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-    if st.button("Refresh database cache"):
+    page_label = st.radio(
+        "Navigation",
+        list(PAGE_OPTIONS.keys()),
+        index=0,
+        label_visibility="collapsed",
+    )
+    page = PAGE_OPTIONS[page_label]
+    st.markdown("---")
+    if st.button("🔄 Refresh database cache", use_container_width=True):
         clear_cache()
         st.rerun()
 
+render_app_hero(page)
+
 if page == "Connection":
-    st.header("Connection")
+    st.header("🔌 Connection")
     try:
         result = supabase.table("athletes").select("id", count="exact").limit(1).execute()
         st.success("Connected to Supabase.")
@@ -1557,7 +1826,7 @@ if page == "Connection":
         st.exception(e)
 
 elif page == "Import CSVs":
-    st.header("Import Google Sheet CSV exports")
+    st.header("📥 Import Google Sheet CSV exports")
     st.write("Export each Google Sheet tab as CSV, then upload it here. Use replace mode for the first import.")
     replace = st.checkbox("Replace existing rows in selected table before importing", value=True)
 
@@ -1613,7 +1882,7 @@ elif page == "Import CSVs":
                 st.exception(e)
 
 elif page == "Database Viewer":
-    st.header("Database Viewer")
+    st.header("🗄️ Database Viewer")
     table = st.selectbox("Table", ["athletes", "athlete_results", "start_lists", "race_overrides", "scoring_settings", "model_runs", "split_audit"])
     exact_count = count_rows(table)
     if exact_count is not None:
@@ -1680,8 +1949,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
     # Use two full calendar years back through race day.
     results_window = results[(results["race_date"].notna()) & (results["race_date"] >= window_start) & (results["race_date"] <= selected_date)].copy()
 
-    st.header(selected_race)
-    st.caption(f"{selected_gender} · Race date {format_date(selected_date)} · Analysis window {format_date(window_start)} to {format_date(selected_date)}")
+    render_race_card(selected_race, selected_gender, selected_date, window_start)
 
     audit_by_disc = {
         disc: build_split_audit(results_window, start_athletes, overrides, selected_date, selected_gender, disc, min_field_size)
@@ -1727,7 +1995,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                     "from every race URL so ranks and % behind fastest are computed against the actual field."
                 )
 
-        st.subheader("Overall Picks")
+        section_title("🏆", "Overall Picks")
         overall = score_overall(results_window, start_athletes, overrides, selected_date, target_year, recent_n, drop_worst)
         display_table(
             overall.head(15),
@@ -1736,10 +2004,10 @@ elif page in {"Race Dashboard", "Split Audit"}:
 
         st.divider()
         st.info("Split ranks use each discipline's own recent valid split rows — not the athlete's top overall races. Swim uses recent swim evidence, bike uses recent bike evidence, and run uses recent run evidence. Full-distance swim/bike now count as high-value non-draft evidence; full-distance run is weighted lower because it transfers less directly to 70.3 speed. Imported sample coverage is still not the full ProTriNews field yet.")
-        tabs = st.tabs(["Fastest Swim", "Fastest Bike", "Fastest Run"])
+        tabs = st.tabs(["🏊 Fastest Swim", "🚴 Fastest Bike", "🏃 Fastest Run"])
         for tab, disc, title in zip(tabs, ["swim", "bike", "run"], ["Fastest Swim", "Fastest Bike", "Fastest Run"]):
             with tab:
-                st.subheader(title)
+                section_title("🏊" if disc == "swim" else "🚴" if disc == "bike" else "🏃", title)
                 scored = score_splits_for_start_list(audit_by_disc[disc], start_athletes, selected_date, recent_n, drop_worst, strong_sof_threshold)
                 scored_top = scored.head(12).copy()
                 selected_row = selectable_table(
@@ -1800,7 +2068,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                         )
 
     else:
-        st.subheader("Split Audit")
+        section_title("🔎", "Split Audit")
         disc = st.selectbox("Discipline", ["swim", "bike", "run"])
         aud = audit_by_disc[disc]
         if aud.empty:
