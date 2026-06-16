@@ -2148,7 +2148,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
     show = humanize_dataframe_for_display(show)
 
     kwargs = {
-        "use_container_width": True,
+        "width": "stretch",
         "hide_index": True,
         "key": key,
     }
@@ -2178,6 +2178,233 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
         st.dataframe(show, width="stretch", hide_index=True)
     return None
 
+
+# ============================================================
+# Gender cleanup helpers
+# ============================================================
+GENDER_BACKFILL_SQL = """
+-- Backfill athlete/result gender without scraping athlete profile pages.
+-- Run in Supabase SQL Editor. This uses only your imported start lists and race-name hints.
+
+-- 1) Normalize start-list genders onto athletes when an athlete appears in only one gender.
+with start_gender as (
+  select
+    athlete_url,
+    max(case
+      when lower(gender) like 'm%' then 'Men'
+      when lower(gender) like 'w%' or lower(gender) like 'f%' then 'Women'
+      else null
+    end) as gender
+  from public.start_lists
+  where athlete_url is not null
+    and athlete_url <> ''
+    and gender is not null
+    and gender <> ''
+  group by athlete_url
+  having count(distinct case
+      when lower(gender) like 'm%' then 'Men'
+      when lower(gender) like 'w%' or lower(gender) like 'f%' then 'Women'
+      else null
+    end) = 1
+)
+update public.athletes a
+set gender = sg.gender
+from start_gender sg
+where a.athlete_url = sg.athlete_url
+  and sg.gender in ('Men', 'Women')
+  and (a.gender is null or a.gender = '');
+
+-- 2) Use obvious race-name hints on athlete_results.
+update public.athlete_results
+set gender = 'Women'
+where (gender is null or gender = '')
+  and (
+    race_name ilike '%women%'
+    or race_name ilike '%female%'
+    or race_name ilike '%ladies%'
+  );
+
+update public.athlete_results
+set gender = 'Men'
+where (gender is null or gender = '')
+  and (
+    race_name ilike '%men%'
+    or race_name ilike '%male%'
+  )
+  and not (
+    race_name ilike '%women%'
+    or race_name ilike '%female%'
+    or race_name ilike '%ladies%'
+  );
+
+-- 3) Use obvious race-name hints on race_field_results.
+update public.race_field_results
+set gender = 'Women'
+where (gender is null or gender = '')
+  and (
+    race_name ilike '%women%'
+    or race_name ilike '%female%'
+    or race_name ilike '%ladies%'
+  );
+
+update public.race_field_results
+set gender = 'Men'
+where (gender is null or gender = '')
+  and (
+    race_name ilike '%men%'
+    or race_name ilike '%male%'
+  )
+  and not (
+    race_name ilike '%women%'
+    or race_name ilike '%female%'
+    or race_name ilike '%ladies%'
+  );
+
+-- 4) Infer athlete gender from any consistent known row across start lists/results/field results.
+with known_gender as (
+  select athlete_url, gender
+  from public.start_lists
+  where athlete_url is not null and athlete_url <> '' and gender in ('Men', 'Women')
+  union all
+  select athlete_url, gender
+  from public.athlete_results
+  where athlete_url is not null and athlete_url <> '' and gender in ('Men', 'Women')
+  union all
+  select athlete_url, gender
+  from public.race_field_results
+  where athlete_url is not null and athlete_url <> '' and gender in ('Men', 'Women')
+), resolved as (
+  select athlete_url, max(gender) as gender
+  from known_gender
+  group by athlete_url
+  having count(distinct gender) = 1
+)
+update public.athletes a
+set gender = r.gender
+from resolved r
+where a.athlete_url = r.athlete_url
+  and r.gender in ('Men', 'Women')
+  and (a.gender is null or a.gender = '');
+
+-- 5) Propagate known athlete gender back to every result row for that athlete.
+update public.athlete_results ar
+set gender = a.gender
+from public.athletes a
+where ar.athlete_url = a.athlete_url
+  and a.gender in ('Men', 'Women')
+  and (ar.gender is null or ar.gender = '');
+
+update public.race_field_results rfr
+set gender = a.gender
+from public.athletes a
+where rfr.athlete_url = a.athlete_url
+  and a.gender in ('Men', 'Women')
+  and (rfr.gender is null or rfr.gender = '');
+
+-- 6) Quick verification counts.
+select 'athletes' as table_name, count(*) as total_rows, count(*) filter (where gender in ('Men','Women')) as gender_known, count(*) filter (where gender is null or gender = '') as gender_missing from public.athletes
+union all
+select 'athlete_results', count(*), count(*) filter (where gender in ('Men','Women')), count(*) filter (where gender is null or gender = '') from public.athlete_results
+union all
+select 'race_field_results', count(*), count(*) filter (where gender in ('Men','Women')), count(*) filter (where gender is null or gender = '') from public.race_field_results;
+"""
+
+
+def gender_counts_frame() -> pd.DataFrame:
+    rows = []
+    for table_name in ["athletes", "athlete_results", "race_field_results", "start_lists"]:
+        df = load_table(table_name)
+        if df.empty or "gender" not in df.columns:
+            rows.append({"Table": table_name, "Total Rows": len(df), "Known Gender": 0, "Missing Gender": len(df), "Men": 0, "Women": 0})
+            continue
+        genders = df["gender"].map(normalize_gender)
+        rows.append({
+            "Table": table_name,
+            "Total Rows": len(df),
+            "Known Gender": int(genders.isin(["Men", "Women"]).sum()),
+            "Missing Gender": int((~genders.isin(["Men", "Women"])).sum()),
+            "Men": int((genders == "Men").sum()),
+            "Women": int((genders == "Women").sum()),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_gender_suggestions(results: pd.DataFrame, starts: pd.DataFrame, athletes: pd.DataFrame) -> pd.DataFrame:
+    suggestions: Dict[str, Dict[str, Any]] = {}
+
+    def add(url: Any, name: Any, gender: Any, source: str, confidence: str, evidence: str):
+        u = clean_str(url)
+        if not u:
+            return
+        g = normalize_gender(gender)
+        if g not in ["Men", "Women"]:
+            return
+        current = suggestions.get(u)
+        priority = {"Start list": 3, "Consistent imported rows": 2, "Race-name hint": 1}.get(source, 0)
+        if current and current.get("priority", 0) > priority:
+            return
+        if current and current.get("Suggested Gender") != g:
+            current["Suggested Gender"] = "CONFLICT"
+            current["Confidence"] = "Do not apply"
+            current["Evidence"] = (current.get("Evidence", "") + "; conflict with " + evidence).strip("; ")
+            return
+        suggestions[u] = {
+            "Athlete URL": u,
+            "Athlete": clean_str(name),
+            "Suggested Gender": g,
+            "Source": source,
+            "Confidence": confidence,
+            "Evidence": evidence,
+            "priority": priority,
+        }
+
+    if starts is not None and not starts.empty and {"athlete_url", "gender"}.issubset(starts.columns):
+        for u, g in starts.dropna(subset=["athlete_url"]).groupby("athlete_url"):
+            gs = sorted(set([x for x in g["gender"].map(normalize_gender).dropna().tolist() if x in ["Men", "Women"]]))
+            if len(gs) == 1:
+                name = g["athlete_name"].dropna().iloc[0] if "athlete_name" in g and g["athlete_name"].notna().any() else ""
+                add(u, name, gs[0], "Start list", "High", f"{len(g)} start-list row(s) all {gs[0]}")
+
+    combined = []
+    for table_name, df in [("athlete_results", results), ("race_field_results", load_table("race_field_results"))]:
+        if df is None or df.empty or "athlete_url" not in df.columns:
+            continue
+        tmp = df.copy()
+        if "gender" in tmp.columns:
+            tmp["_gender_norm"] = tmp["gender"].map(normalize_gender)
+        else:
+            tmp["_gender_norm"] = None
+        # Add race-name hint gender where the result row has no gender.
+        def race_hint(row):
+            existing = row.get("_gender_norm")
+            if existing in ["Men", "Women"]:
+                return existing
+            race = clean_str(row.get("race_name")) or ""
+            low = race.lower()
+            if any(x in low for x in ["women", "female", "ladies"]):
+                return "Women"
+            if any(x in low for x in ["men", "male"]) and not any(x in low for x in ["women", "female", "ladies"]):
+                return "Men"
+            return None
+        tmp["_hint_gender"] = tmp.apply(race_hint, axis=1)
+        combined.append(tmp[[c for c in ["athlete_url", "athlete_name", "race_name", "_hint_gender"] if c in tmp.columns]].assign(_table=table_name))
+
+    if combined:
+        all_rows = pd.concat(combined, ignore_index=True)
+        all_rows = all_rows[all_rows["_hint_gender"].isin(["Men", "Women"])]
+        for u, g in all_rows.groupby("athlete_url"):
+            gs = sorted(set(g["_hint_gender"].dropna().tolist()))
+            if len(gs) == 1:
+                name = g["athlete_name"].dropna().iloc[0] if "athlete_name" in g and g["athlete_name"].notna().any() else ""
+                source = "Consistent imported rows"
+                confidence = "Medium" if len(g) >= 2 else "Low"
+                add(u, name, gs[0], source, confidence, f"{len(g)} imported row(s) all {gs[0]}")
+
+    out = pd.DataFrame([v for v in suggestions.values() if v.get("Suggested Gender") in ["Men", "Women"]])
+    if out.empty:
+        return pd.DataFrame(columns=["Athlete", "Athlete URL", "Suggested Gender", "Source", "Confidence", "Evidence"])
+    return out.drop(columns=["priority"], errors="ignore").sort_values(["Confidence", "Source", "Athlete"], ascending=[True, True, True])
+
 # ============================================================
 # UI
 # ============================================================
@@ -2187,6 +2414,7 @@ PAGE_OPTIONS = {
     "🏆 Race Dashboard": "Race Dashboard",
     "🥇 Athlete Rankings": "Athlete Rankings",
     "👤 Athletes": "Athletes",
+    "🧬 Gender Tools": "Gender Tools",
     "🔎 Split Audit": "Split Audit",
     "📥 Import CSVs": "Import CSVs",
     "🗄️ Database Viewer": "Database Viewer",
@@ -2341,6 +2569,32 @@ elif page == "Athletes":
         raw = results[results["athlete_name"].fillna("").eq(selected)].sort_values("race_date", ascending=False)
         st.subheader(f"Recent career rows for {selected}")
         display_table(raw.head(25), ["race_date", "race_name", "race_type", "distance", "place", "status", "sof", "sof_source", "ors", "swim_split", "bike_split", "run_split", "data_source"], height=420)
+
+elif page == "Gender Tools":
+    st.header("🧬 Gender Tools")
+    st.write("Use this to backfill missing Men/Women values from your imported start lists and race-name hints. This avoids scraping athlete profile pages.")
+
+    results, starts, athletes, overrides = prepare_dataframes()
+
+    st.subheader("Current gender coverage")
+    display_table(gender_counts_frame(), ["Table", "Total Rows", "Known Gender", "Missing Gender", "Men", "Women"], height=220)
+
+    st.subheader("Suggested athlete gender map")
+    suggestions = build_gender_suggestions(results, starts, athletes)
+    if suggestions.empty:
+        st.info("No gender suggestions found from the currently imported data.")
+    else:
+        high = suggestions[suggestions["Confidence"].isin(["High", "Medium"])]
+        st.write(f"Suggestions found: {len(suggestions):,} | High/Medium confidence: {len(high):,}")
+        display_table(suggestions.head(300), ["Athlete", "Suggested Gender", "Source", "Confidence", "Evidence", "Athlete URL"], height=430)
+        csv = suggestions.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download gender suggestions CSV", csv, "gender_suggestions.csv", "text/csv")
+
+    st.subheader("Bulk backfill SQL")
+    st.warning("Run this once in Supabase → SQL Editor. Then click Refresh database cache in the sidebar.")
+    st.code(GENDER_BACKFILL_SQL, language="sql")
+
+    st.caption("Why not scrape athlete profile URLs? The ProTriNews HTML you imported contains a legal notice prohibiting automated access/scraping. The safer workflow is to use your own imported start lists, race names, or an official/permissioned data feed.")
 
 elif page == "Athlete Rankings":
     st.header("🥇 Athlete Rankings")
