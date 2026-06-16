@@ -336,6 +336,61 @@ def parse_int(value: Any) -> Optional[int]:
         return None
     return int(round(n))
 
+def dedupe_start_athletes(start_athletes: pd.DataFrame) -> pd.DataFrame:
+    """Return one row per athlete for the selected start list.
+
+    Start lists can be imported more than once or contain duplicate athlete rows.
+    Pandas lookup tables require unique keys, and duplicate start-list rows also
+    inflate dashboard counts and split scoring. Prefer rows with an athlete URL
+    and the lowest OpenRank when duplicates exist.
+    """
+    if start_athletes is None or start_athletes.empty:
+        return pd.DataFrame() if start_athletes is None else start_athletes
+
+    df = start_athletes.copy()
+    if "athlete_url" not in df.columns:
+        df["athlete_url"] = None
+    if "athlete_name" not in df.columns:
+        df["athlete_name"] = None
+    if "open_rank" not in df.columns:
+        df["open_rank"] = None
+
+    df["__athlete_url_key"] = df["athlete_url"].map(lambda x: (clean_str(x) or "").strip().lower())
+    df["__athlete_name_key"] = df["athlete_name"].map(lambda x: (clean_str(x) or "").strip().lower())
+    df["__athlete_key"] = df["__athlete_url_key"]
+    missing_url = df["__athlete_key"].eq("")
+    df.loc[missing_url, "__athlete_key"] = df.loc[missing_url, "__athlete_name_key"]
+    df = df[df["__athlete_key"].ne("")].copy()
+    if df.empty:
+        return df.drop(columns=[c for c in df.columns if c.startswith("__")], errors="ignore")
+
+    df["__has_url"] = df["__athlete_url_key"].ne("").astype(int)
+    df["__open_rank_num"] = df["open_rank"].map(parse_int)
+    df["__open_rank_sort"] = df["__open_rank_num"].fillna(999999)
+    df = df.sort_values(["__athlete_key", "__has_url", "__open_rank_sort"], ascending=[True, False, True])
+    df = df.drop_duplicates(subset=["__athlete_key"], keep="first").copy()
+    return df.drop(columns=[c for c in df.columns if c.startswith("__")], errors="ignore").reset_index(drop=True)
+
+
+def start_lookup_maps(start_athletes: pd.DataFrame) -> tuple[dict, dict]:
+    """Build safe URL/name lookup maps for a de-duplicated start list."""
+    df = dedupe_start_athletes(start_athletes)
+    url_lookup = {}
+    name_lookup = {}
+    if df.empty:
+        return url_lookup, name_lookup
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        url = clean_str(row.get("athlete_url"))
+        name = clean_str(row.get("athlete_name"))
+        if url and url not in url_lookup:
+            url_lookup[url] = row_dict
+        if name:
+            key = name.lower()
+            if key not in name_lookup:
+                name_lookup[key] = row_dict
+    return url_lookup, name_lookup
+
 
 def parse_status(row: pd.Series) -> Optional[str]:
     status = clean_str(first_col(row, ["Status", "Result Status"]))
@@ -1761,8 +1816,7 @@ def score_overall(
     if df.empty:
         return pd.DataFrame()
 
-    start_lookup = start_athletes.set_index("athlete_url", drop=False).to_dict("index") if "athlete_url" in start_athletes else {}
-    name_start_lookup = {str(r.get("athlete_name", "")).lower(): r for _, r in start_athletes.iterrows()}
+    start_lookup, name_start_lookup = start_lookup_maps(start_athletes)
     rows = []
     for athlete_key, g in df.groupby(df["athlete_url"].fillna(df["athlete_name"])):
         g = g.sort_values("race_date", ascending=False).copy()
@@ -2261,6 +2315,10 @@ elif page in {"Race Dashboard", "Split Audit"}:
     if pd.notna(selected_meta["race_date"]):
         start_athletes = start_athletes[start_athletes["race_date"] == selected_meta["race_date"]]
 
+    imported_start_rows = len(start_athletes)
+    start_athletes = dedupe_start_athletes(start_athletes)
+    duplicate_start_rows = imported_start_rows - len(start_athletes)
+
     # Use two full calendar years back through race day.
     results_window = results[(results["race_date"].notna()) & (results["race_date"] >= window_start) & (results["race_date"] <= selected_date)].copy()
 
@@ -2280,7 +2338,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
 
     if page == "Race Dashboard":
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Start list athletes", len(start_athletes))
+        c1.metric("Start list athletes", len(start_athletes), delta=(f"{duplicate_start_rows} duplicate rows ignored" if duplicate_start_rows else None))
         c2.metric("Result rows in window", len(results_window))
         c3.metric("Overrides", len(overrides) if not overrides.empty else 0)
         c4.metric("Low-sample warning threshold", min_field_size)
