@@ -902,6 +902,199 @@ def upsert_chunks(table_name: str, rows: List[Dict[str, Any]], on_conflict: str,
     for i in range(0, len(rows), chunk_size):
         supabase.table(table_name).upsert(rows[i:i + chunk_size], on_conflict=on_conflict).execute()
 
+
+def athlete_upsert_rows_preserve_gender(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Prepare athlete upserts without overwriting known gender with blank/null.
+
+    Supabase upserts can update provided columns on conflict. Imported Athlete
+    Results often have gender blank, so sending {gender: None} can erase a
+    gender that was already learned from a start list. This helper omits the
+    gender key when it is missing.
+    """
+    cleaned: List[Dict[str, Any]] = []
+    seen = set()
+    for row in rows or []:
+        athlete_url = clean_str(row.get("athlete_url"))
+        athlete_name = clean_str(row.get("athlete_name"))
+        if not athlete_url:
+            continue
+        out = {"athlete_url": athlete_url, "athlete_name": athlete_name}
+        g = normalize_gender(row.get("gender"))
+        if g in ["Men", "Women"]:
+            out["gender"] = g
+        key = (athlete_url, out.get("gender"))
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(out)
+    return cleaned
+
+
+def upsert_athletes_preserve_gender(rows: List[Dict[str, Any]]):
+    prepared = athlete_upsert_rows_preserve_gender(rows)
+    if prepared:
+        upsert_chunks("athletes", prepared, on_conflict="athlete_url")
+
+
+def infer_gender_from_race_name(value: Any) -> Optional[str]:
+    """Infer competition category only from explicit race-name wording."""
+    name = (clean_str(value) or "").lower()
+    if re.search(r"\bwomen\b|women['’]s|\bfemale\b|\bfemmes\b", name):
+        return "Women"
+    # Match Men safely without firing on Women.
+    if re.search(r"(?<!wo)\bmen\b|men['’]s|\bmale\b|\bhommes\b", name):
+        return "Men"
+    return None
+
+
+def build_gender_suggestions(athletes: pd.DataFrame, starts: pd.DataFrame, results: pd.DataFrame) -> pd.DataFrame:
+    """Build high-confidence gender suggestions from data we already own.
+
+    Sources, in order of trust:
+    1. Start lists imported with a Men/Women category.
+    2. Existing known gender values in athlete/result tables.
+    3. Explicit race-name hints such as Men's/Women's.
+
+    We do not infer from athlete name, image, country, or profile scraping.
+    """
+    rows: Dict[str, Dict[str, Any]] = {}
+
+    def add_signal(url: Any, name: Any, gender: Any, source: str, confidence: str):
+        g = normalize_gender(gender)
+        if g not in ["Men", "Women"]:
+            return
+        u = clean_str(url)
+        n = clean_str(name)
+        if not u and not n:
+            return
+        key = u or f"name::{(n or '').lower()}"
+        rec = rows.setdefault(key, {
+            "Athlete URL": u,
+            "Athlete": n,
+            "Signals": [],
+            "Source": source,
+            "Confidence": confidence,
+        })
+        if n and not rec.get("Athlete"):
+            rec["Athlete"] = n
+        if u and not rec.get("Athlete URL"):
+            rec["Athlete URL"] = u
+        rec["Signals"].append((g, source, confidence))
+
+    if starts is not None and not starts.empty:
+        for _, r in starts.iterrows():
+            add_signal(r.get("athlete_url"), r.get("athlete_name"), r.get("gender"), "Start list", "High")
+
+    for df_name, df in [("Athletes table", athletes), ("Result gender", results)]:
+        if df is None or df.empty:
+            continue
+        for _, r in df.iterrows():
+            add_signal(r.get("athlete_url"), r.get("athlete_name"), r.get("gender"), df_name, "High" if df_name == "Athletes table" else "Medium")
+
+    if results is not None and not results.empty:
+        for _, r in results.iterrows():
+            g = infer_gender_from_race_name(r.get("race_name"))
+            add_signal(r.get("athlete_url"), r.get("athlete_name"), g, "Race name hint", "Medium")
+
+    output = []
+    for rec in rows.values():
+        genders = {g for g, _, _ in rec.get("Signals", []) if g in ["Men", "Women"]}
+        sources = sorted({src for _, src, _ in rec.get("Signals", [])})
+        confidences = {conf for _, _, conf in rec.get("Signals", [])}
+        if len(genders) == 1:
+            suggested = next(iter(genders))
+            confidence = "High" if "High" in confidences else "Medium"
+            conflict = "No"
+        elif len(genders) > 1:
+            suggested = "Conflict"
+            confidence = "Low"
+            conflict = "Yes"
+        else:
+            suggested = None
+            confidence = "None"
+            conflict = "No"
+        output.append({
+            "Athlete": rec.get("Athlete"),
+            "Athlete URL": rec.get("Athlete URL"),
+            "Suggested Gender": suggested,
+            "Confidence": confidence,
+            "Conflict": conflict,
+            "Sources": ", ".join(sources),
+            "Signal Count": len(rec.get("Signals", [])),
+        })
+    if not output:
+        return pd.DataFrame(columns=["Athlete", "Athlete URL", "Suggested Gender", "Confidence", "Conflict", "Sources", "Signal Count"])
+    return pd.DataFrame(output).sort_values(["Conflict", "Confidence", "Athlete"], ascending=[True, True, True])
+
+
+def apply_gender_updates(suggestions: pd.DataFrame, include_medium: bool = False) -> int:
+    """Apply selected gender suggestions across athlete/result tables."""
+    if suggestions is None or suggestions.empty:
+        return 0
+    allowed_conf = ["High", "Medium"] if include_medium else ["High"]
+    work = suggestions[
+        suggestions["Suggested Gender"].isin(["Men", "Women"])
+        & suggestions["Confidence"].isin(allowed_conf)
+        & suggestions["Conflict"].ne("Yes")
+    ].copy()
+    applied = 0
+    progress = st.progress(0, text="Applying gender updates...") if len(work) else None
+    for idx, (_, r) in enumerate(work.iterrows(), start=1):
+        g = normalize_gender(r.get("Suggested Gender"))
+        url = clean_str(r.get("Athlete URL"))
+        name = clean_str(r.get("Athlete"))
+        if not g or (not url and not name):
+            continue
+        for table in ["athletes", "athlete_results", "race_field_results", "start_lists"]:
+            try:
+                query = supabase.table(table).update({"gender": g})
+                if url:
+                    query = query.eq("athlete_url", url)
+                else:
+                    query = query.eq("athlete_name", name)
+                query.execute()
+            except Exception:
+                # Optional table may not exist or row may not be present.
+                pass
+        applied += 1
+        if progress is not None and (idx % 25 == 0 or idx == len(work)):
+            progress.progress(idx / max(len(work), 1), text=f"Applied {idx:,} of {len(work):,} gender updates...")
+    if progress is not None:
+        progress.empty()
+    clear_cache()
+    return applied
+
+
+def apply_gender_updates_from_rows(rows: List[Dict[str, Any]]) -> int:
+    """Immediately propagate gender from newly imported start-list rows."""
+    if not rows:
+        return 0
+    df = pd.DataFrame(rows)
+    if df.empty or "gender" not in df.columns:
+        return 0
+    # Only apply unambiguous athlete -> one gender signals.
+    key_col = "athlete_url" if "athlete_url" in df.columns else "athlete_name"
+    df["gender_norm"] = df["gender"].map(normalize_gender)
+    df = df[df["gender_norm"].isin(["Men", "Women"])]
+    if df.empty:
+        return 0
+    suggestions = []
+    for key, g in df.groupby(df[key_col].fillna(df.get("athlete_name", ""))):
+        genders = set(g["gender_norm"].dropna())
+        if len(genders) != 1:
+            continue
+        row = g.iloc[0]
+        suggestions.append({
+            "Athlete URL": clean_str(row.get("athlete_url")),
+            "Athlete": clean_str(row.get("athlete_name")),
+            "Suggested Gender": next(iter(genders)),
+            "Confidence": "High",
+            "Conflict": "No",
+            "Sources": "Start list import",
+            "Signal Count": len(g),
+        })
+    return apply_gender_updates(pd.DataFrame(suggestions), include_medium=False)
+
 # ============================================================
 # CSV normalizers
 # ============================================================
@@ -2539,6 +2732,7 @@ PAGE_OPTIONS = {
     "🏆 Race Dashboard": "Race Dashboard",
     "🥇 Athlete Rankings": "Athlete Rankings",
     "👤 Athletes": "Athletes",
+    "🧬 Gender Tools": "Gender Tools",
     "🔎 Split Audit": "Split Audit",
     "📥 Import CSVs": "Import CSVs",
     "🗄️ Database Viewer": "Database Viewer",
@@ -2607,7 +2801,7 @@ elif page == "Import CSVs":
                     if replace:
                         delete_all("athlete_results")
                     insert_chunks("athlete_results", rows)
-                    upsert_chunks("athletes", athlete_rows, on_conflict="athlete_url")
+                    upsert_athletes_preserve_gender(athlete_rows)
                     clear_cache()
                     after_count = count_rows("athlete_results")
                     st.success(f"Imported {len(rows):,} athlete result rows and upserted {len(athlete_rows):,} athletes.")
@@ -2619,7 +2813,7 @@ elif page == "Import CSVs":
                     if replace:
                         delete_all("race_field_results")
                     insert_chunks("race_field_results", rows)
-                    upsert_chunks("athletes", athlete_rows, on_conflict="athlete_url")
+                    upsert_athletes_preserve_gender(athlete_rows)
                     clear_cache()
                     after_count = count_rows("race_field_results")
                     st.success(f"Imported {len(rows):,} race-field result rows and upserted {len(athlete_rows):,} athletes.")
@@ -2630,9 +2824,11 @@ elif page == "Import CSVs":
                     if replace:
                         delete_all("start_lists")
                     insert_chunks("start_lists", rows)
-                    upsert_chunks("athletes", athlete_rows, on_conflict="athlete_url")
+                    upsert_athletes_preserve_gender(athlete_rows)
+                    propagated = apply_gender_updates_from_rows(rows)
                     clear_cache()
                     st.success(f"Imported {len(rows):,} start-list rows and upserted {len(athlete_rows):,} athletes.")
+                    st.info(f"Auto-propagated gender for {propagated:,} athletes from this start list import.")
 
                 elif table_choice == "Race Overrides":
                     rows = normalize_race_overrides(df)
@@ -2693,6 +2889,120 @@ elif page == "Athletes":
         raw = results[results["athlete_name"].fillna("").eq(selected)].sort_values("race_date", ascending=False)
         st.subheader(f"Recent career rows for {selected}")
         display_table(raw.head(25), ["race_date", "race_name", "race_type", "distance", "place", "status", "sof", "sof_source", "ors", "swim_split", "bike_split", "run_split", "data_source"], height=420)
+
+
+elif page == "Gender Tools":
+    st.header("🧬 Gender Tools")
+    st.caption("Fill Men/Women competition category from start lists, existing gender values, and explicit race-name hints. This does not scrape athlete profile pages or guess from names/photos.")
+
+    raw_athletes = load_table("athletes")
+    raw_results = load_table("athlete_results")
+    raw_race_fields = load_table("race_field_results")
+    raw_starts = load_table("start_lists")
+
+    combined_results = pd.concat(
+        [df for df in [raw_results, raw_race_fields] if df is not None and not df.empty],
+        ignore_index=True,
+        sort=False,
+    ) if (raw_results is not None and not raw_results.empty) or (raw_race_fields is not None and not raw_race_fields.empty) else pd.DataFrame()
+
+    def gender_count_row(label: str, df: pd.DataFrame) -> Dict[str, Any]:
+        if df is None or df.empty:
+            return {"Table": label, "Rows": 0, "Men": 0, "Women": 0, "Missing/Other": 0, "Missing %": ""}
+        g = df["gender"].map(normalize_gender) if "gender" in df.columns else pd.Series([None] * len(df))
+        missing = int((~g.isin(["Men", "Women"])).sum())
+        return {
+            "Table": label,
+            "Rows": len(df),
+            "Men": int(g.eq("Men").sum()),
+            "Women": int(g.eq("Women").sum()),
+            "Missing/Other": missing,
+            "Missing %": f"{(missing / max(len(df), 1)) * 100:.1f}%",
+        }
+
+    coverage = pd.DataFrame([
+        gender_count_row("athletes", raw_athletes),
+        gender_count_row("athlete_results", raw_results),
+        gender_count_row("race_field_results", raw_race_fields),
+        gender_count_row("start_lists", raw_starts),
+    ])
+    st.subheader("Gender coverage")
+    display_table(coverage, list(coverage.columns), height=180)
+
+    suggestions = build_gender_suggestions(raw_athletes, raw_starts, combined_results)
+    if suggestions.empty:
+        st.warning("No gender suggestions found yet. Import start lists with Gender = Men/Women first.")
+    else:
+        high = suggestions[(suggestions["Confidence"].eq("High")) & (suggestions["Conflict"].ne("Yes")) & (suggestions["Suggested Gender"].isin(["Men", "Women"]))]
+        med = suggestions[(suggestions["Confidence"].eq("Medium")) & (suggestions["Conflict"].ne("Yes")) & (suggestions["Suggested Gender"].isin(["Men", "Women"]))]
+        conflict = suggestions[suggestions["Conflict"].eq("Yes")]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("High-confidence suggestions", f"{len(high):,}")
+        c2.metric("Medium suggestions", f"{len(med):,}")
+        c3.metric("Conflicts", f"{len(conflict):,}")
+
+        st.subheader("Suggested updates")
+        show_conf = st.selectbox("Show confidence", ["High only", "High + Medium", "Conflicts", "All"], index=0)
+        view = suggestions.copy()
+        if show_conf == "High only":
+            view = view[view["Confidence"].eq("High") & view["Conflict"].ne("Yes")]
+        elif show_conf == "High + Medium":
+            view = view[view["Confidence"].isin(["High", "Medium"]) & view["Conflict"].ne("Yes")]
+        elif show_conf == "Conflicts":
+            view = view[view["Conflict"].eq("Yes")]
+        display_table(view.head(1000), ["Athlete", "Athlete URL", "Suggested Gender", "Confidence", "Conflict", "Sources", "Signal Count"], height=420)
+
+        st.download_button(
+            "Download gender suggestions CSV",
+            data=suggestions.to_csv(index=False).encode("utf-8"),
+            file_name="gender_suggestions.csv",
+            mime="text/csv",
+        )
+
+        st.markdown("---")
+        st.subheader("Apply updates")
+        st.warning("Recommended: apply High-confidence suggestions first. Medium suggestions are mostly race-name hints and should be reviewed before applying.")
+        a1, a2 = st.columns(2)
+        with a1:
+            if st.button("Apply High-confidence gender updates", type="primary"):
+                applied = apply_gender_updates(suggestions, include_medium=False)
+                st.success(f"Applied gender updates for {applied:,} athletes. Refreshing cache...")
+                st.rerun()
+        with a2:
+            if st.button("Apply High + Medium suggestions"):
+                applied = apply_gender_updates(suggestions, include_medium=True)
+                st.success(f"Applied gender updates for {applied:,} athletes. Refreshing cache...")
+                st.rerun()
+
+    st.markdown("---")
+    st.subheader("Manual gender override upload")
+    st.caption("Upload a CSV with columns: athlete_url, athlete_name, gender. Use this for athletes that have no reliable start-list/race-name source.")
+    override_file = st.file_uploader("Manual gender CSV", type=["csv"], key="manual_gender_csv")
+    if override_file is not None:
+        manual = pd.read_csv(override_file)
+        manual_rows = []
+        for _, r in manual.iterrows():
+            g = normalize_gender(first_col(r, ["gender", "Gender", "sex", "Sex"]))
+            url = clean_str(first_col(r, ["athlete_url", "Athlete URL", "url", "URL"]))
+            name = clean_str(first_col(r, ["athlete_name", "Athlete", "Name", "athlete"]))
+            if g in ["Men", "Women"] and (url or name):
+                manual_rows.append({
+                    "Athlete URL": url,
+                    "Athlete": name,
+                    "Suggested Gender": g,
+                    "Confidence": "High",
+                    "Conflict": "No",
+                    "Sources": "Manual override CSV",
+                    "Signal Count": 1,
+                })
+        manual_df = pd.DataFrame(manual_rows)
+        st.write(f"Valid manual override rows: {len(manual_df):,}")
+        if not manual_df.empty:
+            display_table(manual_df.head(250), ["Athlete", "Athlete URL", "Suggested Gender", "Sources"], height=300)
+            if st.button("Apply manual gender overrides", type="primary"):
+                applied = apply_gender_updates(manual_df, include_medium=False)
+                st.success(f"Applied manual gender overrides for {applied:,} athletes.")
+                st.rerun()
 
 elif page == "Athlete Rankings":
     st.header("🥇 Athlete Rankings")
