@@ -107,19 +107,14 @@ def is_bad_status(status: Any, place: Any = None) -> bool:
 def is_excluded_for_split_status(status: Any, place: Any = None, discipline: str = "") -> bool:
     """Return whether a result status should exclude a discipline split.
 
-    Overall scoring should never use DNF/DNS/DSQ. Split scoring is more
-    nuanced: if an athlete DNF'd after the swim or bike, the completed split
-    can still be useful for fastest-split prediction. DNS/DSQ/DQ/DNQ remain
-    excluded for every discipline. Run splits from DNF rows are excluded by
-    default because a final DNF usually means the run was incomplete or not
-    comparable.
+    Default rule: DNF/DNS/DSQ/DQ/DNQ rows are audit-only and never part of
+    the used split score. We still keep them in the "All evaluated rows" view
+    so it is clear why a recent result did not count, but they should not show
+    under "Used in score" and should not affect split ranks, gap percentages,
+    or evidence scores.
     """
     combined = " ".join([clean_str(status) or "", clean_str(place) or ""]).upper()
-    if any(token in combined for token in ["DNS", "DSQ", "DQ", "DNQ"]):
-        return True
-    if "DNF" in combined:
-        return discipline == "run"
-    return False
+    return any(token in combined for token in ["DNF", "DNS", "DSQ", "DQ", "DNQ"])
 
 
 def parse_place(value: Any) -> Optional[str]:
@@ -1106,7 +1101,11 @@ def build_split_audit(
                 "field_source": "imported_sample",
                 "coverage_note": "Imported sample only; not full ProTriNews field",
                 "quality_tier": evidence_quality_label(pd.Series(r), discipline, 70.0),
-                "strong_evidence": is_strong_split_evidence(pd.Series(r), discipline, 70.0),
+                "strong_evidence": bool(
+                    is_strong_split_evidence(pd.Series(r), discipline, 70.0)
+                    and not split_status_excluded
+                    and not draft_bike
+                ),
                 "split_seconds": int(split_sec),
                 "split": format_seconds(split_sec),
                 "split_rank": idx,
@@ -1368,12 +1367,103 @@ def score_overall(
     return out
 
 
+
+DISPLAY_LABELS = {
+    "athlete_name": "Athlete",
+    "athlete_url": "Athlete URL",
+    "race_date": "Date",
+    "race_name": "Race",
+    "race_type": "Race Type",
+    "distance": "Distance",
+    "quality_tier": "Quality Tier",
+    "strong_evidence": "Strong Evidence",
+    "place": "Place",
+    "status": "Status",
+    "bad_status": "Bad Status",
+    "split_status_excluded": "Status Excluded",
+    "draft_bike_excluded": "Draft Bike Excluded",
+    "sof": "SOF",
+    "sof_source": "SOF Source",
+    "sof_original": "Original SOF",
+    "ors": "ORS",
+    "sample_size": "Sample Size",
+    "field_size": "Sample Size",
+    "field_source": "Field Source",
+    "coverage_note": "Coverage Note",
+    "split": "Split",
+    "swim_split": "Swim",
+    "bike_split": "Bike",
+    "run_split": "Run",
+    "swim_seconds": "Swim Seconds",
+    "bike_seconds": "Bike Seconds",
+    "run_seconds": "Run Seconds",
+    "split_seconds": "Split Seconds",
+    "split_rank": "Split Rank",
+    "rank_display": "Split Rank",
+    "sample_rank_display": "Split Rank",
+    "pct_behind_fastest": "% Behind Fastest",
+    "gap_when_fastest_pct": "Gap When Fastest %",
+    "closeness_score": "Closeness Score",
+    "rank_score": "Rank Score",
+    "dominance_score": "Dominance Score",
+    "raw_score": "Raw Score",
+    "sof_cap": "SOF Cap",
+    "field_cap": "Sample Cap",
+    "race_type_cap": "Race Type Cap",
+    "final_cap": "Final Cap",
+    "evidence_score": "Evidence Score",
+    "evidence_weight": "Evidence Weight",
+    "included": "Included",
+    "reason": "Reason",
+    "gender": "Gender",
+}
+
+
+def humanize_dataframe_for_display(show: pd.DataFrame) -> pd.DataFrame:
+    """Make internal dataframe columns readable before displaying them."""
+    show = show.copy()
+
+    for date_col in ["race_date", "Last Race Date", "Date"]:
+        if date_col in show.columns:
+            show[date_col] = show[date_col].map(format_date)
+
+    percent_cols = [
+        "pct_behind_fastest",
+        "gap_when_fastest_pct",
+        "% Behind Fastest",
+        "Gap When Fastest %",
+    ]
+    for col in percent_cols:
+        if col in show.columns:
+            show[col] = show[col].map(lambda x: "" if safe_float(x) is None else round(float(x), 2))
+
+    numeric_cols = [
+        "evidence_score", "evidence_weight", "closeness_score", "rank_score",
+        "dominance_score", "raw_score", "sof_cap", "field_cap", "race_type_cap",
+        "final_cap", "SOF", "ORS", "Score"
+    ]
+    for col in numeric_cols:
+        if col in show.columns:
+            show[col] = show[col].map(lambda x: "" if safe_float(x) is None else round(float(x), 2))
+
+    bool_cols = [
+        "strong_evidence", "bad_status", "split_status_excluded",
+        "draft_bike_excluded", "included"
+    ]
+    for col in bool_cols:
+        if col in show.columns:
+            show[col] = show[col].map(lambda x: "Yes" if bool(x) else "No")
+
+    show = show.rename(columns={c: DISPLAY_LABELS.get(c, c) for c in show.columns})
+    return show
+
 def display_table(df: pd.DataFrame, columns: List[str], height: Optional[int] = None):
     if df is None or df.empty:
         st.info("No data to show.")
         return
 
     show = df[[c for c in columns if c in df.columns]].copy()
+    show = humanize_dataframe_for_display(show)
 
     # Streamlit 1.58+ rejects height=None. Only pass height when it is a
     # positive integer, otherwise let Streamlit choose its default height.
@@ -1401,6 +1491,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 
     source = df.reset_index(drop=True).copy()
     show = source[[c for c in columns if c in source.columns]].copy()
+    show = humanize_dataframe_for_display(show)
 
     kwargs = {
         "use_container_width": True,
