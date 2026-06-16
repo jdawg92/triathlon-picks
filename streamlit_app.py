@@ -138,6 +138,25 @@ def normalize_gender(value: Any) -> Optional[str]:
     return s
 
 
+def race_gender_compatible(race_name: Any, selected_gender: str) -> bool:
+    """Use race-name hints to avoid obvious mixed-gender field comparisons.
+
+    Many imported Athlete Results rows do not have gender. If we require a
+    gender value, the same-race field collapses to only the current start-list
+    athletes and every split gets excluded. This allows unknown-gender rows
+    unless the race name clearly says the opposite gender.
+    """
+    name = (clean_str(race_name) or "").lower()
+    gender = normalize_gender(selected_gender) or selected_gender
+    women_hints = ["women", "women's", "female", "femmes"]
+    men_hints = ["men", "men's", "male", "hommes"]
+    if gender == "Men":
+        return not any(h in name for h in women_hints)
+    if gender == "Women":
+        return not any(h in name for h in men_hints)
+    return True
+
+
 def format_date(value: Any) -> str:
     if value is None or value == "":
         return ""
@@ -667,8 +686,14 @@ def sof_cap(sof: Optional[float], race_type: str, discipline: str) -> float:
 
 
 def field_cap(field_size: int) -> float:
-    if field_size < 5:
+    # Until we import full race fields, do not hard-exclude every small sample.
+    # A 2-4 athlete overlap is low confidence, so it gets a low cap, but it can
+    # still show in Included rows and contribute modestly. A field of 1 is not
+    # race-relative evidence and remains excluded.
+    if field_size < 2:
         return 0
+    if field_size <= 4:
+        return 45
     if field_size <= 7:
         return 55
     if field_size <= 14:
@@ -772,12 +797,18 @@ def build_split_audit(
     if results.empty or split_col not in results.columns:
         return pd.DataFrame()
 
-    # Same-gender only when known. Unknown rows are allowed only if the athlete is on this selected start list.
+    # Same-gender only when known. Unknown-gender rows are allowed when the race
+    # name does not clearly indicate the opposite gender. This prevents partial
+    # imported fields from collapsing to 1-2 athletes and making Included only blank.
     start_urls = set(start_athletes["athlete_url"].dropna().astype(str).tolist()) if "athlete_url" in start_athletes else set()
     df = results.copy()
     df = df[(df["race_date"].notna()) & (df["race_date"] <= target_date)]
     df = df[(df[split_col].notna()) & (~df["bad_status"])]
-    df = df[(df["gender"].eq(gender)) | (df["athlete_url"].isin(start_urls))]
+
+    gender_known_match = df["gender"].eq(gender)
+    gender_unknown_ok = df["gender"].isna() & df["race_name"].map(lambda x: race_gender_compatible(x, gender))
+    start_list_match = df["athlete_url"].isin(start_urls)
+    df = df[gender_known_match | gender_unknown_ok | start_list_match]
 
     if discipline == "bike":
         df = df[~df["race_type"].fillna("").str.lower().str.contains("wtcs|world triathlon|continental|draft")]
@@ -818,7 +849,11 @@ def build_split_audit(
             f_cap = field_cap(field_size)
             t_cap = race_type_cap(rt, discipline)
             final_cap = min(s_cap, f_cap, t_cap)
-            included = field_size >= min_field_size and final_cap > 0
+            # Include any valid race-relative sample with at least two athletes.
+            # Small fields are handled by low field caps/weights instead of being
+            # hidden completely. The min_field_size slider is now informational
+            # for low-sample warnings, not a hard include/exclude gate.
+            included = field_size >= 2 and final_cap > 0
 
             excluded_override, override_mult, override_reason = match_override(r, overrides, discipline)
             if excluded_override:
@@ -836,8 +871,10 @@ def build_split_audit(
                 ew *= 0.65
 
             reason = []
-            if field_size < min_field_size:
-                reason.append(f"field<{min_field_size}")
+            if field_size < 2:
+                reason.append("field<2")
+            elif field_size < min_field_size:
+                reason.append(f"low sample field<{min_field_size}")
             if final_cap <= 0:
                 reason.append("race type excluded")
             if excluded_override:
@@ -1173,7 +1210,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
         selected_label = st.selectbox("Race / Gender", labels, index=max(0, len(labels) - 1))
         recent_n = st.slider("Recent races used", 3, 8, 5)
         drop_worst = st.slider("Drop worst recent result", 0, 2, 1)
-        min_field_size = st.slider("Minimum same-race field size", 3, 15, 5)
+        min_field_size = st.slider("Low-sample warning threshold", 3, 15, 5)
         strong_sof_threshold = st.slider("Strong-field SOF threshold", 55, 90, 70)
 
     selected_meta = race_options_df[race_options_df["label"] == selected_label].iloc[0]
@@ -1208,7 +1245,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
         c1.metric("Start list athletes", len(start_athletes))
         c2.metric("Result rows in window", len(results_window))
         c3.metric("Overrides", len(overrides) if not overrides.empty else 0)
-        c4.metric("Min field size", min_field_size)
+        c4.metric("Low-sample threshold", min_field_size)
 
         with st.expander("Split data health", expanded=False):
             health = []
@@ -1232,7 +1269,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                     "Included start-list rows": start_included,
                 })
             st.dataframe(pd.DataFrame(health), use_container_width=True, hide_index=True)
-            st.caption("If included start-list rows are 0, the split picks will be blank. Lower the minimum same-race field size or check imported split columns/raw CSV values.")
+            st.caption("Included rows now require at least two same-race split rows. Small fields are included but capped/weighted down. If included start-list rows are 0, check split parsing, athlete URL/name matching, or DNF/status filters.")
 
         st.subheader("Overall Picks")
         overall = score_overall(results_window, start_athletes, overrides, selected_date, target_year, recent_n, drop_worst)
