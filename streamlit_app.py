@@ -690,7 +690,11 @@ def count_rows(table_name: str) -> Optional[int]:
 
 @st.cache_data(ttl=60)
 def load_table(table_name: str) -> pd.DataFrame:
-    return pd.DataFrame(fetch_all(table_name))
+    """Load a Supabase table. Missing optional tables return an empty frame."""
+    try:
+        return pd.DataFrame(fetch_all(table_name))
+    except Exception:
+        return pd.DataFrame()
 
 
 def clear_cache():
@@ -762,6 +766,18 @@ def normalize_athlete_results(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], L
         if athlete_url and athlete_name:
             athletes[athlete_url] = {"athlete_url": athlete_url, "athlete_name": athlete_name, "gender": gender}
     return rows, list(athletes.values())
+
+
+
+
+def normalize_race_field_results(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Normalize full race-field CSV rows.
+
+    This intentionally uses the same column mapping as Athlete Results, but
+    stores rows in race_field_results so split rankings can use the real field
+    without polluting the athlete-history table used for overall form.
+    """
+    return normalize_athlete_results(df)
 
 
 def normalize_start_lists(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -905,10 +921,30 @@ def fill_missing_sof_from_same_race(results: pd.DataFrame) -> pd.DataFrame:
 # Scoring helpers
 # ============================================================
 def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    results = load_table("athlete_results")
+    athlete_results = load_table("athlete_results")
+    race_field_results = load_table("race_field_results")
     starts = load_table("start_lists")
     athletes = load_table("athletes")
     overrides = load_table("race_overrides")
+
+    if not athlete_results.empty:
+        athlete_results["data_source"] = "athlete_results"
+    if not race_field_results.empty:
+        race_field_results["data_source"] = "race_field_results"
+
+    # Split scoring wants both the start-list athlete histories and the full
+    # race-field cache. Overall scoring is protected later by de-duplicating
+    # identical athlete/race rows and by filtering to start-list athletes.
+    if not race_field_results.empty:
+        results = pd.concat([athlete_results, race_field_results], ignore_index=True, sort=False)
+        if not results.empty:
+            results["_source_priority"] = results["data_source"].map({"athlete_results": 0, "race_field_results": 1}).fillna(2)
+            dedupe_cols = [c for c in ["athlete_url", "athlete_name", "race_date", "race_name", "race_type"] if c in results.columns]
+            if dedupe_cols:
+                results = results.sort_values("_source_priority").drop_duplicates(subset=dedupe_cols, keep="first")
+            results = results.drop(columns=["_source_priority"], errors="ignore")
+    else:
+        results = athlete_results
 
     for df in [results, starts, athletes, overrides]:
         if not df.empty:
@@ -1075,7 +1111,7 @@ def race_type_cap(race_type: str, discipline: str) -> float:
     if rt == "full":
         # Full-distance races transfer very well for swim/bike strength.
         # The run is a different fatigue profile, so keep it lower for 70.3.
-        return 95 if discipline == "swim" else 92 if discipline == "bike" else 70
+        return 95 if discipline == "swim" else 92 if discipline == "bike" else 85
     if rt == "wtcs":
         return 95 if discipline == "swim" else 70 if discipline == "run" else 0
     if "world triathlon cup" in rt:
@@ -1096,7 +1132,7 @@ def race_type_weight(race_type: str, discipline: str) -> float:
     if rt == "full":
         # Full IM swim/bike are high-value non-draft evidence for 70.3.
         # Full IM run transfers less directly to 70.3 run speed.
-        return 0.95 if discipline == "swim" else 0.90 if discipline == "bike" else 0.55
+        return 0.95 if discipline == "swim" else 0.90 if discipline == "bike" else 0.75
     if rt == "wtcs":
         return 0.90 if discipline == "swim" else 0.65 if discipline == "run" else 0.0
     if "world triathlon cup" in rt:
@@ -1156,7 +1192,12 @@ def is_premium_split_evidence(row: pd.Series, discipline: str, strong_sof_thresh
         return True
 
     if rt == "full":
-        return discipline in {"swim", "bike"} and sof is not None and sof >= 80
+        if discipline in {"swim", "bike"}:
+            return sof is not None and sof >= 80
+        if discipline == "run":
+            split_rank = safe_float(row.get("split_rank"))
+            pct = safe_float(row.get("pct_behind_fastest"))
+            return sof is not None and sof >= 85 and ((split_rank is not None and split_rank <= 3) or (pct is not None and pct <= 1.5))
 
     # Very high SOF normal 70.3/Challenge races are strong evidence,
     # not premium. Premium is reserved for T100/PTO, World Championship,
@@ -1180,7 +1221,12 @@ def is_strong_split_evidence(row: pd.Series, discipline: str, strong_sof_thresho
         return True
 
     if rt == "full":
-        return discipline in {"swim", "bike"} and sof is not None and sof >= strong_sof_threshold
+        if discipline in {"swim", "bike"}:
+            return sof is not None and sof >= strong_sof_threshold
+        if discipline == "run":
+            split_rank = safe_float(row.get("split_rank"))
+            pct = safe_float(row.get("pct_behind_fastest"))
+            return sof is not None and sof >= 80 and ((split_rank is not None and split_rank <= 5) or (pct is not None and pct <= 2.5))
 
     if rt in {"70.3", "challenge middle"}:
         return sof is not None and sof >= max(strong_sof_threshold, 72)
@@ -1551,6 +1597,32 @@ def score_splits_for_start_list(
         if len(recent_scored) and not (recent_scored["split_rank"] <= 5).any() and (avg_behind is None or avg_behind > 2.5):
             final = min(final, 50)
 
+        # Run-specific consistency gates. A single good run should not outrank
+        # an athlete with repeated elite 70.3/T100/full-IM run proof if the rest
+        # of the recent run profile is mediocre. Full IM runs can be strong when
+        # they are top-3/top-5 in a high-SOF field, but the recent average gap
+        # still matters more for run than for swim/bike.
+        if discipline == "run":
+            close_strong = recent_scored[
+                recent_scored["strong_evidence"].astype(bool)
+                & (
+                    (recent_scored["pct_behind_fastest"].astype(float) <= 2.5)
+                    | (recent_scored["split_rank"].astype(float) <= 3)
+                )
+            ]
+            close_strong_count = len(close_strong)
+            if avg_behind is not None:
+                if avg_behind > 7:
+                    final = min(final, 45)
+                elif avg_behind > 5:
+                    final = min(final, 55)
+                elif avg_behind > 3.5:
+                    final = min(final, 65)
+            if close_strong_count == 0:
+                final = min(final, 50)
+            elif close_strong_count == 1 and evidence_count >= 4 and avg_behind is not None and avg_behind > 3:
+                final = min(final, 60)
+
         # Quality confidence caps. This is the main fix for "three nobodies ahead
         # of Jamie". A normal high-SOF 70.3 win can support a profile, but the
         # very top should require premium proof unless the athlete has multiple
@@ -1867,6 +1939,8 @@ apply_dashboard_theme()
 
 PAGE_OPTIONS = {
     "🏆 Race Dashboard": "Race Dashboard",
+    "🥇 Athlete Rankings": "Athlete Rankings",
+    "👤 Athletes": "Athletes",
     "🔎 Split Audit": "Split Audit",
     "📥 Import CSVs": "Import CSVs",
     "🗄️ Database Viewer": "Database Viewer",
@@ -1906,7 +1980,7 @@ if page == "Connection":
 
         st.subheader("Table counts")
         count_rows_data = []
-        for table_name in ["athletes", "athlete_results", "start_lists", "race_overrides", "scoring_settings", "model_runs", "split_audit"]:
+        for table_name in ["athletes", "athlete_results", "race_field_results", "start_lists", "race_overrides", "scoring_settings", "model_runs", "split_audit"]:
             count_rows_data.append({"Table": table_name, "Rows in Supabase": count_rows(table_name)})
         st.dataframe(pd.DataFrame(count_rows_data), use_container_width=True, hide_index=True)
     except Exception as e:
@@ -1918,7 +1992,7 @@ elif page == "Import CSVs":
     st.write("Export each Google Sheet tab as CSV, then upload it here. Use replace mode for the first import.")
     replace = st.checkbox("Replace existing rows in selected table before importing", value=True)
 
-    table_choice = st.selectbox("CSV type", ["Athlete Results", "Start Lists", "Race Overrides", "Scoring Settings"])
+    table_choice = st.selectbox("CSV type", ["Athlete Results", "Race Field Results", "Start Lists", "Race Overrides", "Scoring Settings"])
     uploaded = st.file_uploader(f"Upload {table_choice} CSV", type=["csv"])
 
     if uploaded:
@@ -1940,6 +2014,18 @@ elif page == "Import CSVs":
                     after_count = count_rows("athlete_results")
                     st.success(f"Imported {len(rows):,} athlete result rows and upserted {len(athlete_rows):,} athletes.")
                     st.info(f"Supabase athlete_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
+
+                elif table_choice == "Race Field Results":
+                    rows, athlete_rows = normalize_race_field_results(df)
+                    before_count = count_rows("race_field_results")
+                    if replace:
+                        delete_all("race_field_results")
+                    insert_chunks("race_field_results", rows)
+                    upsert_chunks("athletes", athlete_rows, on_conflict="athlete_url")
+                    clear_cache()
+                    after_count = count_rows("race_field_results")
+                    st.success(f"Imported {len(rows):,} race-field result rows and upserted {len(athlete_rows):,} athletes.")
+                    st.info(f"Supabase race_field_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
 
                 elif table_choice == "Start Lists":
                     rows, athlete_rows = normalize_start_lists(df)
@@ -1969,9 +2055,85 @@ elif page == "Import CSVs":
                 st.error("Import failed.")
                 st.exception(e)
 
+elif page == "Athletes":
+    st.header("👤 Athletes")
+    results, starts, athletes, overrides = prepare_dataframes()
+    if results.empty:
+        st.warning("No athlete results found. Import Athlete Results first.")
+        st.stop()
+
+    view = results.copy()
+    search = st.text_input("Search athlete", "")
+    gender_filter = st.selectbox("Gender", ["All", "Men", "Women"])
+    if search:
+        view = view[view["athlete_name"].fillna("").str.contains(search, case=False, na=False)]
+    if gender_filter != "All":
+        view = view[view["gender"].eq(gender_filter)]
+
+    agg_rows = []
+    for key, g in view.groupby(view["athlete_url"].fillna(view["athlete_name"])):
+        g = g.sort_values("race_date", ascending=False)
+        valid = g[~g.get("bad_status", False).astype(bool)] if "bad_status" in g.columns else g
+        recent3 = valid.head(3)
+        agg_rows.append({
+            "Athlete": g["athlete_name"].dropna().iloc[0] if g["athlete_name"].notna().any() else key,
+            "Gender": g["gender"].dropna().iloc[0] if "gender" in g and g["gender"].notna().any() else None,
+            "Athlete URL": g["athlete_url"].dropna().iloc[0] if "athlete_url" in g and g["athlete_url"].notna().any() else None,
+            "Races Imported": len(g),
+            "Valid Results": len(valid),
+            "Last Race": clean_str(g["race_name"].iloc[0]) if "race_name" in g and not g.empty else "",
+            "Last Race Date": format_date(g["race_date"].iloc[0]) if "race_date" in g and not g.empty else "",
+            "Best ORS": round(pd.to_numeric(valid.get("ors", pd.Series(dtype=float)), errors="coerce").max(), 1) if not valid.empty else None,
+            "Recent 3 ORS": round(pd.to_numeric(recent3.get("ors", pd.Series(dtype=float)), errors="coerce").mean(), 1) if not recent3.empty else None,
+        })
+    athlete_summary = pd.DataFrame(agg_rows).sort_values(["Recent 3 ORS", "Best ORS"], ascending=[False, False], na_position="last") if agg_rows else pd.DataFrame()
+    display_table(athlete_summary.head(200), ["Athlete", "Gender", "Races Imported", "Valid Results", "Last Race", "Last Race Date", "Best ORS", "Recent 3 ORS", "Athlete URL"], height=520)
+
+    if not athlete_summary.empty:
+        names = athlete_summary["Athlete"].dropna().tolist()
+        selected = st.selectbox("Open athlete career results", names)
+        raw = results[results["athlete_name"].fillna("").eq(selected)].sort_values("race_date", ascending=False)
+        st.subheader(f"Recent career rows for {selected}")
+        display_table(raw.head(25), ["race_date", "race_name", "race_type", "distance", "place", "status", "sof", "sof_source", "ors", "swim_split", "bike_split", "run_split", "data_source"], height=420)
+
+elif page == "Athlete Rankings":
+    st.header("🥇 Athlete Rankings")
+    results, starts, athletes, overrides = prepare_dataframes()
+    if results.empty:
+        st.warning("No athlete results found. Import Athlete Results first.")
+        st.stop()
+
+    c1, c2, c3, c4 = st.columns(4)
+    ranking_gender = c1.selectbox("Gender", ["Men", "Women"], index=0)
+    as_of = c2.date_input("As of date", value=date.today())
+    recent_n_rank = c3.slider("Recent races used", 3, 8, 5, key="rank_recent_n")
+    drop_worst_rank = c4.slider("Drop worst", 0, 2, 1, key="rank_drop_worst")
+    as_of_ts = pd.Timestamp(as_of)
+    year = int(as_of_ts.year)
+    window_start_rank = pd.Timestamp(date(year - 2, 1, 1))
+    ranking_results = results[(results["race_date"].notna()) & (results["race_date"] >= window_start_rank) & (results["race_date"] <= as_of_ts)].copy()
+    ranking_results = ranking_results[(ranking_results["gender"].eq(ranking_gender)) | ranking_results["gender"].isna()]
+
+    # Build an all-athlete candidate list from imported rows for this gender/window.
+    candidate_cols = ["athlete_url", "athlete_name", "gender"]
+    start_all = ranking_results[candidate_cols].drop_duplicates().dropna(subset=["athlete_name"]).copy()
+    start_all["race_name"] = "Global Rankings"
+    start_all["race_date"] = as_of_ts
+    start_all["open_rank"] = None
+
+    tabs = st.tabs(["🏆 Overall", "🏊 Swim", "🚴 Bike", "🏃 Run"])
+    with tabs[0]:
+        overall_all = score_overall(ranking_results, start_all, overrides, as_of_ts, year, recent_n_rank, drop_worst_rank)
+        display_table(overall_all.head(50), ["Rank", "Athlete", "Score", "Recent Form ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"], height=620)
+    for tab, disc in zip(tabs[1:], ["swim", "bike", "run"]):
+        with tab:
+            aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, ranking_gender, disc, min_field_size=5)
+            scored = score_splits_for_start_list(aud, start_all, as_of_ts, recent_n_rank, drop_worst_rank, strong_sof_threshold=70)
+            display_table(scored.head(50), ["Rank", "Athlete", "Score", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"], height=620)
+
 elif page == "Database Viewer":
     st.header("🗄️ Database Viewer")
-    table = st.selectbox("Table", ["athletes", "athlete_results", "start_lists", "race_overrides", "scoring_settings", "model_runs", "split_audit"])
+    table = st.selectbox("Table", ["athletes", "athlete_results", "race_field_results", "start_lists", "race_overrides", "scoring_settings", "model_runs", "split_audit"])
     exact_count = count_rows(table)
     if exact_count is not None:
         st.metric("Rows in Supabase", f"{exact_count:,}")
