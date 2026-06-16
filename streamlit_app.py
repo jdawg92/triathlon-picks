@@ -28,38 +28,48 @@ supabase = get_supabase()
 # Visual styling
 # ============================================================
 def apply_dashboard_theme() -> None:
-    """Polished dark UI styling for the Streamlit dashboard."""
+    """Stripe-inspired UI styling that keeps the app distinct from PTN."""
     st.markdown(
         """
         <style>
         :root {
-            --ptn-bg: #070B12;
-            --ptn-panel: rgba(18, 24, 38, 0.88);
-            --ptn-panel-2: rgba(23, 31, 48, 0.92);
-            --ptn-border: rgba(148, 163, 184, 0.18);
-            --ptn-text: #E5ECF8;
-            --ptn-muted: #94A3B8;
-            --ptn-red: #EF4444;
-            --ptn-orange: #F97316;
-            --ptn-blue: #38BDF8;
-            --ptn-green: #22C55E;
-            --ptn-purple: #8B5CF6;
+            --ptn-bg: #F6F9FC;
+            --ptn-panel: #FFFFFF;
+            --ptn-panel-2: #F7FAFC;
+            --ptn-border: #E3E8EF;
+            --ptn-text: #0A2540;
+            --ptn-muted: #5F6B7A;
+            --ptn-red: #635BFF;
+            --ptn-orange: #00D4FF;
+            --ptn-blue: #635BFF;
+            --ptn-green: #00A878;
+            --ptn-purple: #7A5CFA;
+            --stripe-navy: #0A2540;
+            --stripe-purple: #635BFF;
+            --stripe-cyan: #00D4FF;
+            --stripe-slate: #425466;
+            --stripe-soft: #F6F9FC;
         }
 
         .stApp {
             background:
-                radial-gradient(circle at top left, rgba(56, 189, 248, 0.12), transparent 30rem),
-                radial-gradient(circle at top right, rgba(239, 68, 68, 0.12), transparent 28rem),
-                linear-gradient(135deg, #050816 0%, #08111F 45%, #070B12 100%);
+                radial-gradient(circle at 10% -10%, rgba(99, 91, 255, 0.15), transparent 28rem),
+                radial-gradient(circle at 90% 0%, rgba(0, 212, 255, 0.14), transparent 30rem),
+                linear-gradient(180deg, #FFFFFF 0%, #F6F9FC 34%, #EEF4FB 100%);
             color: var(--ptn-text);
         }
 
         [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, rgba(8, 13, 25, 0.98), rgba(15, 23, 42, 0.98));
+            background: rgba(255, 255, 255, 0.92);
             border-right: 1px solid var(--ptn-border);
+            box-shadow: 10px 0 30px rgba(10, 37, 64, 0.04);
         }
 
-        [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3, [data-testid="stSidebar"] p {
+        [data-testid="stSidebar"] h1,
+        [data-testid="stSidebar"] h2,
+        [data-testid="stSidebar"] h3,
+        [data-testid="stSidebar"] p,
+        [data-testid="stSidebar"] label {
             color: var(--ptn-text);
         }
 
@@ -73,19 +83,20 @@ def apply_dashboard_theme() -> None:
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            width: 2.25rem;
-            height: 2.25rem;
-            border-radius: 0.8rem;
+            width: 2.2rem;
+            height: 2.2rem;
+            border-radius: 0.75rem;
             margin-right: 0.5rem;
-            background: rgba(30, 41, 59, 0.9);
-            border: 1px solid rgba(148, 163, 184, 0.20);
-            box-shadow: none;
+            color: white;
+            background: linear-gradient(135deg, #635BFF, #00D4FF);
+            box-shadow: 0 10px 24px rgba(99, 91, 255, 0.18);
         }
 
         .ptn-sidebar-brand .title {
             font-weight: 800;
             font-size: 1.05rem;
-            letter-spacing: -0.02em;
+            color: var(--stripe-navy);
+            letter-spacing: -0.025em;
         }
 
         .ptn-sidebar-brand .subtitle {
@@ -94,43 +105,57 @@ def apply_dashboard_theme() -> None:
             margin-top: 0.15rem;
         }
 
-
         .ptn-sidebar-section {
-            color: #94A3B8;
-            font-size: 0.70rem;
+            color: #697386;
+            font-size: 0.68rem;
             font-weight: 900;
-            letter-spacing: 0.14em;
+            letter-spacing: 0.16em;
             text-transform: uppercase;
             margin: 1.05rem 0 0.35rem 0;
             padding-top: 0.55rem;
-            border-top: 1px solid rgba(148, 163, 184, 0.16);
+            border-top: 1px solid var(--ptn-border);
         }
 
         .ptn-hero {
-            padding: 1.35rem 1.5rem;
-            border: 1px solid var(--ptn-border);
-            border-radius: 1.25rem;
+            position: relative;
+            overflow: hidden;
+            padding: 1.45rem 1.6rem;
+            border: 1px solid rgba(99, 91, 255, 0.16);
+            border-radius: 1.35rem;
             background:
-                linear-gradient(135deg, rgba(239, 68, 68, 0.16), rgba(56, 189, 248, 0.08)),
-                rgba(15, 23, 42, 0.82);
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+                linear-gradient(135deg, rgba(99, 91, 255, 0.10), rgba(0, 212, 255, 0.08)),
+                #FFFFFF;
+            box-shadow: 0 24px 65px rgba(10, 37, 64, 0.08);
             margin: 0.25rem 0 1.2rem 0;
         }
 
-        .ptn-hero .eyebrow, .ptn-race-card .eyebrow {
-            color: #FCA5A5;
-            font-size: 0.75rem;
-            font-weight: 800;
-            letter-spacing: 0.14em;
+        .ptn-hero:after {
+            content: "";
+            position: absolute;
+            width: 18rem;
+            height: 18rem;
+            right: -7rem;
+            top: -8rem;
+            background: radial-gradient(circle, rgba(99, 91, 255, 0.18), transparent 64%);
+            pointer-events: none;
+        }
+
+        .ptn-hero .eyebrow,
+        .ptn-race-card .eyebrow {
+            color: var(--stripe-purple);
+            font-size: 0.74rem;
+            font-weight: 900;
+            letter-spacing: 0.15em;
             text-transform: uppercase;
             margin-bottom: 0.35rem;
         }
 
         .ptn-hero h1 {
+            color: var(--stripe-navy);
             font-size: 2.15rem;
             line-height: 1.05;
             margin: 0;
-            letter-spacing: -0.04em;
+            letter-spacing: -0.045em;
         }
 
         .ptn-hero p {
@@ -139,19 +164,25 @@ def apply_dashboard_theme() -> None:
             font-size: 1rem;
         }
 
+        .ptn-race-card,
+        [data-testid="stMetric"],
+        div[data-testid="stExpander"] {
+            background: rgba(255, 255, 255, 0.88);
+            border: 1px solid var(--ptn-border);
+            box-shadow: 0 18px 45px rgba(10, 37, 64, 0.06);
+        }
+
         .ptn-race-card {
             padding: 1.15rem 1.25rem;
-            border: 1px solid var(--ptn-border);
             border-radius: 1.15rem;
-            background: linear-gradient(135deg, rgba(15, 23, 42, 0.94), rgba(30, 41, 59, 0.72));
-            box-shadow: 0 18px 50px rgba(0, 0, 0, 0.22);
             margin: 0.35rem 0 1rem 0;
         }
 
         .ptn-race-card h2 {
             margin: 0;
+            color: var(--stripe-navy);
             font-size: 1.55rem;
-            letter-spacing: -0.03em;
+            letter-spacing: -0.035em;
         }
 
         .ptn-race-card .meta {
@@ -164,9 +195,10 @@ def apply_dashboard_theme() -> None:
             display: flex;
             align-items: center;
             gap: 0.55rem;
-            font-weight: 800;
+            color: var(--stripe-navy);
+            font-weight: 850;
             font-size: 1.3rem;
-            letter-spacing: -0.02em;
+            letter-spacing: -0.03em;
             margin: 1.25rem 0 0.7rem 0;
         }
 
@@ -175,40 +207,37 @@ def apply_dashboard_theme() -> None:
             padding: 0.22rem 0.55rem;
             border-radius: 999px;
             font-size: 0.76rem;
-            font-weight: 700;
-            color: #FEE2E2;
-            background: rgba(239, 68, 68, 0.16);
-            border: 1px solid rgba(239, 68, 68, 0.26);
+            font-weight: 750;
+            color: #3B2DBF;
+            background: rgba(99, 91, 255, 0.10);
+            border: 1px solid rgba(99, 91, 255, 0.18);
         }
 
         [data-testid="stMetric"] {
-            background: rgba(15, 23, 42, 0.78);
-            border: 1px solid var(--ptn-border);
             border-radius: 1rem;
             padding: 0.9rem 1rem;
-            box-shadow: 0 14px 40px rgba(0, 0, 0, 0.18);
         }
 
         [data-testid="stMetricLabel"] p {
             color: var(--ptn-muted) !important;
-            font-weight: 700;
+            font-weight: 750;
         }
 
         [data-testid="stMetricValue"] {
-            color: var(--ptn-text);
+            color: var(--stripe-navy);
             font-weight: 900;
         }
 
-        .stDataFrame, [data-testid="stDataFrame"] {
+        .stDataFrame,
+        [data-testid="stDataFrame"] {
             border-radius: 1rem;
             overflow: hidden;
             border: 1px solid var(--ptn-border);
+            box-shadow: 0 14px 34px rgba(10, 37, 64, 0.05);
         }
 
         div[data-testid="stExpander"] {
-            border: 1px solid var(--ptn-border);
             border-radius: 1rem;
-            background: rgba(15, 23, 42, 0.56);
             overflow: hidden;
         }
 
@@ -217,56 +246,71 @@ def apply_dashboard_theme() -> None:
         }
 
         .stTabs [data-baseweb="tab"] {
-            height: 2.75rem;
+            height: 2.65rem;
             border-radius: 999px;
             padding: 0 1rem;
-            background: rgba(15, 23, 42, 0.68);
+            background: #FFFFFF;
+            color: var(--stripe-slate);
             border: 1px solid var(--ptn-border);
         }
 
         .stTabs [aria-selected="true"] {
-            background: linear-gradient(135deg, rgba(239, 68, 68, 0.26), rgba(249, 115, 22, 0.18));
-            border-color: rgba(248, 113, 113, 0.55);
+            background: rgba(99, 91, 255, 0.10);
+            border-color: rgba(99, 91, 255, 0.32);
+            color: var(--stripe-purple);
         }
 
-        .stButton > button, .stDownloadButton > button {
-            border-radius: 0.75rem;
-            border: 1px solid rgba(148, 163, 184, 0.22);
-            background: rgba(15, 23, 42, 0.72);
-            color: var(--ptn-text);
-            font-weight: 750;
-            box-shadow: none;
+        .stButton > button,
+        .stDownloadButton > button {
+            border-radius: 0.72rem;
+            border: 1px solid var(--ptn-border);
+            background: #FFFFFF;
+            color: var(--stripe-navy);
+            font-weight: 760;
+            box-shadow: 0 8px 18px rgba(10, 37, 64, 0.04);
         }
 
-        .stButton > button:hover, .stDownloadButton > button:hover {
-            border-color: rgba(148, 163, 184, 0.42);
-            background: rgba(30, 41, 59, 0.82);
-            color: white;
+        .stButton > button:hover,
+        .stDownloadButton > button:hover {
+            border-color: rgba(99, 91, 255, 0.34);
+            background: #F7F9FF;
+            color: var(--stripe-purple);
         }
 
         [data-testid="stSidebar"] .stButton > button {
             justify-content: flex-start;
             text-align: left;
             padding-left: 0.85rem;
-            background: rgba(15, 23, 42, 0.66) !important;
-            border-color: rgba(148, 163, 184, 0.16) !important;
+            background: #FFFFFF !important;
+            border-color: #E6EBF2 !important;
+            color: #344054 !important;
             box-shadow: none !important;
         }
 
         [data-testid="stSidebar"] .stButton > button:hover {
-            background: rgba(30, 41, 59, 0.86) !important;
-            border-color: rgba(148, 163, 184, 0.34) !important;
+            background: #F6F9FC !important;
+            border-color: rgba(99, 91, 255, 0.28) !important;
+            color: var(--stripe-purple) !important;
         }
 
         [data-testid="stSidebar"] .stButton > button[kind="primary"],
         [data-testid="stSidebar"] .stButton button[data-testid="baseButton-primary"] {
-            background: rgba(59, 130, 246, 0.16) !important;
-            border-color: rgba(96, 165, 250, 0.44) !important;
-            color: #EAF2FF !important;
+            background: rgba(99, 91, 255, 0.09) !important;
+            border-color: rgba(99, 91, 255, 0.34) !important;
+            color: #3B2DBF !important;
+            box-shadow: none !important;
         }
 
-        .stSelectbox, .stSlider, .stRadio, .stFileUploader, .stCheckbox {
-            color: var(--ptn-text);
+        .stSelectbox,
+        .stSlider,
+        .stRadio,
+        .stFileUploader,
+        .stCheckbox,
+        label,
+        p,
+        span,
+        div {
+            color: inherit;
         }
 
         div[data-testid="stAlert"] {
@@ -274,14 +318,16 @@ def apply_dashboard_theme() -> None:
             border: 1px solid var(--ptn-border);
         }
 
-        h1, h2, h3 {
-            letter-spacing: -0.03em;
+        h1,
+        h2,
+        h3 {
+            color: var(--stripe-navy);
+            letter-spacing: -0.035em;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
-
 
 def render_app_hero(page_name: str) -> None:
     st.markdown(
@@ -834,6 +880,31 @@ def recover_split_from_raw(row: pd.Series, discipline: str) -> Optional[int]:
     }[discipline]
     value = first_from_mapping(raw, aliases)
     return parse_split_seconds(value, discipline, clean_str(row.get("race_type")))
+
+
+
+def recover_number_from_raw(row: pd.Series, aliases: Iterable[str]) -> Optional[float]:
+    """Recover numeric fields such as ORS/SOF from the stored raw CSV payload.
+
+    This protects older imports where the normalized column was blank because
+    the uploaded CSV used a slightly different header, while the original value
+    still exists inside the jsonb raw column.
+    """
+    raw = parse_raw_payload(row.get("raw"))
+    if not raw:
+        return None
+    value = first_from_mapping(raw, aliases)
+    return parse_number(value)
+
+
+ORS_ALIASES = [
+    "ORS", "OpenRank Score", "Open Rank Score", "Race Score", "Result Score",
+    "Score", "score", "ors", "openrank_score", "open_rank_score", "race_score",
+]
+
+SOF_ALIASES = [
+    "SOF", "Strength of Field", "Field Strength", "sof", "strength_of_field",
+]
 
 
 def read_uploaded_csv(uploaded_file) -> pd.DataFrame:
@@ -1637,8 +1708,8 @@ def normalize_athlete_results(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], L
             "race_type": race_type,
             "distance": distance,
             "place": place,
-            "sof": parse_number(first_col(r, ["SOF", "Strength of Field", "sof"])),
-            "ors": parse_number(first_col(r, ["ORS", "Score", "ors"])),
+            "sof": parse_number(first_col(r, SOF_ALIASES)),
+            "ors": parse_number(first_col(r, ORS_ALIASES)),
             "swim_seconds": parse_split_seconds(swim, "swim", race_type),
             "bike_seconds": parse_split_seconds(bike, "bike", race_type),
             "run_seconds": parse_split_seconds(run, "run", race_type),
@@ -1829,10 +1900,24 @@ def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
         results = pd.concat([athlete_results, race_field_results], ignore_index=True, sort=False)
         if not results.empty:
             results["_source_priority"] = results["data_source"].map({"athlete_results": 0, "race_field_results": 1}).fillna(2)
+            # Prefer the most complete duplicate row. Previously, an athlete_results
+            # row with blank ORS could win over a race_field_results row from the
+            # same athlete/race that actually had ORS/SOF/splits. That made some
+            # current-year athletes look like they had races but no ORS.
+            ors_num = pd.to_numeric(results.get("ors", pd.Series(index=results.index, dtype=object)), errors="coerce")
+            sof_num = pd.to_numeric(results.get("sof", pd.Series(index=results.index, dtype=object)), errors="coerce")
+            split_score = pd.Series(0, index=results.index, dtype="int64")
+            for split_col in ["swim_seconds", "bike_seconds", "run_seconds"]:
+                if split_col in results.columns:
+                    split_score = split_score + pd.to_numeric(results[split_col], errors="coerce").notna().astype(int)
+            results["_row_completeness"] = ors_num.notna().astype(int) * 4 + sof_num.notna().astype(int) * 2 + split_score
             dedupe_cols = [c for c in ["athlete_url", "athlete_name", "race_date", "race_name", "race_type"] if c in results.columns]
             if dedupe_cols:
-                results = results.sort_values("_source_priority").drop_duplicates(subset=dedupe_cols, keep="first")
-            results = results.drop(columns=["_source_priority"], errors="ignore")
+                results = (
+                    results.sort_values(["_row_completeness", "_source_priority"], ascending=[False, True])
+                    .drop_duplicates(subset=dedupe_cols, keep="first")
+                )
+            results = results.drop(columns=["_source_priority", "_row_completeness"], errors="ignore")
     else:
         results = athlete_results
 
@@ -1875,6 +1960,25 @@ def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
         for col in ["sof", "ors"]:
             if col in results.columns:
                 results[col] = pd.to_numeric(results[col], errors="coerce")
+
+        # Recover ORS/SOF from raw jsonb if older imports used slightly different
+        # CSV headers. This fixes rows that have a race in the selected year but
+        # appeared blank in Current Year ORS.
+        if "ors" not in results.columns:
+            results["ors"] = np.nan
+        if "sof" not in results.columns:
+            results["sof"] = np.nan
+        if "raw" in results.columns:
+            ors_missing = results["ors"].isna()
+            if ors_missing.any():
+                recovered_ors = results.loc[ors_missing].apply(lambda r: recover_number_from_raw(r, ORS_ALIASES), axis=1)
+                results.loc[ors_missing, "ors"] = pd.to_numeric(recovered_ors, errors="coerce").to_numpy()
+            sof_missing = results["sof"].isna()
+            if sof_missing.any():
+                recovered_sof = results.loc[sof_missing].apply(lambda r: recover_number_from_raw(r, SOF_ALIASES), axis=1)
+                results.loc[sof_missing, "sof"] = pd.to_numeric(recovered_sof, errors="coerce").to_numpy()
+        results["ors"] = pd.to_numeric(results["ors"], errors="coerce")
+        results["sof"] = pd.to_numeric(results["sof"], errors="coerce")
 
         # SOF is race-level evidence. PTN/imported CSV rows can have SOF blank
         # for one athlete while other athletes from the exact same race have it.
@@ -3029,8 +3133,15 @@ def score_overall(
             continue
         gg = pd.DataFrame(scored_rows).sort_values("race_date", ascending=False)
         rank_score_val, best_scores = best4_openrank_average(gg["ors_for_rank"].tolist(), top_n)
-        current_year = gg[gg["race_date"].dt.year == target_year]
-        current_year_score = pd.to_numeric(current_year.get("ors_for_rank", pd.Series(dtype=float)), errors="coerce").mean() if not current_year.empty else None
+        current_year = gg[gg["race_date"].dt.year == target_year].copy()
+        current_year_values = pd.to_numeric(current_year.get("ors_for_rank", pd.Series(dtype=float)), errors="coerce").dropna().tolist() if not current_year.empty else []
+        # Display a real current-year ORS average from scored current-year races.
+        # Do not pad this display value with zeros; padding is only for the main
+        # OpenRank-style ranking score. This makes it obvious when an athlete has
+        # races this year but none of those rows carried an ORS value.
+        current_year_score = float(np.mean(sorted(current_year_values, reverse=True)[:top_n])) if current_year_values else None
+        current_year_races = int(len(current_year))
+        current_year_scored = int(len(current_year_values))
         strong = gg[(gg["sof"].fillna(0) >= 70) | (gg["race_type"].isin(["T100", "WTCS"]))]
         strong_score = pd.to_numeric(strong.get("ors_for_rank", pd.Series(dtype=float)), errors="coerce").mean() if not strong.empty else 0
         name = g["athlete_name"].dropna().iloc[0] if g["athlete_name"].notna().any() else str(athlete_key)
@@ -3045,6 +3156,8 @@ def score_overall(
             "Best Scores Used": ", ".join([f"{x:.1f}" for x in best_scores]),
             "Recent Form ORS": round(rank_score_val, 1),
             "Current Year ORS": round(float(current_year_score), 1) if current_year_score is not None and not pd.isna(current_year_score) else None,
+            "Current Year Races": current_year_races,
+            "Current Year Scored": current_year_scored,
             "Best Recent ORS": round(max(best_scores), 1) if best_scores else 0,
             "Strong Field ORS": round(float(strong_score), 1) if strong_score is not None and not pd.isna(strong_score) else 0,
             "Championship Score": round(championship_result_score(gg.sort_values("race_date", ascending=False).iloc[0]), 1) if not gg.empty else 0,
@@ -3142,7 +3255,7 @@ def humanize_dataframe_for_display(show: pd.DataFrame) -> pd.DataFrame:
         "evidence_score", "evidence_weight", "closeness_score", "rank_score",
         "dominance_score", "raw_score", "sof_cap", "field_cap", "race_type_cap",
         "final_cap", "SOF", "ORS", "Score", "OpenRank Score",
-        "OpenRank Split Score", "split_openrank_score", "openrank_position_score",
+        "OpenRank Split Score", "Current Year Races", "Current Year Scored", "split_openrank_score", "openrank_position_score",
         "openrank_sof_score", "openrank_time_score", "baseline_split"
     ]
     for col in numeric_cols:
@@ -3661,7 +3774,7 @@ elif page == "Athlete Rankings":
             overall_all = score_overall(ranking_results, start_all, overrides, as_of_ts, year, top_n_rank)
         display_table(
             overall_all.head(75),
-            ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"],
+            ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"],
             height=620,
         )
     else:
@@ -3810,7 +3923,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
         overall = score_overall(results_window, start_athletes, overrides, selected_date, target_year, top_n)
         display_table(
             overall.head(15),
-            ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "OpenRank", "Last Race", "Last Race Date"],
+            ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "OpenRank", "Last Race", "Last Race Date"],
         )
 
         if not overall.empty:
