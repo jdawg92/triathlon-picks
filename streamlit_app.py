@@ -1097,6 +1097,53 @@ def display_table(df: pd.DataFrame, columns: List[str], height: Optional[int] = 
 
     st.dataframe(show, **kwargs)
 
+
+def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Optional[int] = None) -> Optional[pd.Series]:
+    """Display a Streamlit dataframe and return the clicked/selected source row.
+
+    Streamlit row selection lets us click an athlete row in a split pick table
+    and immediately show that athlete's recent evidence without using a separate
+    dropdown first. If selection is unavailable for any reason, the function
+    gracefully falls back to a normal dataframe and returns None.
+    """
+    if df is None or df.empty:
+        st.info("No data to show.")
+        return None
+
+    source = df.reset_index(drop=True).copy()
+    show = source[[c for c in columns if c in source.columns]].copy()
+
+    kwargs = {
+        "use_container_width": True,
+        "hide_index": True,
+        "key": key,
+    }
+    if isinstance(height, int) and height > 0:
+        kwargs["height"] = height
+
+    try:
+        event = st.dataframe(
+            show,
+            on_select="rerun",
+            selection_mode="single-row",
+            **kwargs,
+        )
+        selected_rows = []
+        try:
+            selected_rows = list(event.selection.rows)
+        except Exception:
+            if isinstance(event, dict):
+                selected_rows = event.get("selection", {}).get("rows", []) or []
+        if selected_rows:
+            row_idx = int(selected_rows[0])
+            if 0 <= row_idx < len(source):
+                return source.iloc[row_idx]
+    except TypeError:
+        # Older Streamlit fallback. Current Cloud version should support row
+        # selection, but this keeps the dashboard from crashing if API changes.
+        st.dataframe(show, use_container_width=True, hide_index=True)
+    return None
+
 # ============================================================
 # UI
 # ============================================================
@@ -1284,20 +1331,45 @@ elif page in {"Race Dashboard", "Split Audit"}:
             with tab:
                 st.subheader(title)
                 scored = score_splits_for_start_list(audit_by_disc[disc], start_athletes, selected_date, recent_n, drop_worst, strong_sof_threshold)
-                display_table(
-                    scored.head(12),
+                scored_top = scored.head(12).copy()
+                selected_row = selectable_table(
+                    scored_top,
                     ["Rank", "Athlete", "Score", "Recent Score", "Strong Field Score", "Recent Avg Behind %", "Recent Top 3 %", "Recent Fastest %", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
+                    key=f"split_pick_table_{disc}",
                 )
-                st.caption("Score is based on recent race-relative split performance. Raw times are shown only as evidence; % behind fastest is the main metric.")
+                st.caption("Click an athlete row above to show their last 5 valid split rows. Score is based on recent race-relative split performance; % behind fastest is the main metric.")
 
-                if not scored.empty:
-                    athlete = st.selectbox(f"Show recent evidence for {title}", scored["Athlete"].tolist(), key=f"evidence_{disc}")
+                if not scored_top.empty:
                     aud = audit_by_disc[disc]
-                    ev = aud[(aud["athlete_name"] == athlete) & (aud["included"])].sort_values("race_date", ascending=False).head(recent_n)
-                    display_table(
-                        ev,
-                        ["race_date", "race_name", "race_type", "sof", "field_size", "split", "rank_display", "pct_behind_fastest", "evidence_score", "final_cap", "reason"],
+                    fallback_athlete = scored_top["Athlete"].iloc[0]
+                    selected_athlete = clean_str(selected_row.get("Athlete")) if selected_row is not None else fallback_athlete
+                    selected_url = clean_str(selected_row.get("Athlete URL")) if selected_row is not None and "Athlete URL" in selected_row.index else None
+
+                    # Fallback selector is still useful on mobile or if the row
+                    # selection gets reset after Streamlit reruns.
+                    athlete = st.selectbox(
+                        f"Selected {title} athlete",
+                        scored_top["Athlete"].tolist(),
+                        index=max(0, scored_top["Athlete"].tolist().index(selected_athlete)) if selected_athlete in scored_top["Athlete"].tolist() else 0,
+                        key=f"evidence_{disc}",
                     )
+                    if athlete != selected_athlete:
+                        selected_athlete = athlete
+                        selected_url = clean_str(scored_top.loc[scored_top["Athlete"] == athlete, "Athlete URL"].iloc[0]) if "Athlete URL" in scored_top.columns and not scored_top.loc[scored_top["Athlete"] == athlete].empty else None
+
+                    st.markdown(f"**Last 5 {disc} rows for {selected_athlete}**")
+                    if aud.empty:
+                        st.info("No audit rows for this athlete.")
+                    else:
+                        if selected_url:
+                            mask = aud["athlete_url"].astype(str).eq(selected_url)
+                        else:
+                            mask = aud["athlete_name"].fillna("").str.lower().eq(str(selected_athlete).lower())
+                        ev = aud[mask].sort_values("race_date", ascending=False).head(5)
+                        display_table(
+                            ev,
+                            ["race_date", "race_name", "race_type", "sof", "field_size", "split", "rank_display", "pct_behind_fastest", "evidence_score", "final_cap", "included", "reason"],
+                        )
 
     else:
         st.subheader("Split Audit")
