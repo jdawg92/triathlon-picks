@@ -2098,38 +2098,58 @@ elif page == "Athletes":
 
 elif page == "Athlete Rankings":
     st.header("🥇 Athlete Rankings")
+    st.caption("Global rankings are now gender-strict and can be filtered by race family, so Men/Women and 70.3/T100 profiles do not get blended together.")
     results, starts, athletes, overrides = prepare_dataframes()
     if results.empty:
         st.warning("No athlete results found. Import Athlete Results first.")
         st.stop()
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns([1.1, 1.3, 1.1, 1.1, 1.1])
     ranking_gender = c1.selectbox("Gender", ["Men", "Women"], index=0)
-    as_of = c2.date_input("As of date", value=date.today())
-    recent_n_rank = c3.slider("Recent races used", 3, 8, 5, key="rank_recent_n")
-    drop_worst_rank = c4.slider("Drop worst", 0, 2, 1, key="rank_drop_worst")
+    ranking_scope = c2.selectbox(
+        "Race family",
+        ["All", "IRONMAN 70.3 / Middle", "T100 / PTO", "Full IRONMAN", "Short Course / WTCS"],
+        index=1,
+        help="Use 70.3/Middle for normal 70.3-style rankings, or T100/PTO for that race family only.",
+    )
+    as_of = c3.date_input("As of date", value=date.today())
+    recent_n_rank = c4.slider("Recent races used", 3, 8, 5, key="rank_recent_n")
+    drop_worst_rank = c5.slider("Drop worst", 0, 2, 1, key="rank_drop_worst")
     as_of_ts = pd.Timestamp(as_of)
     year = int(as_of_ts.year)
     window_start_rank = pd.Timestamp(date(year - 2, 1, 1))
-    ranking_results = results[(results["race_date"].notna()) & (results["race_date"] >= window_start_rank) & (results["race_date"] <= as_of_ts)].copy()
-    ranking_results = ranking_results[(ranking_results["gender"].eq(ranking_gender)) | ranking_results["gender"].isna()]
 
-    # Build an all-athlete candidate list from imported rows for this gender/window.
+    ranking_results = results[(results["race_date"].notna()) & (results["race_date"] >= window_start_rank) & (results["race_date"] <= as_of_ts)].copy()
+    pre_gender_count = len(ranking_results)
+    ranking_results = filter_rankings_by_gender(ranking_results, ranking_gender)
+    post_gender_count = len(ranking_results)
+    ranking_results = ranking_results[ranking_scope_mask(ranking_results, ranking_scope)].copy()
+
+    if ranking_results.empty:
+        st.warning("No rows match this gender/race-family filter. Check imported genders or choose a different race family.")
+        st.stop()
+
+    # Build an all-athlete candidate list from gender-clean imported rows for this window/family.
     candidate_cols = ["athlete_url", "athlete_name", "gender"]
     start_all = ranking_results[candidate_cols].drop_duplicates().dropna(subset=["athlete_name"]).copy()
-    start_all["race_name"] = "Global Rankings"
+    start_all["race_name"] = f"Global Rankings — {ranking_scope}"
     start_all["race_date"] = as_of_ts
     start_all["open_rank"] = None
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Rows after gender filter", f"{post_gender_count:,}", help=f"Started with {pre_gender_count:,} rows in the date window. Unknown-gender rows are excluded here to prevent mixed Men/Women rankings.")
+    m2.metric("Rows after race-family filter", f"{len(ranking_results):,}")
+    m3.metric("Athletes ranked", f"{start_all['athlete_name'].nunique():,}")
 
     tabs = st.tabs(["🏆 Overall", "🏊 Swim", "🚴 Bike", "🏃 Run"])
     with tabs[0]:
         overall_all = score_overall(ranking_results, start_all, overrides, as_of_ts, year, recent_n_rank, drop_worst_rank)
-        display_table(overall_all.head(50), ["Rank", "Athlete", "Score", "Recent Form ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"], height=620)
+        display_table(overall_all.head(75), ["Rank", "Athlete", "Score", "Recent Form ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"], height=620)
     for tab, disc in zip(tabs[1:], ["swim", "bike", "run"]):
         with tab:
             aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, ranking_gender, disc, min_field_size=5)
             scored = score_splits_for_start_list(aud, start_all, as_of_ts, recent_n_rank, drop_worst_rank, strong_sof_threshold=70)
-            display_table(scored.head(50), ["Rank", "Athlete", "Score", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"], height=620)
+            display_table(scored.head(75), ["Rank", "Athlete", "Score", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"], height=620)
 
 elif page == "Database Viewer":
     st.header("🗄️ Database Viewer")
