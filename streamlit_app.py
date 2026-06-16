@@ -3739,6 +3739,271 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
                 height=360,
             )
 
+
+
+# ============================================================
+# Race lookup and start-list management helpers
+# ============================================================
+def _race_group_key(row: pd.Series) -> str:
+    """Stable display key for a race/date/gender/source group."""
+    race_name = clean_str(row.get("race_name")) or "Unknown Race"
+    race_date = format_date(row.get("race_date"))
+    gender = normalize_gender(row.get("gender")) or clean_str(row.get("gender")) or "Unknown"
+    race_type = clean_str(row.get("race_type")) or clean_str(row.get("distance")) or "Unknown"
+    source = clean_str(row.get("data_source")) or clean_str(row.get("source")) or "results"
+    return f"{race_date} · {gender} · {race_name} · {race_type} · {source}"
+
+
+def race_lookup_summary(results: pd.DataFrame) -> pd.DataFrame:
+    """Build a searchable race index from imported athlete/race-field results."""
+    if results is None or results.empty:
+        return pd.DataFrame()
+    df = results.copy()
+    for col in ["race_name", "race_date", "gender", "race_type", "distance", "data_source"]:
+        if col not in df.columns:
+            df[col] = None
+    df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
+    df["athlete_key"] = df.apply(
+        lambda r: canonical_athlete_url(r.get("athlete_url")) or (clean_str(r.get("athlete_name")) or "").lower(),
+        axis=1,
+    )
+    group_cols = ["race_name", "race_date", "gender", "race_type", "distance", "data_source"]
+    grouped = df.groupby(group_cols, dropna=False)
+    rows = []
+    for key, g in grouped:
+        race_name, race_date, gender, race_type, distance, source = key
+        sof_vals = pd.to_numeric(g.get("sof", pd.Series(dtype=float)), errors="coerce")
+        ors_vals = pd.to_numeric(g.get("ors", pd.Series(dtype=float)), errors="coerce")
+        rows.append({
+            "Race Date": race_date,
+            "Race": clean_str(race_name) or "Unknown Race",
+            "Gender": normalize_gender(gender) or clean_str(gender) or "Unknown",
+            "Race Type": clean_str(race_type) or clean_str(distance) or "Unknown",
+            "Source": clean_str(source) or "results",
+            "Athletes": int(g["athlete_key"].replace("", np.nan).dropna().nunique()),
+            "Rows": int(len(g)),
+            "SOF": None if sof_vals.dropna().empty else round(float(sof_vals.dropna().median()), 2),
+            "Max ORS": None if ors_vals.dropna().empty else round(float(ors_vals.dropna().max()), 2),
+            "_race_name": clean_str(race_name) or "Unknown Race",
+            "_race_date": race_date,
+            "_gender": normalize_gender(gender) or clean_str(gender) or "Unknown",
+            "_race_type": clean_str(race_type) or clean_str(distance) or "Unknown",
+            "_source": clean_str(source) or "results",
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["_select_key"] = out.apply(lambda r: f"{format_date(r['_race_date'])} · {r['_gender']} · {r['_race_name']} · {r['_race_type']} · {r['_source']}", axis=1)
+    return out.sort_values(["Race Date", "Race", "Gender"], ascending=[False, True, True]).reset_index(drop=True)
+
+
+def filter_race_lookup(summary: pd.DataFrame, search: str, gender: str, race_family: str, source_filter: str) -> pd.DataFrame:
+    if summary is None or summary.empty:
+        return pd.DataFrame()
+    out = summary.copy()
+    q = (search or "").strip().lower()
+    if q:
+        hay = (
+            out["Race"].fillna("").astype(str) + " " +
+            out["Race Type"].fillna("").astype(str) + " " +
+            out["Gender"].fillna("").astype(str) + " " +
+            out["Source"].fillna("").astype(str)
+        ).str.lower()
+        out = out[hay.str.contains(re.escape(q), na=False)]
+    if gender and gender != "All":
+        out = out[out["Gender"].eq(gender)]
+    if race_family and race_family != "All":
+        # Reuse the ranking family mask against a dataframe with race_type/race_name.
+        temp = pd.DataFrame({"race_name": out["Race"], "race_type": out["Race Type"]})
+        mask = ranking_scope_mask(temp, race_family)
+        out = out[mask.to_numpy()]
+    if source_filter and source_filter != "All":
+        out = out[out["Source"].eq(source_filter)]
+    return out.reset_index(drop=True)
+
+
+def race_participants(results: pd.DataFrame, selected: pd.Series) -> pd.DataFrame:
+    if results is None or results.empty or selected is None:
+        return pd.DataFrame()
+    df = results.copy()
+    for col in ["race_name", "race_date", "gender", "race_type", "distance", "data_source"]:
+        if col not in df.columns:
+            df[col] = None
+    df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
+    selected_date = pd.to_datetime(selected.get("_race_date"), errors="coerce")
+    mask = df["race_name"].fillna("Unknown Race").astype(str).eq(str(selected.get("_race_name")))
+    if not pd.isna(selected_date):
+        mask &= df["race_date"].dt.date.eq(selected_date.date())
+    selected_gender = clean_str(selected.get("_gender"))
+    if selected_gender and selected_gender != "Unknown":
+        mask &= df["gender"].map(lambda x: normalize_gender(x) or clean_str(x) or "Unknown").eq(selected_gender)
+    selected_type = clean_str(selected.get("_race_type"))
+    if selected_type and selected_type != "Unknown":
+        type_ser = df.apply(lambda r: clean_str(r.get("race_type")) or clean_str(r.get("distance")) or "Unknown", axis=1)
+        mask &= type_ser.eq(selected_type)
+    selected_source = clean_str(selected.get("_source"))
+    if selected_source and selected_source != "results":
+        mask &= df["data_source"].fillna("results").astype(str).eq(selected_source)
+    out = df[mask].copy()
+    if out.empty:
+        return out
+    out["Athlete"] = out.get("athlete_name", pd.Series(index=out.index, dtype=object))
+    out["Gender"] = out.get("gender", pd.Series(index=out.index, dtype=object))
+    out["Race Date"] = out.get("race_date", pd.Series(index=out.index, dtype=object))
+    out["Race Type"] = out.apply(lambda r: clean_str(r.get("race_type")) or clean_str(r.get("distance")) or "", axis=1)
+    out["Place"] = out.get("place", pd.Series(index=out.index, dtype=object))
+    out["ORS"] = out.get("ors", pd.Series(index=out.index, dtype=object))
+    out["SOF"] = out.get("sof", pd.Series(index=out.index, dtype=object))
+    out["Swim"] = out.get("swim_seconds", pd.Series(index=out.index, dtype=object))
+    out["Bike"] = out.get("bike_seconds", pd.Series(index=out.index, dtype=object))
+    out["Run"] = out.get("run_seconds", pd.Series(index=out.index, dtype=object))
+    out["Status"] = out.get("status", pd.Series(index=out.index, dtype=object))
+    out["Athlete URL"] = out.get("athlete_url", pd.Series(index=out.index, dtype=object))
+    out["Source"] = out.get("data_source", pd.Series(index=out.index, dtype=object))
+    if "place_num" not in out.columns:
+        out["place_num"] = out["Place"].map(parse_place_number)
+    return out.sort_values(["place_num", "ORS", "Athlete"], ascending=[True, False, True], na_position="last").reset_index(drop=True)
+
+
+def start_list_group_summary(starts: pd.DataFrame) -> pd.DataFrame:
+    """Return one row per imported start-list race/date/gender group."""
+    if starts is None or starts.empty:
+        return pd.DataFrame()
+    df = starts.copy()
+    for col in ["race_name", "race_date", "gender", "athlete_url", "athlete_name", "open_rank"]:
+        if col not in df.columns:
+            df[col] = None
+    df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
+    df["athlete_key"] = df.apply(lambda r: canonical_athlete_url(r.get("athlete_url")) or (clean_str(r.get("athlete_name")) or "").lower(), axis=1)
+    rows = []
+    for (race_name, race_date, gender), g in df.groupby(["race_name", "race_date", "gender"], dropna=False):
+        athletes_count = int(g["athlete_key"].replace("", np.nan).dropna().nunique())
+        duplicate_rows = int(len(g) - athletes_count)
+        rows.append({
+            "Race Date": race_date,
+            "Race": clean_str(race_name) or "Unknown Race",
+            "Gender": normalize_gender(gender) or clean_str(gender) or "Unknown",
+            "Athletes": athletes_count,
+            "Rows": int(len(g)),
+            "Duplicate Rows": max(duplicate_rows, 0),
+            "_race_name": clean_str(race_name) or "Unknown Race",
+            "_race_date": race_date,
+            "_gender": normalize_gender(gender) or clean_str(gender) or "Unknown",
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["_select_key"] = out.apply(lambda r: f"{format_date(r['_race_date'])} · {r['_gender']} · {r['_race_name']} · {int(r['Athletes'])} athletes", axis=1)
+    return out.sort_values(["Race Date", "Race", "Gender"], ascending=[False, True, True]).reset_index(drop=True)
+
+
+def start_list_rows_for_group(starts: pd.DataFrame, race_name: str, race_date: Any, gender: str) -> pd.DataFrame:
+    if starts is None or starts.empty:
+        return pd.DataFrame()
+    df = starts.copy()
+    df["race_date"] = pd.to_datetime(df.get("race_date"), errors="coerce")
+    selected_date = pd.to_datetime(race_date, errors="coerce")
+    mask = df.get("race_name", pd.Series(index=df.index, dtype=object)).fillna("Unknown Race").astype(str).eq(str(race_name))
+    if not pd.isna(selected_date):
+        mask &= df["race_date"].dt.date.eq(selected_date.date())
+    if gender and gender != "Unknown":
+        mask &= df.get("gender", pd.Series(index=df.index, dtype=object)).map(lambda x: normalize_gender(x) or clean_str(x) or "Unknown").eq(gender)
+    out = df[mask].copy()
+    if out.empty:
+        return out
+    out["Athlete"] = out.get("athlete_name", pd.Series(index=out.index, dtype=object))
+    out["Athlete URL"] = out.get("athlete_url", pd.Series(index=out.index, dtype=object)).map(canonical_athlete_url)
+    out["OpenRank"] = out.get("open_rank", pd.Series(index=out.index, dtype=object))
+    out["Gender"] = out.get("gender", pd.Series(index=out.index, dtype=object))
+    out["Race Date"] = out.get("race_date", pd.Series(index=out.index, dtype=object))
+    out["Race"] = out.get("race_name", pd.Series(index=out.index, dtype=object))
+    return out.sort_values(["OpenRank", "Athlete"], ascending=[True, True], na_position="last").reset_index(drop=True)
+
+
+def delete_start_list_row(row: pd.Series) -> bool:
+    """Delete one start-list row, preferring its database id when present."""
+    try:
+        row_id = row.get("id")
+        if row_id is not None and not (isinstance(row_id, float) and math.isnan(row_id)):
+            supabase.table("start_lists").delete().eq("id", int(row_id)).execute()
+            return True
+    except Exception:
+        pass
+    race_name = clean_str(row.get("race_name") or row.get("Race"))
+    race_date = format_date(row.get("race_date") or row.get("Race Date"))
+    gender = normalize_gender(row.get("gender") or row.get("Gender"))
+    athlete_url = canonical_athlete_url(row.get("athlete_url") or row.get("Athlete URL"))
+    athlete_name = clean_str(row.get("athlete_name") or row.get("Athlete"))
+    try:
+        q = supabase.table("start_lists").delete().eq("race_name", race_name).eq("race_date", race_date).eq("gender", gender)
+        if athlete_url:
+            q = q.eq("athlete_url", athlete_url)
+        elif athlete_name:
+            q = q.eq("athlete_name", athlete_name)
+        else:
+            return False
+        q.execute()
+        return True
+    except Exception:
+        return False
+
+
+def add_start_list_athlete(race_name: str, race_date: Any, gender: str, athlete_name: str, athlete_url: str, open_rank: Any) -> Tuple[bool, str]:
+    """Add one athlete to a start list if that athlete is not already in it."""
+    race_name = clean_str(race_name)
+    race_date_str = format_date(race_date)
+    gender = normalize_gender(gender) or clean_str(gender)
+    athlete_name = clean_str(athlete_name)
+    athlete_url = canonical_athlete_url(athlete_url)
+    if not race_name or not race_date_str or not gender:
+        return False, "Missing race, date, or gender."
+    if not athlete_name and not athlete_url:
+        return False, "Enter an athlete name or athlete URL."
+    row = {
+        "race_name": race_name,
+        "race_date": race_date_str,
+        "gender": gender,
+        "athlete_url": athlete_url,
+        "athlete_name": athlete_name,
+        "open_rank": parse_int(open_rank),
+    }
+    inserted, skipped = merge_start_list_rows([row])
+    upsert_athletes_preserve_gender([{"athlete_url": athlete_url, "athlete_name": athlete_name, "gender": gender}])
+    apply_gender_updates_from_rows([row])
+    clear_cache()
+    if inserted:
+        return True, "Athlete added to start list."
+    return False, "That athlete already appears on this start list."
+
+
+def normalize_start_list_upload_for_group(upload_df: pd.DataFrame, race_name: str, race_date: Any, gender: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Normalize an uploaded start-list CSV and fill blank race/date/gender from selected group."""
+    rows, athlete_rows = normalize_start_lists(upload_df)
+    race_name = clean_str(race_name)
+    race_date_str = format_date(race_date)
+    gender = normalize_gender(gender) or clean_str(gender)
+    fixed = []
+    for row in rows:
+        row = dict(row)
+        if not clean_str(row.get("race_name")) or clean_str(row.get("race_name")) == "Unknown Race":
+            row["race_name"] = race_name
+        if not clean_str(row.get("race_date")):
+            row["race_date"] = race_date_str
+        if not normalize_gender(row.get("gender")):
+            row["gender"] = gender
+        row["athlete_url"] = canonical_athlete_url(row.get("athlete_url"))
+        fixed.append(row)
+    fixed = dedupe_start_list_rows(fixed)
+    # Make sure athlete upsert rows inherit the selected gender when omitted.
+    fixed_athletes = []
+    for row in fixed:
+        fixed_athletes.append({
+            "athlete_url": row.get("athlete_url"),
+            "athlete_name": row.get("athlete_name"),
+            "gender": row.get("gender"),
+        })
+    return fixed, fixed_athletes
+
 # ============================================================
 # UI
 # ============================================================
@@ -3750,6 +4015,8 @@ NAV_GROUPS = [
         ("🥇 Athlete Rankings", "Athlete Rankings"),
     ]),
     ("Athlete Data", [
+        ("🏁 Race Lookup", "Race Lookup"),
+        ("📋 Start Lists", "Start Lists"),
         ("👤 Athletes", "Athletes"),
         ("🔎 Split Audit", "Split Audit"),
     ]),
@@ -3887,6 +4154,193 @@ elif page == "Import CSVs":
             except Exception as e:
                 st.error("Import failed.")
                 st.exception(e)
+
+
+elif page == "Race Lookup":
+    st.header("🏁 Race Lookup")
+    st.write("Search imported race results, open a race, and see the athletes/results stored for that race.")
+    results, starts, athletes, overrides = prepare_dataframes()
+    if results.empty:
+        st.warning("No race results found. Import Athlete Results or Race Field Results first.")
+        st.stop()
+
+    summary = race_lookup_summary(results)
+    if summary.empty:
+        st.warning("No races found in the imported result tables.")
+        st.stop()
+
+    f1, f2, f3, f4 = st.columns([2.4, 1, 1.3, 1.2])
+    race_search = f1.text_input("Search races", placeholder="Example: World Championship, T100, Oceanside, WTCS...")
+    gender_filter = f2.selectbox("Gender", ["All", "Men", "Women", "Unknown"], index=0)
+    race_family_filter = f3.selectbox("Race family", RANKING_FAMILIES, index=0)
+    source_options = ["All"] + sorted([s for s in summary["Source"].dropna().astype(str).unique().tolist() if s])
+    source_filter = f4.selectbox("Source", source_options, index=0)
+
+    filtered_summary = filter_race_lookup(summary, race_search, gender_filter, race_family_filter, source_filter)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Races shown", f"{len(filtered_summary):,}")
+    m2.metric("Total result rows", f"{int(filtered_summary['Rows'].sum()) if not filtered_summary.empty else 0:,}")
+    m3.metric("Athlete rows", f"{int(filtered_summary['Athletes'].sum()) if not filtered_summary.empty else 0:,}")
+
+    if filtered_summary.empty:
+        st.info("No races match those filters.")
+        st.stop()
+
+    section_title("🔎", "Race Index")
+    display_table(filtered_summary.head(250), ["Race Date", "Race", "Gender", "Race Type", "Source", "Athletes", "Rows", "SOF", "Max ORS"], height=360)
+
+    selected_key = st.selectbox(
+        "Open race",
+        filtered_summary["_select_key"].tolist(),
+        index=0,
+        help="Pick one race/date/gender/source group to view the stored athletes.",
+    )
+    selected = filtered_summary[filtered_summary["_select_key"] == selected_key].iloc[0]
+    participants = race_participants(results, selected)
+
+    section_title("👥", f"Athletes in {selected.get('Race')}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Athletes", f"{participants['Athlete URL'].fillna(participants['Athlete']).nunique() if not participants.empty else 0:,}")
+    c2.metric("Rows", f"{len(participants):,}")
+    c3.metric("SOF", selected.get("SOF") if selected.get("SOF") not in [None, ""] else "—")
+    c4.metric("Source", selected.get("Source") or "—")
+    display_table(
+        participants,
+        ["Athlete", "Gender", "Place", "ORS", "SOF", "Swim", "Bike", "Run", "Status", "Race Type", "Race Date", "Source", "Athlete URL"],
+        height=520,
+    )
+
+elif page == "Start Lists":
+    st.header("📋 Start Lists")
+    st.write("Manage changing race start lists: search, remove athletes, add athletes, or replace/merge a fresh upload.")
+    results, starts, athletes, overrides = prepare_dataframes()
+    if starts.empty:
+        st.warning("No start lists found. Import a Start Lists CSV first.")
+        st.stop()
+
+    groups = start_list_group_summary(starts)
+    if groups.empty:
+        st.warning("No start-list groups found.")
+        st.stop()
+
+    f1, f2 = st.columns([2.4, 1])
+    start_search = f1.text_input("Search start lists", placeholder="Example: WTCS, T100, Oceanside, World Championship...")
+    start_gender = f2.selectbox("Gender", ["All", "Men", "Women", "Unknown"], index=0, key="start_list_gender_filter")
+    filtered_groups = groups.copy()
+    if start_search.strip():
+        hay = (filtered_groups["Race"].fillna("").astype(str) + " " + filtered_groups["Gender"].fillna("").astype(str)).str.lower()
+        filtered_groups = filtered_groups[hay.str.contains(re.escape(start_search.strip().lower()), na=False)]
+    if start_gender != "All":
+        filtered_groups = filtered_groups[filtered_groups["Gender"].eq(start_gender)]
+    filtered_groups = filtered_groups.reset_index(drop=True)
+
+    if filtered_groups.empty:
+        st.info("No start lists match those filters.")
+        st.stop()
+
+    section_title("📚", "Imported Start Lists")
+    display_table(filtered_groups.head(250), ["Race Date", "Race", "Gender", "Athletes", "Rows", "Duplicate Rows"], height=300)
+
+    selected_key = st.selectbox("Manage start list", filtered_groups["_select_key"].tolist(), index=0)
+    selected = filtered_groups[filtered_groups["_select_key"] == selected_key].iloc[0]
+    race_name = selected.get("_race_name")
+    race_date = selected.get("_race_date")
+    gender = selected.get("_gender")
+    current_rows = start_list_rows_for_group(starts, race_name, race_date, gender)
+    current_rows = dedupe_start_athletes(current_rows) if not current_rows.empty else current_rows
+
+    st.markdown(
+        f"<div class='tri-race-card'><div class='eyebrow'>Selected Start List</div><h2>{race_name}</h2><div class='meta'>{gender} · {format_date(race_date)} · {len(current_rows):,} athletes</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    section_title("👥", "Current Athletes")
+    display_table(current_rows, ["OpenRank", "Athlete", "Gender", "Race Date", "Race", "Athlete URL"], height=420)
+
+    tab_remove, tab_add, tab_upload = st.tabs(["Remove", "Add", "Reupload / Merge"])
+
+    with tab_remove:
+        st.subheader("Remove athletes from this start list")
+        if current_rows.empty:
+            st.info("No athletes to remove.")
+        else:
+            remove_options = []
+            option_to_idx = {}
+            for idx, r in current_rows.iterrows():
+                label = f"{clean_str(r.get('Athlete')) or clean_str(r.get('athlete_name')) or clean_str(r.get('Athlete URL')) or idx}"
+                rank = clean_str(r.get("OpenRank") or r.get("open_rank"))
+                if rank:
+                    label = f"#{rank} · {label}"
+                if label in option_to_idx:
+                    label = f"{label} · row {idx}"
+                remove_options.append(label)
+                option_to_idx[label] = idx
+            selected_remove = st.multiselect("Athletes to remove", remove_options)
+            if st.button("Remove selected athletes", type="primary", disabled=not selected_remove):
+                removed = 0
+                for label in selected_remove:
+                    idx = option_to_idx.get(label)
+                    if idx is None:
+                        continue
+                    if delete_start_list_row(current_rows.loc[idx]):
+                        removed += 1
+                clear_cache()
+                st.success(f"Removed {removed:,} athlete(s) from the start list.")
+                st.info("Rebuild the model cache for this race after start-list edits.")
+                st.rerun()
+
+    with tab_add:
+        st.subheader("Add one athlete")
+        a1, a2 = st.columns([1.3, 2])
+        new_name = a1.text_input("Athlete name")
+        new_url = a2.text_input("Athlete URL", placeholder="https://protrinews.com/athletes/athlete-slug")
+        new_rank = st.number_input("OpenRank", min_value=0, max_value=999999, value=0, help="Use 0/blank if unknown.")
+        if st.button("Add athlete", type="primary"):
+            ok, msg = add_start_list_athlete(race_name, race_date, gender, new_name, new_url, None if int(new_rank) == 0 else int(new_rank))
+            if ok:
+                st.success(msg)
+                st.info("Rebuild the model cache for this race after start-list edits.")
+                st.rerun()
+            else:
+                st.warning(msg)
+
+    with tab_upload:
+        st.subheader("Reupload or merge a fresh start list")
+        st.write("Upload the new start-list CSV. If race/date/gender columns are blank, the selected start list values will be used.")
+        upload_mode = st.radio("Upload mode", ["Replace selected start list", "Merge new athletes only"], horizontal=True)
+        start_upload = st.file_uploader("Upload updated start list CSV", type=["csv"], key="start_list_reupload")
+        if start_upload is not None:
+            up_df = read_uploaded_csv(start_upload)
+            st.write(f"Rows detected: {len(up_df):,}")
+            st.dataframe(up_df.head(20), width="stretch")
+            if st.button("Apply start-list upload", type="primary"):
+                try:
+                    rows, athlete_rows = normalize_start_list_upload_for_group(up_df, race_name, race_date, gender)
+                    if upload_mode == "Replace selected start list":
+                        delete_matching_start_lists([{"race_name": race_name, "race_date": format_date(race_date), "gender": gender}])
+                        insert_chunks("start_lists", rows)
+                        inserted = len(rows)
+                        skipped = 0
+                    else:
+                        inserted, skipped = merge_start_list_rows(rows)
+                    athlete_inserted, athlete_updated = upsert_athletes_preserve_gender(athlete_rows)
+                    propagated = apply_gender_updates_from_rows(rows)
+                    clear_cache()
+                    st.success(f"Start list updated. Inserted {inserted:,}; skipped {skipped:,}. Athletes merged: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
+                    st.info("Rebuild the model cache for this race after start-list edits.")
+                    st.rerun()
+                except Exception as e:
+                    st.error("Start-list upload failed.")
+                    st.exception(e)
+
+        with st.expander("Danger zone: delete this entire selected start list"):
+            st.warning("This deletes only the selected race/date/gender start list rows.")
+            confirm = st.checkbox("I understand this will delete the selected start list", key="confirm_delete_start_list")
+            if st.button("Delete selected start list", disabled=not confirm):
+                deleted_groups = delete_matching_start_lists([{"race_name": race_name, "race_date": format_date(race_date), "gender": gender}])
+                clear_cache()
+                st.success(f"Deleted {deleted_groups:,} start-list group(s).")
+                st.rerun()
 
 elif page == "Athletes":
     st.header("👤 Athletes")
