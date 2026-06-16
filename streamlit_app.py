@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import re
@@ -3346,6 +3347,312 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
         st.dataframe(show, width="stretch", hide_index=True)
     return None
 
+
+# ============================================================
+# Model cache helpers
+# ============================================================
+MODEL_CACHE_VERSION = "openrank_topx_cache_v1"
+RANKING_FAMILIES = ["All", "IRONMAN 70.3 / Middle", "T100 / PTO", "Full IRONMAN", "Short Course / WTCS"]
+RANKING_VIEW_LABELS = ["🏆 Overall", "🏊 Swim", "🚴 Bike", "🏃 Run"]
+
+
+def cache_safe_rows(df: pd.DataFrame, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Convert a dataframe to JSON-safe rows for storage in model_cache.rows."""
+    if df is None or df.empty:
+        return []
+    out = df.copy()
+    if isinstance(limit, int) and limit > 0:
+        out = out.head(limit).copy()
+    return [json_safe_row(row.to_dict()) for _, row in out.iterrows()]
+
+
+def cache_rows_to_df(rows: Any) -> pd.DataFrame:
+    if rows is None:
+        return pd.DataFrame()
+    if isinstance(rows, str):
+        try:
+            rows = json.loads(rows)
+        except Exception:
+            return pd.DataFrame()
+    if isinstance(rows, dict):
+        rows = rows.get("rows", [])
+    if not isinstance(rows, list):
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def stable_cache_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def make_cache_key(cache_kind: str, params: Dict[str, Any]) -> str:
+    payload = {"kind": cache_kind, "version": MODEL_CACHE_VERSION, **params}
+    digest = hashlib.md5(stable_cache_json(payload).encode("utf-8")).hexdigest()
+    return digest
+
+
+def cache_table_ready() -> bool:
+    try:
+        supabase.table("model_cache").select("id").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def load_model_cache_df(cache_kind: str, cache_key: str) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]]]:
+    try:
+        res = (
+            supabase.table("model_cache")
+            .select("cache_kind,cache_key,cache_label,params,rows,row_count,computed_at")
+            .eq("cache_kind", cache_kind)
+            .eq("cache_key", cache_key)
+            .limit(1)
+            .execute()
+        )
+        data = res.data or []
+        if not data:
+            return pd.DataFrame(), None
+        row = data[0]
+        return cache_rows_to_df(row.get("rows")), row
+    except Exception:
+        return pd.DataFrame(), None
+
+
+def save_model_cache_df(cache_kind: str, cache_key: str, cache_label: str, params: Dict[str, Any], df: pd.DataFrame, limit: Optional[int] = None) -> int:
+    rows = cache_safe_rows(df, limit=limit)
+    payload = {
+        "cache_kind": cache_kind,
+        "cache_key": cache_key,
+        "cache_label": cache_label,
+        "params": json_safe_row(params),
+        "rows": rows,
+        "row_count": len(rows),
+        "computed_at": datetime.utcnow().isoformat(),
+    }
+    supabase.table("model_cache").upsert(payload, on_conflict="cache_kind,cache_key").execute()
+    return len(rows)
+
+
+def clear_model_cache(cache_kind: Optional[str] = None) -> None:
+    if cache_kind:
+        supabase.table("model_cache").delete().eq("cache_kind", cache_kind).execute()
+    else:
+        supabase.table("model_cache").delete().neq("cache_key", "__never__").execute()
+
+
+def ranking_view_to_kind(view_label: str) -> str:
+    return {
+        "🏆 Overall": "overall",
+        "🏊 Swim": "swim",
+        "🚴 Bike": "bike",
+        "🏃 Run": "run",
+    }.get(view_label, str(view_label).lower().strip())
+
+
+def athlete_ranking_cache_params(gender: str, race_family: str, as_of_ts: pd.Timestamp, top_n: int, view_kind: str) -> Dict[str, Any]:
+    return {
+        "gender": normalize_gender(gender) or gender,
+        "race_family": race_family,
+        "as_of_date": format_date(as_of_ts),
+        "top_n": int(top_n),
+        "view": view_kind,
+        "version": MODEL_CACHE_VERSION,
+    }
+
+
+def build_athlete_ranking_result(
+    results: pd.DataFrame,
+    overrides: pd.DataFrame,
+    gender: str,
+    race_family: str,
+    as_of_ts: pd.Timestamp,
+    top_n: int,
+    view_kind: str,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if results is None or results.empty:
+        return pd.DataFrame(), {"rows_after_gender": 0, "rows_after_family": 0, "athletes_ranked": 0}
+
+    year = int(pd.to_datetime(as_of_ts).year)
+    window_start_rank = pd.Timestamp(date(year - 2, 1, 1))
+    ranking_results = results[(results["race_date"].notna()) & (results["race_date"] >= window_start_rank) & (results["race_date"] <= as_of_ts)].copy()
+    pre_gender_count = len(ranking_results)
+    ranking_results = filter_rankings_by_gender(ranking_results, gender)
+    post_gender_count = len(ranking_results)
+    ranking_results = ranking_results[ranking_scope_mask(ranking_results, race_family)].copy()
+
+    metrics = {
+        "rows_before_gender": int(pre_gender_count),
+        "rows_after_gender": int(post_gender_count),
+        "rows_after_family": int(len(ranking_results)),
+        "athletes_ranked": 0,
+    }
+    if ranking_results.empty:
+        return pd.DataFrame(), metrics
+
+    candidate_cols = ["athlete_url", "athlete_name", "gender"]
+    start_all = ranking_results[candidate_cols].drop_duplicates().dropna(subset=["athlete_name"]).copy()
+    start_all["race_name"] = f"Global Rankings — {race_family}"
+    start_all["race_date"] = as_of_ts
+    start_all["open_rank"] = None
+    metrics["athletes_ranked"] = int(start_all["athlete_name"].nunique())
+
+    if view_kind == "overall":
+        out = score_overall(ranking_results, start_all, overrides, as_of_ts, year, top_n)
+    else:
+        aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, normalize_gender(gender) or gender, view_kind, min_field_size=5)
+        out = score_splits_for_start_list(aud, start_all, as_of_ts, top_n, strong_sof_threshold=70)
+    if not out.empty:
+        out["Cache View"] = view_kind
+        out["Gender"] = gender
+        out["Race Family"] = race_family
+        out["As Of"] = format_date(as_of_ts)
+    return out, metrics
+
+
+def save_athlete_ranking_cache(
+    results: pd.DataFrame,
+    overrides: pd.DataFrame,
+    gender: str,
+    race_family: str,
+    as_of_ts: pd.Timestamp,
+    top_n: int,
+    view_kind: str,
+) -> Tuple[int, Dict[str, Any]]:
+    params = athlete_ranking_cache_params(gender, race_family, as_of_ts, top_n, view_kind)
+    cache_key = make_cache_key("athlete_ranking", params)
+    df, metrics = build_athlete_ranking_result(results, overrides, gender, race_family, as_of_ts, top_n, view_kind)
+    label = f"{gender} · {race_family} · {view_kind} · top {top_n} · {format_date(as_of_ts)}"
+    rows = save_model_cache_df("athlete_ranking", cache_key, label, {**params, **metrics}, df, limit=500)
+    return rows, metrics
+
+
+def race_prediction_cache_params(
+    race_name: str,
+    race_date: pd.Timestamp,
+    gender: str,
+    top_n: int,
+    min_field_size: int,
+    strong_sof_threshold: float,
+    prediction_scope: str,
+) -> Dict[str, Any]:
+    return {
+        "race_name": clean_str(race_name),
+        "race_date": format_date(race_date),
+        "gender": normalize_gender(gender) or gender,
+        "top_n": int(top_n),
+        "min_field_size": int(min_field_size),
+        "strong_sof_threshold": float(strong_sof_threshold),
+        "prediction_scope": prediction_scope,
+        "version": MODEL_CACHE_VERSION,
+    }
+
+
+def build_race_prediction_result(
+    results: pd.DataFrame,
+    starts: pd.DataFrame,
+    overrides: pd.DataFrame,
+    selected_race: str,
+    selected_date: pd.Timestamp,
+    selected_gender: str,
+    top_n: int,
+    min_field_size: int,
+    strong_sof_threshold: float,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if results is None or results.empty or starts is None or starts.empty:
+        return pd.DataFrame(), {}
+
+    selected_date = pd.to_datetime(selected_date) if not pd.isna(selected_date) else pd.Timestamp.today().normalize()
+    target_year = int(selected_date.year)
+    window_start = pd.Timestamp(date(target_year - 2, 1, 1))
+    prediction_scope = prediction_scope_from_race(selected_race, None, None)
+
+    start_athletes = starts[(starts["race_name"] == selected_race) & (starts["gender"] == selected_gender)].copy()
+    if "race_date" in start_athletes.columns:
+        start_athletes = start_athletes[start_athletes["race_date"] == selected_date]
+    imported_start_rows = len(start_athletes)
+    start_athletes = dedupe_start_athletes(start_athletes)
+    duplicate_start_rows = imported_start_rows - len(start_athletes)
+
+    results_window_all = results[(results["race_date"].notna()) & (results["race_date"] >= window_start) & (results["race_date"] <= selected_date)].copy()
+    results_window = apply_prediction_scope(results_window_all, prediction_scope)
+
+    combined_rows: List[Dict[str, Any]] = []
+    overall = score_overall(results_window, start_athletes, overrides, selected_date, target_year, top_n)
+    for row in cache_safe_rows(overall.head(75)):
+        row["_section"] = "overall"
+        combined_rows.append(row)
+
+    audit_source_by_disc = {
+        disc: filter_results_to_startlist_races(results_window, start_athletes, disc)
+        for disc in ["swim", "bike", "run"]
+    }
+    for disc in ["swim", "bike", "run"]:
+        aud = build_split_audit(audit_source_by_disc[disc], start_athletes, overrides, selected_date, selected_gender, disc, min_field_size)
+        scored = score_splits_for_start_list(aud, start_athletes, selected_date, top_n, strong_sof_threshold)
+        for row in cache_safe_rows(scored.head(75)):
+            row["_section"] = disc
+            combined_rows.append(row)
+
+    meta = {
+        "start_list_athletes": int(len(start_athletes)),
+        "duplicate_start_rows": int(duplicate_start_rows),
+        "rows_used": int(len(results_window)),
+        "rows_available_before_scope": int(len(results_window_all)),
+        "prediction_scope": prediction_scope,
+        "window_start": format_date(window_start),
+    }
+    return pd.DataFrame(combined_rows), meta
+
+
+def save_race_prediction_cache(
+    results: pd.DataFrame,
+    starts: pd.DataFrame,
+    overrides: pd.DataFrame,
+    selected_race: str,
+    selected_date: pd.Timestamp,
+    selected_gender: str,
+    top_n: int,
+    min_field_size: int,
+    strong_sof_threshold: float,
+) -> Tuple[int, Dict[str, Any], str]:
+    prediction_scope = prediction_scope_from_race(selected_race, None, None)
+    params = race_prediction_cache_params(selected_race, selected_date, selected_gender, top_n, min_field_size, strong_sof_threshold, prediction_scope)
+    cache_key = make_cache_key("race_prediction", params)
+    df, meta = build_race_prediction_result(results, starts, overrides, selected_race, selected_date, selected_gender, top_n, min_field_size, strong_sof_threshold)
+    label = f"{format_date(selected_date)} · {selected_gender} · {selected_race} · top {top_n}"
+    rows = save_model_cache_df("race_prediction", cache_key, label, {**params, **meta}, df, limit=500)
+    return rows, meta, cache_key
+
+
+def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional[Dict[str, Any]] = None) -> None:
+    if cached_df is None or cached_df.empty:
+        st.info("No cached prediction rows found.")
+        return
+    params = (cache_meta or {}).get("params", {}) if isinstance(cache_meta, dict) else {}
+    computed_at = (cache_meta or {}).get("computed_at") if isinstance(cache_meta, dict) else None
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Cached rows", f"{len(cached_df):,}")
+    c2.metric("Start athletes", params.get("start_list_athletes", "—"))
+    c3.metric("Rows used", params.get("rows_used", "—"))
+    c4.metric("Cached at", clean_str(computed_at)[:19] if computed_at else "—")
+    st.info("Fast mode: showing saved model output. Use Model Cache → Rebuild selected race, or turn off cache in the sidebar, to recalculate live evidence.")
+
+    section_title("🏆", "Overall Picks")
+    overall = cached_df[cached_df.get("_section") == "overall"].copy() if "_section" in cached_df.columns else pd.DataFrame()
+    display_table(overall.head(15), ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "OpenRank", "Last Race", "Last Race Date"])
+
+    st.divider()
+    tabs = st.tabs(["🏊 Fastest Swim", "🚴 Fastest Bike", "🏃 Fastest Run"])
+    for tab, disc, title in zip(tabs, ["swim", "bike", "run"], ["Fastest Swim", "Fastest Bike", "Fastest Run"]):
+        with tab:
+            section_title("🏊" if disc == "swim" else "🚴" if disc == "bike" else "🏃", title)
+            scored = cached_df[cached_df.get("_section") == disc].copy() if "_section" in cached_df.columns else pd.DataFrame()
+            display_table(
+                scored.head(12),
+                ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
+                height=360,
+            )
+
 # ============================================================
 # UI
 # ============================================================
@@ -3361,6 +3668,7 @@ NAV_GROUPS = [
         ("🔎 Split Audit", "Split Audit"),
     ]),
     ("Tools & Admin", [
+        ("⚡ Model Cache", "Model Cache"),
         ("🧬 Gender Tools", "Gender Tools"),
         ("📥 Import CSVs", "Import CSVs"),
         ("🗄️ Database Viewer", "Database Viewer"),
@@ -3409,7 +3717,7 @@ if page == "Connection":
 
         st.subheader("Table counts")
         count_rows_data = []
-        for table_name in ["athletes", "athlete_results", "race_field_results", "start_lists", "race_overrides", "scoring_settings", "model_runs", "split_audit"]:
+        for table_name in ["athletes", "athlete_results", "race_field_results", "start_lists", "race_overrides", "scoring_settings", "model_cache", "model_runs", "split_audit"]:
             count_rows_data.append({"Table": table_name, "Rows in Supabase": count_rows(table_name)})
         st.dataframe(pd.DataFrame(count_rows_data), width="stretch", hide_index=True)
     except Exception as e:
@@ -3715,6 +4023,110 @@ elif page == "Gender Tools":
                 st.success(f"Applied manual gender overrides for {applied:,} athletes.")
                 st.rerun()
 
+
+elif page == "Model Cache":
+    st.header("⚡ Model Cache")
+    st.caption("Precompute the expensive rankings and race predictions once, save them in Supabase, then the dashboard reads the saved rows instead of recalculating on every click.")
+
+    if not cache_table_ready():
+        st.error("The `model_cache` table does not exist yet. Run the `model_cache_tables.sql` script in Supabase SQL Editor first.")
+        st.stop()
+
+    results, starts, athletes, overrides = prepare_dataframes()
+    if results.empty:
+        st.warning("No athlete results found. Import Athlete Results first.")
+        st.stop()
+
+    tab_rankings, tab_races, tab_manage = st.tabs(["Athlete Rankings Cache", "Race Prediction Cache", "Manage Cache"])
+
+    with tab_rankings:
+        st.subheader("Athlete Rankings Cache")
+        c1, c2, c3, c4 = st.columns([1, 1.25, 1, 1])
+        cache_gender = c1.selectbox("Gender", ["Men", "Women"], key="cache_rank_gender")
+        cache_family = c2.selectbox("Race family", RANKING_FAMILIES, index=1, key="cache_rank_family")
+        cache_as_of = c3.date_input("As of date", value=date.today(), key="cache_rank_asof")
+        cache_top_n = c4.slider("Top scores used", 3, 8, 4, key="cache_rank_topn")
+        cache_view = st.radio("Ranking view", RANKING_VIEW_LABELS, horizontal=True, key="cache_rank_view")
+        view_kind = ranking_view_to_kind(cache_view)
+        if st.button("Rebuild selected ranking cache", type="primary", width="stretch"):
+            with st.spinner("Building selected ranking cache..."):
+                rows, metrics = save_athlete_ranking_cache(results, overrides, cache_gender, cache_family, pd.Timestamp(cache_as_of), cache_top_n, view_kind)
+            st.success(f"Saved {rows:,} cached rows for {cache_gender} · {cache_family} · {view_kind}.")
+            st.json(metrics)
+            clear_cache()
+
+        with st.expander("Rebuild all common athlete ranking caches", expanded=False):
+            st.warning("This can take a few minutes because it calculates Men/Women × race families × overall/swim/bike/run. Run it after big imports or scoring-code changes.")
+            if st.button("Rebuild all athlete ranking caches", width="stretch"):
+                progress = st.progress(0, text="Starting cache rebuild...")
+                total = len(["Men", "Women"]) * len(RANKING_FAMILIES) * len(["overall", "swim", "bike", "run"])
+                done = 0
+                logs = []
+                for g in ["Men", "Women"]:
+                    for fam in RANKING_FAMILIES:
+                        for vk in ["overall", "swim", "bike", "run"]:
+                            rows, metrics = save_athlete_ranking_cache(results, overrides, g, fam, pd.Timestamp(cache_as_of), cache_top_n, vk)
+                            logs.append({"Gender": g, "Race Family": fam, "View": vk, "Rows Saved": rows, **metrics})
+                            done += 1
+                            progress.progress(done / total, text=f"Built {done}/{total}: {g} · {fam} · {vk}")
+                progress.empty()
+                st.success("Finished rebuilding athlete ranking caches.")
+                display_table(pd.DataFrame(logs), ["Gender", "Race Family", "View", "Rows Saved", "rows_after_gender", "rows_after_family", "athletes_ranked"], height=420)
+                clear_cache()
+
+    with tab_races:
+        st.subheader("Race Prediction Cache")
+        if starts.empty:
+            st.warning("No start lists found. Import Start Lists first.")
+        else:
+            race_options_df = starts.dropna(subset=["race_name"]).copy()
+            race_options_df["race_date_label"] = race_options_df["race_date"].map(format_date)
+            race_options_df["label"] = race_options_df["race_date_label"].fillna("") + " | " + race_options_df["gender"].fillna("") + " | " + race_options_df["race_name"].fillna("")
+            race_options_df = race_options_df.drop_duplicates(subset=["race_name", "race_date", "gender", "label"]).sort_values(["race_date", "race_name", "gender"], na_position="last")
+            labels = race_options_df["label"].tolist()
+            if labels:
+                selected_cache_label = st.selectbox("Race / Gender", labels, index=max(0, len(labels) - 1), key="cache_race_label")
+                c1, c2, c3 = st.columns(3)
+                race_top_n = c1.slider("Top scores used", 3, 8, 4, key="cache_race_topn")
+                race_min_field = c2.slider("Low-sample warning threshold", 3, 15, 5, key="cache_race_minfield")
+                race_sof = c3.slider("Strong-field SOF threshold", 55, 90, 70, key="cache_race_sof")
+                selected_meta = race_options_df[race_options_df["label"] == selected_cache_label].iloc[0]
+                selected_race = selected_meta["race_name"]
+                selected_gender = selected_meta["gender"]
+                selected_date = selected_meta["race_date"]
+                if pd.isna(selected_date):
+                    selected_date = pd.Timestamp.today().normalize()
+                if st.button("Rebuild selected race prediction cache", type="primary", width="stretch"):
+                    with st.spinner("Building race prediction cache..."):
+                        rows, meta, _ = save_race_prediction_cache(results, starts, overrides, selected_race, selected_date, selected_gender, race_top_n, race_min_field, race_sof)
+                    st.success(f"Saved {rows:,} cached prediction rows for {selected_gender} · {selected_race}.")
+                    st.json(meta)
+                    clear_cache()
+
+    with tab_manage:
+        st.subheader("Manage Cache")
+        try:
+            cache_df = load_table("model_cache")
+        except Exception:
+            cache_df = pd.DataFrame()
+        if cache_df.empty:
+            st.info("No cache rows stored yet.")
+        else:
+            display_table(cache_df.sort_values("computed_at", ascending=False).head(200), ["cache_kind", "cache_label", "row_count", "computed_at", "cache_key"], height=520)
+        c1, c2, c3 = st.columns(3)
+        if c1.button("Clear athlete ranking cache", width="stretch"):
+            clear_model_cache("athlete_ranking")
+            clear_cache()
+            st.success("Cleared athlete ranking cache.")
+        if c2.button("Clear race prediction cache", width="stretch"):
+            clear_model_cache("race_prediction")
+            clear_cache()
+            st.success("Cleared race prediction cache.")
+        if c3.button("Clear all model cache", width="stretch"):
+            clear_model_cache()
+            clear_cache()
+            st.success("Cleared all model cache.")
+
 elif page == "Athlete Rankings":
     st.header("🥇 Athlete Rankings")
     st.caption("Global rankings are now gender-strict and can be filtered by race family, so Men/Women and 70.3/T100 profiles do not get blended together.")
@@ -3769,8 +4181,45 @@ elif page == "Athlete Rankings":
         key="athlete_rankings_view",
     )
 
+    view_kind = ranking_view_to_kind(ranking_view)
+    params = athlete_ranking_cache_params(ranking_gender, ranking_scope, as_of_ts, top_n_rank, view_kind)
+    cache_key = make_cache_key("athlete_ranking", params)
+    cached_rankings, cache_meta = load_model_cache_df("athlete_ranking", cache_key)
+
+    cc1, cc2 = st.columns([2, 1])
+    if cache_meta:
+        cc1.success(f"Using saved ranking cache · {clean_str(cache_meta.get('computed_at'))[:19]}")
+        if cc2.button("Rebuild this cache", width="stretch"):
+            with st.spinner("Rebuilding this ranking cache..."):
+                save_athlete_ranking_cache(results, overrides, ranking_gender, ranking_scope, as_of_ts, top_n_rank, view_kind)
+            clear_cache()
+            st.rerun()
+    else:
+        cc1.warning("No saved cache for this exact gender/race-family/view/date/top-score setup yet.")
+        if cc2.button("Build cache now", type="primary", width="stretch"):
+            with st.spinner("Building ranking cache..."):
+                save_athlete_ranking_cache(results, overrides, ranking_gender, ranking_scope, as_of_ts, top_n_rank, view_kind)
+            clear_cache()
+            st.rerun()
+
+    if cached_rankings is not None and not cached_rankings.empty:
+        if ranking_view == "🏆 Overall":
+            display_table(
+                cached_rankings.head(75),
+                ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"],
+                height=620,
+            )
+        else:
+            display_table(
+                cached_rankings.head(75),
+                ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"],
+                height=620,
+            )
+        st.stop()
+
+    st.info("Showing live calculation because no cache exists yet. Use the button above or Model Cache page to save it for fast loading next time.")
     if ranking_view == "🏆 Overall":
-        with st.spinner("Calculating overall rankings..."):
+        with st.spinner("Calculating overall rankings live..."):
             overall_all = score_overall(ranking_results, start_all, overrides, as_of_ts, year, top_n_rank)
         display_table(
             overall_all.head(75),
@@ -3778,8 +4227,8 @@ elif page == "Athlete Rankings":
             height=620,
         )
     else:
-        disc = {"🏊 Swim": "swim", "🚴 Bike": "bike", "🏃 Run": "run"}[ranking_view]
-        with st.spinner(f"Calculating {disc} rankings..."):
+        disc = view_kind
+        with st.spinner(f"Calculating {disc} rankings live..."):
             aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, ranking_gender, disc, min_field_size=5)
             scored = score_splits_for_start_list(aud, start_all, as_of_ts, top_n_rank, strong_sof_threshold=70)
         display_table(
@@ -3790,7 +4239,7 @@ elif page == "Athlete Rankings":
 
 elif page == "Database Viewer":
     st.header("🗄️ Database Viewer")
-    table = st.selectbox("Table", ["athletes", "athlete_results", "race_field_results", "start_lists", "race_overrides", "scoring_settings", "model_runs", "split_audit"])
+    table = st.selectbox("Table", ["athletes", "athlete_results", "race_field_results", "start_lists", "race_overrides", "scoring_settings", "model_cache", "model_runs", "split_audit"])
     exact_count = count_rows(table)
     if exact_count is not None:
         st.metric("Rows in Supabase", f"{exact_count:,}")
@@ -3835,6 +4284,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
         top_n = st.slider("Top scores used", 3, 8, 4, help="OpenRank-style scoring uses the best X valid scores in the trailing 52 weeks. Missing scores are padded as zero.")
         min_field_size = st.slider("Low-sample warning threshold", 3, 15, 5)
         strong_sof_threshold = st.slider("Strong-field SOF threshold", 55, 90, 70)
+        use_model_cache = st.checkbox("Use saved model cache", value=True, help="Fast mode: load saved predictions when available instead of recalculating everything live.")
 
     selected_meta = race_options_df[race_options_df["label"] == selected_label].iloc[0]
     selected_race = selected_meta["race_name"]
@@ -3862,6 +4312,18 @@ elif page in {"Race Dashboard", "Split Audit"}:
     results_window = apply_prediction_scope(results_window_all, prediction_scope)
 
     render_race_card(selected_race, selected_gender, selected_date, window_start)
+
+
+    if page == "Race Dashboard" and use_model_cache:
+        cache_prediction_scope = prediction_scope_from_race(selected_race, None, None)
+        cache_params = race_prediction_cache_params(selected_race, selected_date, selected_gender, top_n, min_field_size, strong_sof_threshold, cache_prediction_scope)
+        cache_key = make_cache_key("race_prediction", cache_params)
+        cached_prediction, cached_meta = load_model_cache_df("race_prediction", cache_key)
+        if cached_prediction is not None and not cached_prediction.empty:
+            display_cached_race_prediction(cached_prediction, cached_meta)
+            st.stop()
+        else:
+            st.warning("No saved race prediction cache for this exact race/settings yet. Showing live calculation. Use ⚡ Model Cache → Race Prediction Cache to save it for fast loading next time.")
 
     # Performance: build each split audit only from races relevant to the
     # selected start-list athletes, not from every result row in the 2-year
