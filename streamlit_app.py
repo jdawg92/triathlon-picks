@@ -1158,10 +1158,11 @@ def is_premium_split_evidence(row: pd.Series, discipline: str, strong_sof_thresh
     if rt == "full":
         return discipline in {"swim", "bike"} and sof is not None and sof >= 80
 
-    # Very high SOF non-championship races can still be premium evidence.
-    if sof is not None and sof >= 85:
-        return True
-
+    # Very high SOF normal 70.3/Challenge races are strong evidence,
+    # not premium. Premium is reserved for T100/PTO, World Championship,
+    # true WTCS swim, Olympic Games swim, and high-SOF full IM swim/bike.
+    # This prevents normal-race wins from jumping above athletes with
+    # repeated T100 / World Championship proof.
     return False
 
 
@@ -1556,17 +1557,17 @@ def score_splits_for_start_list(
         # strong rows with excellent closeness.
         if premium_count == 0:
             if strong_count == 0:
-                cap = 56 if len(medium_or_better) >= 3 else 50
+                cap = 50 if len(medium_or_better) >= 3 else 45
                 final = min(final, cap)
                 confidence = "Low - no strong-field proof"
             elif strong_count == 1:
-                final = min(final, 60)
+                final = min(final, 55)
                 confidence = "Medium - 1 strong row, no premium"
             elif strong_count == 2:
-                final = min(final, 64)
+                final = min(final, 60)
                 confidence = "Medium - strong rows, no premium"
             else:
-                final = min(final, 68)
+                final = min(final, 63)
                 confidence = "Good - repeated strong rows, no premium"
         elif premium_count == 1:
             final = min(final, 72)
@@ -1710,6 +1711,7 @@ DISPLAY_LABELS = {
     "race_type": "Race Type",
     "distance": "Distance",
     "quality_tier": "Quality Tier",
+    "premium_evidence": "Premium Evidence",
     "strong_evidence": "Strong Evidence",
     "place": "Place",
     "status": "Status",
@@ -2088,6 +2090,27 @@ elif page in {"Race Dashboard", "Split Audit"}:
             ["Rank", "Athlete", "Score", "Recent Form ORS", "Current Year ORS", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "OpenRank", "Last Race", "Last Race Date"],
         )
 
+        if not overall.empty:
+            st.markdown("#### 🔽 Open an athlete to see recent overall evidence")
+            for _, pick in overall.head(10).iterrows():
+                athlete_name = clean_str(pick.get("Athlete"))
+                athlete_url = clean_str(pick.get("Athlete URL"))
+                title_text = f"#{int(pick.get('Rank'))} {athlete_name} — Score {pick.get('Score')}"
+                with st.expander(title_text, expanded=False):
+                    if results_window.empty:
+                        st.info("No result rows loaded.")
+                    else:
+                        name_mask = results_window["athlete_name"].fillna("").str.lower().eq(str(athlete_name).lower())
+                        url_mask = results_window["athlete_url"].astype(str).eq(athlete_url) if athlete_url else pd.Series(False, index=results_window.index)
+                        ev = results_window[(url_mask | name_mask) & (~results_window["bad_status"])].sort_values("race_date", ascending=False).head(5)
+                        if ev.empty:
+                            st.warning("No recent valid overall rows found for this athlete.")
+                        else:
+                            display_table(
+                                ev,
+                                ["race_date", "race_name", "race_type", "distance", "place", "sof", "sof_source", "ors", "swim_split", "bike_split", "run_split", "status"],
+                            )
+
         st.divider()
         st.info("Split ranks use each discipline's own recent valid split rows — not the athlete's top overall races. Swim uses recent swim evidence, bike uses recent bike evidence, and run uses recent run evidence. Full-distance swim/bike now count as high-value non-draft evidence; full-distance run is weighted lower because it transfers less directly to 70.3 speed. Imported sample coverage is still not the full ProTriNews field yet.")
         tabs = st.tabs(["🏊 Fastest Swim", "🚴 Fastest Bike", "🏃 Fastest Run"])
@@ -2096,62 +2119,40 @@ elif page in {"Race Dashboard", "Split Audit"}:
                 section_title("🏊" if disc == "swim" else "🚴" if disc == "bike" else "🏃", title)
                 scored = score_splits_for_start_list(audit_by_disc[disc], start_athletes, selected_date, recent_n, drop_worst, strong_sof_threshold)
                 scored_top = scored.head(12).copy()
-                selected_row = selectable_table(
+                display_table(
                     scored_top,
                     ["Rank", "Athlete", "Score", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Premium Top 3 %", "Strong Top 3 %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
-                    key=f"split_pick_table_{disc}",
+                    height=360,
                 )
-                st.caption("Click an athlete row above to show the recent split rows used for that discipline. These are not the athlete's best overall races; each split is scored from its own swim/bike/run evidence.")
+                st.caption("Open an athlete below to see the exact recent split rows used for this discipline. These are not the athlete's best overall races; each split is scored from its own swim/bike/run evidence.")
 
                 if not scored_top.empty:
                     aud = audit_by_disc[disc]
-                    fallback_athlete = scored_top["Athlete"].iloc[0]
-                    selected_athlete = clean_str(selected_row.get("Athlete")) if selected_row is not None else fallback_athlete
-                    selected_url = clean_str(selected_row.get("Athlete URL")) if selected_row is not None and "Athlete URL" in selected_row.index else None
-
-                    # Fallback selector is still useful on mobile or if the row
-                    # selection gets reset after Streamlit reruns.
-                    athlete = st.selectbox(
-                        f"Selected {title} athlete",
-                        scored_top["Athlete"].tolist(),
-                        index=max(0, scored_top["Athlete"].tolist().index(selected_athlete)) if selected_athlete in scored_top["Athlete"].tolist() else 0,
-                        key=f"evidence_{disc}",
-                    )
-                    if athlete != selected_athlete:
-                        selected_athlete = athlete
-                        selected_url = clean_str(scored_top.loc[scored_top["Athlete"] == athlete, "Athlete URL"].iloc[0]) if "Athlete URL" in scored_top.columns and not scored_top.loc[scored_top["Athlete"] == athlete].empty else None
-
-                    st.markdown(f"**Last 5 {disc} rows for {selected_athlete}**")
-                    if aud.empty:
-                        st.info("No audit rows for this athlete.")
-                    else:
-                        # Match by URL OR athlete name. Sometimes an imported CSV
-                        # has a slightly different/missing URL even though the
-                        # displayed athlete name is correct; using only URL made
-                        # the evidence table look stuck on the previous athlete.
-                        name_mask = aud["athlete_name"].fillna("").str.lower().eq(str(selected_athlete).lower())
-                        if selected_url:
-                            url_mask = aud["athlete_url"].astype(str).eq(selected_url)
-                            mask = url_mask | name_mask
-                        else:
-                            mask = name_mask
-                        athlete_audit = aud[mask].sort_values("race_date", ascending=False)
-                        evidence_view = st.radio(
-                            f"{selected_athlete} evidence rows",
-                            ["Used in score", "All evaluated rows"],
-                            horizontal=True,
-                            key=f"evidence_view_{disc}_{selected_athlete}",
-                        )
-                        if evidence_view == "Used in score":
-                            ev = athlete_audit[athlete_audit["included"]].head(5)
-                        else:
-                            ev = athlete_audit.head(8)
-                        if ev.empty:
-                            st.warning("No included split evidence found for the selected athlete. Switch to 'All evaluated rows' to see excluded DNF/DNS/DSQ, draft-legal, or invalid rows.")
-                        display_table(
-                            ev,
-                            ["race_date", "race_name", "race_type", "quality_tier", "premium_evidence", "strong_evidence", "place", "status", "bad_status", "split_status_excluded", "sof", "sof_source", "sample_size", "split", "sample_rank_display", "pct_behind_fastest", "evidence_score", "final_cap", "included", "coverage_note", "reason"],
-                        )
+                    st.markdown("#### 🔽 Athlete split evidence")
+                    for _, pick in scored_top.head(10).iterrows():
+                        selected_athlete = clean_str(pick.get("Athlete"))
+                        selected_url = clean_str(pick.get("Athlete URL"))
+                        expander_label = f"#{int(pick.get('Rank'))} {selected_athlete} — Score {pick.get('Score')} — {pick.get('Confidence')}"
+                        with st.expander(expander_label, expanded=False):
+                            if aud.empty:
+                                st.info("No audit rows for this discipline.")
+                                continue
+                            name_mask = aud["athlete_name"].fillna("").str.lower().eq(str(selected_athlete).lower())
+                            url_mask = aud["athlete_url"].astype(str).eq(selected_url) if selected_url else pd.Series(False, index=aud.index)
+                            athlete_audit = aud[url_mask | name_mask].sort_values("race_date", ascending=False)
+                            used = athlete_audit[athlete_audit["included"]].head(5)
+                            if used.empty:
+                                st.warning("No split rows were used in the score for this athlete. Showing the most recent evaluated rows instead.")
+                                used = athlete_audit.head(5)
+                            display_table(
+                                used,
+                                ["race_date", "race_name", "race_type", "quality_tier", "premium_evidence", "strong_evidence", "place", "status", "sof", "sof_source", "sample_size", "split", "sample_rank_display", "pct_behind_fastest", "evidence_score", "final_cap", "included", "coverage_note", "reason"],
+                            )
+                            with st.expander("Show all evaluated rows for this athlete", expanded=False):
+                                display_table(
+                                    athlete_audit.head(12),
+                                    ["race_date", "race_name", "race_type", "quality_tier", "premium_evidence", "strong_evidence", "place", "status", "bad_status", "split_status_excluded", "sof", "sof_source", "sample_size", "split", "sample_rank_display", "pct_behind_fastest", "evidence_score", "final_cap", "included", "coverage_note", "reason"],
+                                )
 
     else:
         section_title("🔎", "Split Audit")
