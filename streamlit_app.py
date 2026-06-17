@@ -62,7 +62,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v3_fast_clear"
+MODEL_CACHE_VERSION = "score_engine_v4_scoring_pool"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -3846,7 +3846,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v3_fast_clear"
+MODEL_CACHE_VERSION = "score_engine_v4_scoring_pool"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4383,7 +4383,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "score_engine_v3_fast_clear"
+MODEL_CACHE_VERSION = "score_engine_v4_scoring_pool"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -5492,7 +5492,7 @@ elif page == "Connection":
 
         st.subheader("Table counts")
         count_rows_data = []
-        for table_name in ["athletes", "athlete_results", "race_field_results", "start_lists", "athlete_scorecards", "athlete_scorecard_evidence", "race_overrides", "scoring_settings", "model_cache", "model_runs", "split_audit"]:
+        for table_name in ["athletes", "athlete_results", "race_field_results", "scoring_result_pool", "start_lists", "athlete_scorecards", "athlete_scorecard_evidence", "race_overrides", "scoring_settings", "model_cache", "model_runs", "split_audit"]:
             count_rows_data.append({"Table": table_name, "Rows in Supabase": count_rows(table_name)})
         st.dataframe(pd.DataFrame(count_rows_data), width="stretch", hide_index=True)
     except Exception as e:
@@ -5740,7 +5740,142 @@ elif page == "Import CSVs":
         }
         return app_rows, list(app_rows), athlete_rows, stats
 
-    tabs = st.tabs(["Test pulls", "Sync athletes", "Sync races", "Sync results", "Sync start lists", "Coverage"])
+
+    def build_scoring_pool_rows_from_app_rows(app_rows: List[Dict[str, Any]], as_of_date: Any, lookback_days: int = 730) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """Convert normalized app result rows into the lean scoring pool.
+
+        trinews_results remains the raw/API cache. scoring_result_pool is the
+        two-year working set the score engine reads, so scorecard rebuilds do not
+        scan every raw historical row.
+        """
+        as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
+        if pd.isna(as_of_ts):
+            as_of_ts = pd.Timestamp.today().normalize()
+        cutoff = as_of_ts - pd.Timedelta(days=int(lookback_days or 730))
+
+        def _pool_int(value: Any) -> Optional[int]:
+            try:
+                if value is None or value == "":
+                    return None
+                if pd.isna(value):
+                    return None
+            except Exception:
+                pass
+            try:
+                return int(round(float(value)))
+            except Exception:
+                return None
+
+        def _pool_float(value: Any) -> Optional[float]:
+            return safe_float(value)
+
+        def _pool_bool(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            s = clean_str(value).strip().lower()
+            return s in {"true", "1", "yes", "y"}
+
+        rows: List[Dict[str, Any]] = []
+        seen: set = set()
+        stats = {
+            "input_rows": len(app_rows or []),
+            "outside_window": 0,
+            "missing_source_id": 0,
+            "missing_identity": 0,
+            "missing_race": 0,
+            "duplicate_source_id": 0,
+            "ready_rows": 0,
+        }
+
+        for r in app_rows or []:
+            raw = _source_raw_dict(r.get("raw"))
+            source_result_id = clean_str(raw.get("trinews_result_id") or raw.get("id"))
+            if not source_result_id:
+                stats["missing_source_id"] += 1
+                continue
+            if source_result_id in seen:
+                stats["duplicate_source_id"] += 1
+                continue
+            seen.add(source_result_id)
+
+            race_date = pd.to_datetime(r.get("race_date"), errors="coerce")
+            if pd.isna(race_date):
+                stats["missing_race"] += 1
+                continue
+            if race_date < cutoff or race_date > as_of_ts:
+                stats["outside_window"] += 1
+                continue
+
+            athlete_url = clean_str(r.get("athlete_url"))
+            athlete_name = clean_str(r.get("athlete_name"))
+            race_name = clean_str(r.get("race_name"))
+            if not athlete_url or not athlete_name:
+                stats["missing_identity"] += 1
+                continue
+            if not race_name:
+                stats["missing_race"] += 1
+                continue
+
+            status = clean_str(r.get("status"))
+            status_upper = status.upper()
+            bad_status = bool(re.search(r"DNF|DNS|DSQ|DQ|CANCEL", status_upper))
+            swim_seconds = _pool_int(r.get("swim_seconds"))
+            bike_seconds = _pool_int(r.get("bike_seconds"))
+            run_seconds = _pool_int(r.get("run_seconds"))
+            finish_seconds = None
+            finish_time = clean_str(raw.get("finish_time"))
+            if finish_time:
+                try:
+                    parts = [int(float(x)) for x in finish_time.split(":")]
+                    if len(parts) == 3:
+                        finish_seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
+                    elif len(parts) == 2:
+                        finish_seconds = parts[0] * 60 + parts[1]
+                except Exception:
+                    finish_seconds = None
+
+            row = {
+                "source_result_id": source_result_id,
+                "athlete_id": clean_str(raw.get("trinews_athlete_id")),
+                "athlete_url": athlete_url,
+                "athlete_name": athlete_name,
+                "gender": normalize_gender(r.get("gender")) or clean_str(r.get("gender")),
+                "country": clean_str(raw.get("country") or raw.get("country_name")),
+                "race_id": clean_str(raw.get("trinews_race_id")),
+                "race_url": clean_str(r.get("race_url")),
+                "race_name": race_name,
+                "race_slug": clean_str(raw.get("race_slug")),
+                "race_date": race_date.date().isoformat(),
+                "race_type": clean_str(r.get("race_type")),
+                "distance": clean_str(r.get("distance")),
+                "circuit": clean_str(raw.get("race_circuit")),
+                "brand": clean_str(raw.get("race_brand")),
+                "tier": clean_str(raw.get("race_tier")),
+                "place": clean_str(r.get("place")),
+                "status": status,
+                "bad_status": bad_status,
+                "sof": _pool_float(r.get("sof")),
+                "ors": _pool_float(r.get("ors")),
+                "finish_seconds": finish_seconds,
+                "swim_seconds": swim_seconds,
+                "bike_seconds": bike_seconds,
+                "run_seconds": run_seconds,
+                "swim_rank": _pool_int(raw.get("swim_rank")),
+                "bike_rank": _pool_int(raw.get("bike_rank")),
+                "run_rank": _pool_int(raw.get("run_rank")),
+                "has_swim": bool(swim_seconds and swim_seconds > 0),
+                "has_bike": bool(bike_seconds and bike_seconds > 0),
+                "has_run": bool(run_seconds and run_seconds > 0),
+                "is_finish": (not bad_status) and status_upper in {"FIN", "FINISH", "OK", ""},
+                "is_valid_result": bool((not bad_status) and athlete_url and race_name and race_date is not pd.NaT),
+                "raw": raw or r,
+            }
+            rows.append(row)
+
+        stats["ready_rows"] = len(rows)
+        return rows, stats
+
+    tabs = st.tabs(["Test pulls", "Sync athletes", "Sync races", "Sync results", "Sync start lists", "Build scoring pool", "Coverage"])
 
     with tabs[0]:
         section_title("🧪", "Test pulls")
@@ -6135,8 +6270,72 @@ elif page == "Import CSVs":
                     st.success("Preview complete. No data was written.")
 
     with tabs[5]:
+        section_title("🏗️", "Build scoring pool")
+        st.caption("Creates the two-year scoring-ready table used by the scorecard engine. Raw API results stay in trinews_results.")
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Cached API results", f"{count_rows('trinews_results') or 0:,}")
+        p2.metric("Scoring pool rows", f"{count_rows('scoring_result_pool') or 0:,}")
+        p3.metric("Lookback days", "730")
+        p4.metric("Score source", "scoring_result_pool")
+
+        sp1, sp2, sp3, sp4 = st.columns(4)
+        pool_offset = sp1.number_input("Cached result offset", min_value=0, value=0, step=10000, key="scoring_pool_offset")
+        pool_limit = sp2.number_input("Rows this run", min_value=10, max_value=50000, value=10000, step=5000, key="scoring_pool_limit")
+        pool_as_of = sp3.date_input("As of date", value=date.today(), key="scoring_pool_asof")
+        pool_lookback = sp4.number_input("Lookback days", min_value=365, max_value=1095, value=730, step=30, key="scoring_pool_lookback_days")
+        pool_mode = st.radio("Mode", ["Preview", "Write"], horizontal=True, key="scoring_pool_mode")
+        clear_pool_first = st.checkbox(
+            "Clear scoring pool before this write",
+            value=False,
+            help="Use only on the first write when you want to rebuild the scoring pool from scratch. Leave off for later offsets.",
+            key="clear_scoring_pool_first",
+        )
+
+        if st.button("Build scoring pool batch", type="primary", key="build_scoring_pool_batch"):
+            try:
+                cached_rows = load_trinews_results_batch(int(pool_offset), int(pool_limit))
+            except Exception as e:
+                st.error("Could not read trinews_results. Sync results first and run the scoring_result_pool SQL.")
+                st.exception(e)
+                cached_rows = []
+            if cached_rows:
+                app_rows, _, _, app_stats = build_app_rows_from_cached_trinews_results(cached_rows)
+                pool_rows, pool_stats = build_scoring_pool_rows_from_app_rows(app_rows, pool_as_of, int(pool_lookback))
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Cached rows read", f"{len(cached_rows):,}")
+                m2.metric("App rows normalized", f"{app_stats.get('app_rows_ready', 0):,}")
+                m3.metric("Pool rows ready", f"{pool_stats.get('ready_rows', 0):,}")
+                m4.metric("Outside window", f"{pool_stats.get('outside_window', 0):,}")
+                sample = pd.DataFrame(pool_rows[:50])
+                if not sample.empty:
+                    cols = [c for c in ["athlete_name", "gender", "race_date", "race_name", "race_type", "place", "sof", "ors", "swim_seconds", "bike_seconds", "run_seconds", "status"] if c in sample.columns]
+                    st.dataframe(sample[cols], width="stretch", hide_index=True)
+                with st.expander("Scoring pool batch stats", expanded=False):
+                    st.json({"app_stats": app_stats, "pool_stats": pool_stats})
+                if pool_mode == "Write":
+                    if not pool_rows:
+                        st.warning("No scoring-pool rows are ready in this batch.")
+                    else:
+                        loader = loading_card("Building scoring pool", f"Writing {len(pool_rows):,} scoring-ready rows...")
+                        try:
+                            if clear_pool_first:
+                                deleted = delete_rows_in_batches("scoring_result_pool", chunk_size=1000)
+                            else:
+                                deleted = 0
+                            upsert_chunks("scoring_result_pool", pool_rows, on_conflict="source_result_id", chunk_size=1000)
+                            clear_cache()
+                        finally:
+                            loader.empty()
+                        st.success(f"Scoring pool updated. Cleared {deleted:,} old rows; upserted {len(pool_rows):,} rows.")
+                        st.info(f"Next cached result offset: {int(pool_offset) + len(cached_rows):,}")
+                else:
+                    st.success("Preview complete. No scoring-pool rows were written.")
+            else:
+                st.info("No cached rows found at this offset.")
+
+    with tabs[6]:
         section_title("✅", "Coverage")
-        table_names = ["trinews_athletes", "trinews_races", "trinews_results", "trinews_start_lists", "athletes", "athlete_results", "race_field_results", "start_lists", "athlete_scorecards"]
+        table_names = ["trinews_athletes", "trinews_races", "trinews_results", "trinews_start_lists", "athletes", "athlete_results", "race_field_results", "scoring_result_pool", "start_lists", "athlete_scorecards"]
         rows = []
         for table_name in table_names:
             rows.append({"Table": table_name, "Rows": count_rows(table_name)})
@@ -6489,11 +6688,12 @@ elif page == "Gender Tools":
 
 elif page == "Model Cache":
     st.header("⚡ Model Cache")
-    st.caption("Rebuild durable athlete scorecards. Rankings and race dashboards read these saved rows instead of recalculating live.")
+    st.caption("Rebuild durable athlete scorecards from scoring_result_pool. Rankings and race dashboards read the saved scorecard rows instead of recalculating live.")
 
-    results, starts, athletes, overrides = prepare_dataframes()
+    results = load_table("scoring_result_pool")
+    overrides = load_table("race_overrides")
     if results.empty:
-        st.warning("No athlete results found. Import Athlete Results first.")
+        st.warning("No scoring pool rows found. Build it first from API Sync → Build scoring pool.")
         st.stop()
     if not scorecard_tables_ready():
         st.error("Scorecard tables are missing. Run `athlete_scorecard_tables.sql` in Supabase SQL Editor first.")
@@ -6506,7 +6706,7 @@ elif page == "Model Cache":
     c4.metric("Strong SOF", int(STRONG_SOF_THRESHOLD))
 
     rebuild_date = st.date_input("Scorecards as of", value=date.today(), key="scorecards_asof")
-    st.info("Rebuild scorecards after importing new results or fixing athlete genders. Start-list edits usually do not require rebuilding scorecards unless new athletes/results were added.")
+    st.info("Build/update scoring_result_pool first, then rebuild scorecards. Start-list edits usually do not require rebuilding scorecards unless new athletes/results were added.")
 
     col_a, col_b = st.columns([2, 1])
     if col_a.button("Rebuild all athlete scorecards", type="primary", width="stretch"):
@@ -6600,7 +6800,7 @@ elif page == "Athlete Rankings":
 
 elif page == "Database Viewer":
     st.header("🗄️ Database Viewer")
-    table = st.selectbox("Table", ["athletes", "athlete_results", "race_field_results", "start_lists", "athlete_scorecards", "athlete_scorecard_evidence", "race_overrides", "scoring_settings", "model_cache", "model_runs", "split_audit"])
+    table = st.selectbox("Table", ["athletes", "athlete_results", "race_field_results", "scoring_result_pool", "start_lists", "athlete_scorecards", "athlete_scorecard_evidence", "race_overrides", "scoring_settings", "model_cache", "model_runs", "split_audit"])
     exact_count = count_rows(table)
     if exact_count is not None:
         st.metric("Rows in Supabase", f"{exact_count:,}")
