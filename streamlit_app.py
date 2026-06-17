@@ -5907,11 +5907,25 @@ elif page == "Import CSVs":
 
         st.divider()
         section_title("📤", "Publish cached results")
-        st.caption("Use this after source results exist in trinews_results. It copies cached TriNews results into the prediction tables used by the dashboard and scorecards.")
+        st.caption("Copies rows from the cached TriNews results table into the app result tables used by rankings and scorecards.")
         pc1, pc2, pc3 = st.columns(3)
-        publish_offset = pc1.number_input("Cached result offset", min_value=0, value=0, step=1000, key="publish_cached_results_offset")
-        publish_limit = pc2.number_input("Cached result rows", min_value=10, max_value=10000, value=1000, step=500, key="publish_cached_results_limit")
-        publish_mode = pc3.radio("Publish mode", ["Preview", "Write"], horizontal=True, key="publish_cached_results_mode")
+        publish_offset = pc1.number_input("Cached result offset", min_value=0, value=0, step=500, key="publish_cached_results_offset")
+        publish_limit = pc2.number_input("Rows this run", min_value=10, max_value=5000, value=500, step=250, key="publish_cached_results_limit")
+        publish_mode = pc3.radio("Mode", ["Preview", "Write"], horizontal=True, key="publish_cached_results_mode")
+        fast_publish = st.checkbox(
+            "Fast publish for fresh tables",
+            value=True,
+            help="Recommended after a fresh reset. This inserts the selected batch directly instead of doing slow row-by-row duplicate checks.",
+            key="fast_publish_cached_results",
+        )
+        update_athletes_during_publish = st.checkbox(
+            "Update athlete master during publish",
+            value=False,
+            help="Leave off if you already synced athletes. Turning this on can make large batches slower.",
+            key="update_athletes_during_publish",
+        )
+        st.caption("For large imports, publish in batches. Start with 500–1,000 rows, then continue using the next offset shown after each successful write.")
+
         if st.button("Publish cached results to app tables", type="primary", key="publish_cached_results_to_app_tables"):
             try:
                 cached_rows = load_trinews_results_batch(int(publish_offset), int(publish_limit))
@@ -5930,20 +5944,48 @@ elif page == "Import CSVs":
                 if not sample.empty:
                     cols = [col for col in ["athlete_name", "gender", "race_date", "race_name", "race_type", "place", "sof", "ors", "swim_seconds", "bike_seconds", "run_seconds", "status"] if col in sample.columns]
                     st.dataframe(sample[cols], width="stretch", hide_index=True)
+
                 if publish_mode == "Write":
-                    app_rows, a_ins, a_upd, a_prop = sync_athlete_master_import(app_rows, athlete_rows)
-                    race_field_rows, rf_ins, rf_upd, rf_prop = sync_athlete_master_import(race_field_rows, athlete_rows)
-                    ar_inserted, ar_skipped, ar_updated = merge_result_rows("athlete_results", app_rows)
-                    rf_inserted, rf_skipped, rf_updated = merge_result_rows("race_field_results", race_field_rows)
-                    clear_cache()
-                    st.success(
-                        f"Published cached results. athlete_results inserted {ar_inserted:,}, updated {ar_updated:,}; "
-                        f"race_field_results inserted {rf_inserted:,}, updated {rf_updated:,}."
-                    )
-                    st.caption(f"Athlete master upserts: {a_ins + rf_ins:,}; athlete updates: {a_upd + rf_upd:,}; gender propagated: {a_prop + rf_prop:,}.")
+                    if not app_rows:
+                        st.warning("No rows in this batch are ready to publish.")
+                    else:
+                        loader = loading_card("Publishing cached results", f"Writing {len(app_rows):,} rows into app result tables...")
+                        try:
+                            app_rows = dedupe_result_rows(app_rows)
+                            race_field_rows = dedupe_result_rows(race_field_rows)
+
+                            athlete_inserted = athlete_updated = gender_propagated = 0
+                            if update_athletes_during_publish:
+                                app_rows, athlete_inserted, athlete_updated, gender_propagated = sync_athlete_master_import(app_rows, athlete_rows)
+                                race_field_rows, rf_ai, rf_au, rf_gp = sync_athlete_master_import(race_field_rows, athlete_rows)
+                                athlete_inserted += rf_ai
+                                athlete_updated += rf_au
+                                gender_propagated += rf_gp
+
+                            if fast_publish:
+                                # Fresh-table path: fast direct inserts. Avoids the slow row-by-row merge that can hang on large batches.
+                                insert_chunks("athlete_results", app_rows, chunk_size=200)
+                                insert_chunks("race_field_results", race_field_rows, chunk_size=200)
+                                ar_inserted, ar_updated = len(app_rows), 0
+                                rf_inserted, rf_updated = len(race_field_rows), 0
+                            else:
+                                # Repair/import path: slower but tries to update matching existing rows instead of adding duplicates.
+                                ar_inserted, ar_skipped, ar_updated = merge_result_rows("athlete_results", app_rows)
+                                rf_inserted, rf_skipped, rf_updated = merge_result_rows("race_field_results", race_field_rows)
+
+                            clear_cache()
+                        finally:
+                            loader.empty()
+                        next_offset = int(publish_offset) + len(cached_rows)
+                        st.success(
+                            f"Published cached results. athlete_results inserted {ar_inserted:,}, updated {ar_updated:,}; "
+                            f"race_field_results inserted {rf_inserted:,}, updated {rf_updated:,}."
+                        )
+                        if update_athletes_during_publish:
+                            st.caption(f"Athlete master inserted/upserted: {athlete_inserted:,}; updated: {athlete_updated:,}; gender propagated: {gender_propagated:,}.")
+                        st.info(f"Next cached result offset: {next_offset:,}")
                 else:
                     st.success("Preview complete. No app tables were changed.")
-
     with tabs[4]:
         section_title("📋", "Sync start lists")
         api_key = st.text_input("TriNews API key", value=default_trinews_key, type="password", key="trinews_start_lists_key")
