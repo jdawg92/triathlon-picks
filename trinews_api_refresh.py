@@ -728,6 +728,37 @@ START_LIST_FILTER_CANDIDATES = [
     ("slug", "slug"),
 ]
 
+# Some TriNews start-list tables are race/header rows, not athlete-entry rows.
+# Example: /start_lists can return one row per race with id/race_id/event_hub_id
+# and no athlete_id. In that case, probe the likely child entry tables using
+# the start-list/header id before giving up.
+START_LIST_ENTRY_CANDIDATE_TABLES = [
+    "start_list_entries",
+    "startlist_entries",
+    "race_start_list_entries",
+    "race_startlist_entries",
+    "event_start_list_entries",
+    "entries",
+    "race_entries",
+    "participants",
+    "race_participants",
+    "event_participants",
+    "program_entries",
+]
+
+START_LIST_ENTRY_FILTER_CANDIDATES = [
+    ("start_list_id", "start_list_id"),
+    ("startlist_id", "start_list_id"),
+    ("start_list", "start_list_id"),
+    ("startlist", "start_list_id"),
+    ("list_id", "start_list_id"),
+    ("race_start_list_id", "start_list_id"),
+    ("race_id", "race_id"),
+    ("event_hub_id", "event_hub_id"),
+    ("event_id", "event_hub_id"),
+    ("race_slug", "race_slug"),
+]
+
 
 def _get_optional(api_key: str, path: str, params: Dict[str, Any], timeout: int = 25) -> Tuple[int, Any]:
     """GET a PostgREST path and return (status, json_or_text), never raise."""
@@ -767,32 +798,103 @@ def probe_start_list_sources_for_race(api_key: str, race: Dict[str, Any], limit:
             params = {"select": "*", col: f"eq.{val}", "limit": int(limit)}
             status, data = _get_optional(api_key, table, params)
             rows = data if isinstance(data, list) else []
+            athlete_rows = [r for r in rows if _start_list_has_athlete_identity(r)]
             out.append({
                 "table": table,
                 "filter_column": col,
                 "filter_value": val,
                 "status": status,
                 "row_count": len(rows),
+                "athlete_row_count": len(athlete_rows),
                 "sample": rows[:3] if rows else data,
             })
-            if status == 200 and rows:
-                # A non-empty exact-race match is enough. Avoid hammering every
-                # remaining candidate table in app flows.
+            if status == 200 and athlete_rows:
+                # A non-empty athlete-entry match is enough. Race/list header rows
+                # are not migratable, so keep probing if athlete fields are blank.
                 return out
     return out
 
 
+def probe_start_list_entry_sources_for_race(api_key: str, race: Dict[str, Any], header_rows: List[Dict[str, Any]], limit: int = 25) -> List[Dict[str, Any]]:
+    """Probe child entry tables using race/header rows from /start_lists."""
+    out: List[Dict[str, Any]] = []
+    race_id = _clean(race.get("id"))
+    event_hub_id = _clean(race.get("event_hub_id"))
+    race_slug = _clean(race.get("slug"))
+    header_ids = [_clean(h.get("id")) for h in (header_rows or []) if _clean(h.get("id"))]
+    value_sets: List[Dict[str, str]] = []
+    for hid in header_ids[:5]:
+        value_sets.append({"start_list_id": hid, "race_id": race_id or "", "event_hub_id": event_hub_id or "", "race_slug": race_slug or ""})
+    if not value_sets:
+        value_sets.append({"start_list_id": "", "race_id": race_id or "", "event_hub_id": event_hub_id or "", "race_slug": race_slug or ""})
+
+    for values in value_sets:
+        for table in START_LIST_ENTRY_CANDIDATE_TABLES:
+            for col, key in START_LIST_ENTRY_FILTER_CANDIDATES:
+                val = values.get(key)
+                if not val:
+                    continue
+                params = {"select": "*", col: f"eq.{val}", "limit": int(limit)}
+                status, data = _get_optional(api_key, table, params)
+                rows = data if isinstance(data, list) else []
+                athlete_rows = [r for r in rows if _start_list_has_athlete_identity(r)]
+                out.append({
+                    "table": table,
+                    "filter_column": col,
+                    "filter_value": val,
+                    "status": status,
+                    "row_count": len(rows),
+                    "athlete_row_count": len(athlete_rows),
+                    "sample": rows[:3] if rows else data,
+                })
+                if status == 200 and athlete_rows:
+                    return out
+    return out
+
+
 def discover_start_list_rows_for_race(api_key: str, race: Dict[str, Any], limit: int = 1000) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Return first non-empty start-list candidate rows plus discovery log."""
+    """Return athlete-entry start-list rows, not race/list header rows."""
     attempts = probe_start_list_sources_for_race(api_key, race, limit=min(25, int(limit)))
+    header_rows: List[Dict[str, Any]] = []
     for a in attempts:
         if a.get("status") == 200 and int(a.get("row_count") or 0) > 0:
             table = a.get("table")
             col = a.get("filter_column")
             val = a.get("filter_value")
             rows = _get(api_key, str(table), {"select": "*", str(col): f"eq.{val}", "limit": int(limit)}, timeout=45)
-            return rows, {"status": "ok", "table": table, "filter_column": col, "rows": len(rows), "race_id": race.get("id"), "race_slug": race.get("slug")}
-    return [], {"status": "not_found_or_empty", "attempts": attempts, "race_id": race.get("id"), "race_slug": race.get("slug")}
+            athlete_rows = [r for r in rows if _start_list_has_athlete_identity(r)]
+            if athlete_rows:
+                return athlete_rows, {
+                    "status": "ok", "table": table, "filter_column": col,
+                    "rows": len(athlete_rows), "raw_rows": len(rows),
+                    "race_id": race.get("id"), "race_slug": race.get("slug"),
+                }
+            # Keep possible race/list headers so we can probe child entry tables.
+            header_rows.extend(rows[:10])
+
+    entry_attempts = probe_start_list_entry_sources_for_race(api_key, race, header_rows, limit=min(25, int(limit)))
+    for a in entry_attempts:
+        if a.get("status") == 200 and int(a.get("athlete_row_count") or 0) > 0:
+            table = a.get("table")
+            col = a.get("filter_column")
+            val = a.get("filter_value")
+            rows = _get(api_key, str(table), {"select": "*", str(col): f"eq.{val}", "limit": int(limit)}, timeout=45)
+            athlete_rows = [r for r in rows if _start_list_has_athlete_identity(r)]
+            return athlete_rows, {
+                "status": "ok", "table": table, "filter_column": col,
+                "rows": len(athlete_rows), "raw_rows": len(rows),
+                "via_header_probe": True,
+                "race_id": race.get("id"), "race_slug": race.get("slug"),
+            }
+
+    return [], {
+        "status": "not_found_or_empty",
+        "attempts": attempts,
+        "entry_attempts": entry_attempts,
+        "header_rows_seen": len(header_rows),
+        "race_id": race.get("id"),
+        "race_slug": race.get("slug"),
+    }
 
 
 def _extract_nested(row: Dict[str, Any], keys: List[str]) -> Any:
@@ -808,6 +910,29 @@ def _extract_nested(row: Dict[str, Any], keys: List[str]) -> Any:
         if ok and cur is not None:
             return cur
     return None
+
+
+def _start_list_has_athlete_identity(row: Dict[str, Any]) -> bool:
+    """True only when a source row is an athlete entry, not a race/list header."""
+    if not isinstance(row, dict):
+        return False
+    if _clean(_extract_nested(row, [
+        "athlete_id", "athlete.id", "athletes.id", "participant.athlete_id",
+        "entry.athlete_id", "profile_id", "person_id", "competitor_id",
+    ])):
+        return True
+    if _clean(_extract_nested(row, [
+        "athlete_name", "full_name", "name", "display_name",
+        "athlete.full_name", "athlete.name", "athletes.full_name",
+        "participant.full_name", "participant.name", "entry.name",
+    ])):
+        return True
+    if _clean(_extract_nested(row, [
+        "athlete_slug", "athlete.slug", "athletes.slug", "slug",
+        "athlete_url", "athlete.url", "profile_url",
+    ])):
+        return True
+    return False
 
 
 def _start_list_athlete_id(row: Dict[str, Any]) -> Optional[str]:
@@ -1155,6 +1280,9 @@ def build_full_clean_api_rebuild(
 START_LIST_CANDIDATE_TABLES = [
     "start_lists",
     "race_start_lists",
+    "start_list_entries",
+    "startlist_entries",
+    "race_start_list_entries",
     "race_entries",
     "entries",
     "race_participants",

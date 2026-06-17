@@ -61,6 +61,11 @@ except Exception as _trinews_api_import_error:
 else:
     TRINEWS_API_IMPORT_ERROR = None
 
+try:
+    from trinews_api_refresh import build_clean_start_list_sync
+except Exception:
+    build_clean_start_list_sync = None
+
 st.set_page_config(page_title="Triathlon Picks", page_icon="🏁", layout="wide")
 
 # ============================================================
@@ -6623,12 +6628,44 @@ elif page == "Import CSVs":
                 source_rows_all = fetch_all("trinews_start_lists", select="*", page_size=1000)
                 source_rows = source_rows_all[: int(migrate_limit)]
                 start_rows, athlete_rows, mig_stats = start_rows_from_trinews_source_rows(source_rows)
+
+                # If the cached rows are only race/list headers, they are not directly
+                # migratable. Use those cached race slugs as a discovery list, fetch the
+                # actual athlete-entry rows from the API, cache them back into
+                # trinews_start_lists, then migrate the normalized app rows.
+                if not start_rows and source_rows and api_key and build_clean_start_list_sync is not None:
+                    race_slugs = sorted({clean_str(r.get("race_slug")) for r in source_rows if clean_str(r.get("race_slug"))})
+                    if race_slugs:
+                        st.info(
+                            "Cached trinews_start_lists rows look like race/list headers, not athlete entries. "
+                            "Fetching athlete entries from the TriNews API for those cached races."
+                        )
+                        api_payload = build_clean_start_list_sync(
+                            api_key=api_key,
+                            race_slugs=race_slugs,
+                            max_races=len(race_slugs),
+                            row_limit_per_race=1000,
+                        )
+                        api_source_rows = api_payload.get("trinews_start_lists", []) or []
+                        if api_source_rows:
+                            write_source_rows_safe("trinews_start_lists", api_source_rows, "id")
+                        start_rows = api_payload.get("start_lists", []) or []
+                        athlete_rows = api_payload.get("athletes", []) or []
+                        mig_stats["api_refetch"] = {
+                            "race_slugs": len(race_slugs),
+                            "api_source_rows": len(api_source_rows),
+                            "api_app_rows": len(start_rows),
+                            "logs": api_payload.get("logs", [])[-10:],
+                            "summary": api_payload.get("summary", {}) or {},
+                        }
+
                 if not start_rows:
-                    st.warning("No migratable cached start-list rows found in trinews_start_lists.")
+                    st.warning("No migratable cached start-list athlete rows found in trinews_start_lists.")
                     st.json(mig_stats)
                     if source_rows:
                         st.caption("Sample cached row shape")
                         st.json({k: source_rows[0].get(k) for k in list(source_rows[0].keys())[:12]})
+                    st.info("Those cached rows may be race/list headers only. Re-run Sync start lists after saving the updated trinews_api_refresh.py, then try migration again.")
                 else:
                     if athlete_rows:
                         upsert_athletes_preserve_gender(athlete_rows)
