@@ -156,6 +156,15 @@ def gender_from_api(athlete: Optional[Dict[str, Any]], result: Optional[Dict[str
     return None
 
 
+def display_race_name_from_api(race: Dict[str, Any], result: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    name = _clean(race.get("name") or (result or {}).get("race_name"))
+    if not name:
+        return None
+    # Match legacy/imported naming where the leading calendar year was not stored
+    # in the race name. The date remains stored separately in race_date.
+    return re.sub(r"^\s*(19|20)\d{2}\s+", "", name).strip()
+
+
 def race_type_from_api_race(race: Dict[str, Any]) -> Optional[str]:
     txt = " ".join(str(race.get(k) or "") for k in ["name", "distance_category", "brand", "wt_category", "circuit", "organization"]).lower()
     if "t100" in txt or "pto" in txt or "100k" in txt:
@@ -260,7 +269,7 @@ def result_to_pick_rows(result: Dict[str, Any], race: Optional[Dict[str, Any]], 
         "athlete_name": athlete_name_from_api(athlete, athlete_id),
         "gender": gender,
         "race_date": date_from_api(race.get("date") or result.get("race_date")),
-        "race_name": _clean(race.get("name") or result.get("race_name")),
+        "race_name": display_race_name_from_api(race, result),
         "race_url": f"{PROTRINEWS_BASE}/races/{race_slug}" if race_slug else None,
         "race_type": race_type,
         "distance": _clean(race.get("distance_category")),

@@ -1812,16 +1812,30 @@ def merge_start_list_rows(rows: List[Dict[str, Any]]) -> Tuple[int, int]:
     return len(to_insert), skipped
 
 
+def normalize_result_race_name_for_key(value: Any) -> str:
+    """Normalize race names so API rows merge with old imported rows.
+
+    TriNews race names often include a leading year, for example
+    "2026 T100 Triathlon World Tour Spain", while the older CSV imports often
+    saved "T100 Triathlon World Tour Spain". Those should be the same result
+    row for merge/update purposes.
+    """
+    name = (clean_str(value) or "").strip().lower()
+    name = re.sub(r"^\s*(19|20)\d{2}\s+", "", name)
+    name = re.sub(r"\s+", " ", name)
+    return name.strip()
+
+
 def result_import_key(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
     """Stable key for one athlete race-result row.
 
-    Imports should merge on this key instead of appending another duplicate row.
-    It intentionally matches the database guard we tried to create earlier:
-    athlete_url + race_date + race_name + race_type.
+    Imports merge on athlete + date + normalized race name + race type instead
+    of appending duplicates. The normalized race name intentionally treats
+    "2026 T100 ..." and "T100 ..." as the same race.
     """
     athlete_key = canonical_athlete_url(row.get("athlete_url")) or (clean_str(row.get("athlete_name")) or "").strip().lower()
     race_date = iso_date(row.get("race_date"))
-    race_name = (clean_str(row.get("race_name")) or "").strip().lower()
+    race_name = normalize_result_race_name_for_key(row.get("race_name"))
     race_type = (clean_str(row.get("race_type")) or clean_str(row.get("distance")) or "").strip().lower()
     return athlete_key, race_date, race_name, race_type
 
@@ -1945,7 +1959,9 @@ def update_existing_result_row(table_name: str, existing: Dict[str, Any], payloa
     try:
         row_id = existing.get("id")
         if row_id is not None and not (isinstance(row_id, float) and math.isnan(row_id)):
-            supabase.table(table_name).update(payload).eq("id", int(row_id)).execute()
+            # IDs may be bigint or UUID depending on the deployed table. Do not
+            # cast to int, because UUID ids caused clean API repair updates to fail.
+            supabase.table(table_name).update(payload).eq("id", row_id).execute()
         else:
             supabase.table(table_name).update(payload) \
                 .eq("athlete_url", existing.get("athlete_url")) \
@@ -1954,7 +1970,11 @@ def update_existing_result_row(table_name: str, existing: Dict[str, Any], payloa
                 .eq("race_type", existing.get("race_type")) \
                 .execute()
         return True
-    except Exception:
+    except Exception as e:
+        try:
+            st.warning(f"Could not update existing {table_name} row: {e}")
+        except Exception:
+            pass
         return False
 
 
