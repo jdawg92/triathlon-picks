@@ -578,6 +578,78 @@ def _group_top_scores(work: pd.DataFrame, gender: str, profile: str, discipline:
     return score_rows, evidence_rows
 
 
+def prep_results(results: pd.DataFrame) -> pd.DataFrame:
+    """Public wrapper used by the app for one-time normalization before batched saves."""
+    return _prep_results(results)
+
+
+def build_scorecard_slice(
+    prep_df: pd.DataFrame,
+    gender: str,
+    profile: str,
+    discipline: str,
+    as_of_date: Any,
+    model_version: str,
+    top_n: int = 5,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Build one gender/profile/discipline scorecard slice.
+
+    The app can call this repeatedly and save each slice separately so Supabase
+    never has to run one giant scorecard transaction.
+    """
+    as_of = pd.to_datetime(as_of_date, errors="coerce")
+    if pd.isna(as_of):
+        as_of = pd.Timestamp.today().normalize()
+    if prep_df is None or prep_df.empty:
+        return [], [], {
+            "Gender": gender,
+            "Profile": profile,
+            "Discipline": discipline,
+            "Rows After Profile": 0,
+            "Candidate Score Rows": 0,
+            "Scorecard Rows": 0,
+            "Evidence Rows": 0,
+            "Lookback Days": _lookback_days(profile),
+            "Status": "empty results",
+        }
+
+    lookback = _lookback_days(profile)
+    window_start = as_of - pd.Timedelta(days=lookback)
+    gdf_base = prep_df[prep_df["gender"] == gender].copy()
+    pdf = gdf_base[
+        (gdf_base["race_date"].notna()) &
+        (gdf_base["race_date"] >= window_start) &
+        (gdf_base["race_date"] <= as_of) &
+        (_profile_mask(gdf_base, profile))
+    ].copy()
+
+    try:
+        if discipline == "overall":
+            candidate_rows = int(pd.to_numeric(pdf.get("ors", pd.Series(dtype=object)), errors="coerce").gt(0).sum())
+            cards, evidence = _build_overall_cards(pdf, gender, profile, as_of, model_version, top_n)
+        else:
+            split_col = f"{discipline}_seconds"
+            candidate_rows = int(pd.to_numeric(pdf.get(split_col, pd.Series(dtype=object)), errors="coerce").gt(0).sum())
+            cards, evidence = _build_split_cards(pdf, gender, profile, discipline, as_of, model_version, top_n)
+        status = "saved"
+    except Exception as exc:
+        candidate_rows = 0
+        cards, evidence = [], []
+        status = f"error: {exc}"
+
+    return cards, evidence, {
+        "Gender": gender,
+        "Profile": profile,
+        "Discipline": discipline,
+        "Rows After Profile": int(len(pdf)),
+        "Candidate Score Rows": int(candidate_rows),
+        "Scorecard Rows": int(len(cards)),
+        "Evidence Rows": int(len(evidence)),
+        "Lookback Days": int(lookback),
+        "Status": status,
+    }
+
+
 def build_all_scorecards(
     results: pd.DataFrame,
     as_of_date: Any,
@@ -601,43 +673,11 @@ def build_all_scorecards(
     logs: List[Dict[str, Any]] = []
 
     for gender in ["Men", "Women"]:
-        gdf_base = df[df["gender"] == gender].copy()
         for profile in PROFILES:
-            lookback = _lookback_days(profile)
-            window_start = as_of - pd.Timedelta(days=lookback)
-            pdf = gdf_base[
-                (gdf_base["race_date"].notna()) &
-                (gdf_base["race_date"] >= window_start) &
-                (gdf_base["race_date"] <= as_of) &
-                (_profile_mask(gdf_base, profile))
-            ].copy()
             for discipline in DISCIPLINES:
-                before_cards = len(cards)
-                before_ev = len(evidence)
-                try:
-                    if discipline == "overall":
-                        candidate_rows = int(pd.to_numeric(pdf.get("ors", pd.Series(dtype=object)), errors="coerce").gt(0).sum())
-                        c, e = _build_overall_cards(pdf, gender, profile, as_of, model_version, top_n)
-                    else:
-                        split_col = f"{discipline}_seconds"
-                        candidate_rows = int(pd.to_numeric(pdf.get(split_col, pd.Series(dtype=object)), errors="coerce").gt(0).sum())
-                        c, e = _build_split_cards(pdf, gender, profile, discipline, as_of, model_version, top_n)
-                    cards.extend(c)
-                    evidence.extend(e)
-                    status = "saved"
-                except Exception as exc:
-                    candidate_rows = 0
-                    status = f"error: {exc}"
-                logs.append({
-                    "Gender": gender,
-                    "Profile": profile,
-                    "Discipline": discipline,
-                    "Rows After Profile": int(len(pdf)),
-                    "Candidate Score Rows": int(candidate_rows),
-                    "Scorecard Rows": int(len(cards) - before_cards),
-                    "Evidence Rows": int(len(evidence) - before_ev),
-                    "Lookback Days": int(lookback),
-                    "Status": status,
-                })
+                c, e, log = build_scorecard_slice(df, gender, profile, discipline, as_of, model_version, top_n)
+                cards.extend(c)
+                evidence.extend(e)
+                logs.append(log)
 
     return pd.DataFrame(cards), pd.DataFrame(evidence), pd.DataFrame(logs)

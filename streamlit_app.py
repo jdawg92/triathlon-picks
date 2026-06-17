@@ -13,9 +13,24 @@ import streamlit as st
 from supabase import create_client
 
 try:
-    from score_engine import build_all_scorecards as build_all_scorecards_fast
+    from score_engine import (
+        DISCIPLINES as SCORE_ENGINE_DISCIPLINES,
+        PROFILES as SCORE_ENGINE_PROFILES,
+        build_all_scorecards as build_all_scorecards_fast,
+        build_scorecard_slice,
+        prep_results as prep_score_results,
+    )
 except Exception as _score_engine_import_error:
     build_all_scorecards_fast = None
+    build_scorecard_slice = None
+    prep_score_results = None
+    SCORE_ENGINE_DISCIPLINES = ["overall", "swim", "bike", "run"]
+    SCORE_ENGINE_PROFILES = [
+        "Long Course / 70.3 + T100",
+        "Short Course / WTCS",
+        "Full IRONMAN",
+        "All",
+    ]
     SCORE_ENGINE_IMPORT_ERROR = _score_engine_import_error
 else:
     SCORE_ENGINE_IMPORT_ERROR = None
@@ -1338,6 +1353,64 @@ def load_table(table_name: str) -> pd.DataFrame:
         return pd.DataFrame(fetch_all(table_name))
     except Exception:
         return pd.DataFrame()
+
+
+SCORING_POOL_SCORECARD_COLUMNS = (
+    "athlete_url,athlete_name,gender,race_name,race_type,distance,race_date,"
+    "place,status,bad_status,sof,ors,swim_seconds,bike_seconds,run_seconds"
+)
+MAX_SCORECARD_POOL_LOOKBACK_DAYS = ALL_PROFILE_SCORECARD_LOOKBACK_DAYS
+
+
+def fetch_scoring_pool_for_scorecards(
+    as_of_date: Any,
+    lookback_days: int = MAX_SCORECARD_POOL_LOOKBACK_DAYS,
+    page_size: int = 2000,
+) -> pd.DataFrame:
+    """Load only the scoring-pool rows needed for scorecard rebuilds.
+
+    This avoids pulling the full historical pool through Streamlit and keeps each
+    Supabase request small enough to avoid statement timeouts.
+    """
+    as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
+    if pd.isna(as_of_ts):
+        as_of_ts = pd.Timestamp.today().normalize()
+    cutoff = (as_of_ts - pd.Timedelta(days=int(lookback_days or MAX_SCORECARD_POOL_LOOKBACK_DAYS))).strftime("%Y-%m-%d")
+    as_of_label = as_of_ts.strftime("%Y-%m-%d")
+
+    all_rows: List[Dict[str, Any]] = []
+    start = 0
+    page_size = max(500, min(int(page_size), 5000))
+    while True:
+        end = start + page_size - 1
+        try:
+            res = (
+                supabase.table("scoring_result_pool")
+                .select(SCORING_POOL_SCORECARD_COLUMNS)
+                .gte("race_date", cutoff)
+                .lte("race_date", as_of_label)
+                .order("race_date", desc=False)
+                .range(start, end)
+                .execute()
+            )
+            rows = res.data or []
+        except Exception:
+            # Older pools may not have every helper column; fall back to full select.
+            res = (
+                supabase.table("scoring_result_pool")
+                .select("*")
+                .gte("race_date", cutoff)
+                .lte("race_date", as_of_label)
+                .order("race_date", desc=False)
+                .range(start, end)
+                .execute()
+            )
+            rows = res.data or []
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        start += page_size
+    return pd.DataFrame(all_rows)
 
 
 def fetch_all_filtered(table_name: str, filters: Tuple[Tuple[str, Any], ...], select: str = "*", page_size: int = 1000) -> List[Dict[str, Any]]:
@@ -4982,48 +5055,123 @@ def rebuild_all_athlete_scorecards(results: pd.DataFrame, overrides: pd.DataFram
     normalized results to a dedicated engine once, then bulk-saves the returned
     scorecard and evidence rows.
     """
-    if build_all_scorecards_fast is None:
+    return rebuild_athlete_scorecards_batched(
+        results=results,
+        as_of_ts=as_of_ts,
+        clear_first=True,
+        top_n=TOP_SCORES_USED,
+        save_mode="bulk",
+    )
+
+
+def rebuild_athlete_scorecards_batched(
+    results: pd.DataFrame,
+    as_of_ts: pd.Timestamp,
+    clear_first: bool = True,
+    top_n: int = TOP_SCORES_USED,
+    save_mode: str = "slice",
+) -> pd.DataFrame:
+    """Build scorecards in small slices to avoid Supabase statement timeouts."""
+    if build_scorecard_slice is None or prep_score_results is None:
         raise RuntimeError(f"score_engine.py could not be imported: {SCORE_ENGINE_IMPORT_ERROR}")
 
     ensure_scorecard_tables()
-    progress = st.progress(0, text="Preparing fast scorecard engine...")
     as_of_ts = pd.to_datetime(as_of_ts, errors="coerce")
     if pd.isna(as_of_ts):
         as_of_ts = pd.Timestamp.today().normalize()
 
-    progress.progress(0.15, text="Building all scorecards in one engine pass...")
-    scorecards_df, evidence_df, logs_df = build_all_scorecards_fast(
-        results=results,
-        as_of_date=as_of_ts,
-        model_version=MODEL_CACHE_VERSION,
-        top_n=TOP_SCORES_USED,
-    )
+    progress = st.progress(0, text="Preparing scorecard engine...")
+    prep_df = prep_score_results(results)
+    if prep_df.empty:
+        progress.empty()
+        return pd.DataFrame([{"Status": "empty results"}])
 
-    progress.progress(0.65, text="Clearing saved scorecard tables...")
-    # Rebuild-all should be deterministic: clear old scorecards/evidence first,
-    # then save the fresh model version. Use RPC truncate when available; fall
-    # back to batched deletes so large tables do not time out.
-    clear_info = clear_scorecard_tables_for_rebuild()
+    slices = [
+        (gender, profile, discipline)
+        for gender in ["Men", "Women"]
+        for profile in SCORE_ENGINE_PROFILES
+        for discipline in SCORE_ENGINE_DISCIPLINES
+    ]
+    total_slices = len(slices)
 
-    progress.progress(0.78, text="Saving athlete scorecards...")
-    scorecard_rows = cache_safe_rows(scorecards_df) if scorecards_df is not None and not scorecards_df.empty else []
-    evidence_rows = cache_safe_rows(evidence_df) if evidence_df is not None and not evidence_df.empty else []
-    if scorecard_rows:
-        insert_chunks("athlete_scorecards", scorecard_rows, chunk_size=750)
-    progress.progress(0.90, text="Saving scorecard evidence...")
-    if evidence_rows:
-        insert_chunks("athlete_scorecard_evidence", evidence_rows, chunk_size=750)
+    clear_info: Dict[str, Any] = {"method": "none"}
+    if clear_first:
+        progress.progress(0.05, text="Clearing saved scorecard tables...")
+        clear_info = clear_scorecard_tables_for_rebuild()
+
+    logs: List[Dict[str, Any]] = []
+    total_cards = 0
+    total_evidence = 0
+
+    if save_mode == "bulk":
+        progress.progress(0.20, text="Building all scorecards in one engine pass...")
+        scorecards_df, evidence_df, logs_df = build_all_scorecards_fast(
+            results=results,
+            as_of_date=as_of_ts,
+            model_version=MODEL_CACHE_VERSION,
+            top_n=int(top_n),
+        )
+        progress.progress(0.70, text="Saving athlete scorecards...")
+        scorecard_rows = cache_safe_rows(scorecards_df) if scorecards_df is not None and not scorecards_df.empty else []
+        evidence_rows = cache_safe_rows(evidence_df) if evidence_df is not None and not evidence_df.empty else []
+        if scorecard_rows:
+            insert_chunks("athlete_scorecards", scorecard_rows, chunk_size=750)
+        progress.progress(0.88, text="Saving scorecard evidence...")
+        if evidence_rows:
+            insert_chunks("athlete_scorecard_evidence", evidence_rows, chunk_size=750)
+        total_cards = len(scorecard_rows)
+        total_evidence = len(evidence_rows)
+        logs_df = pd.DataFrame() if logs_df is None else logs_df.copy()
+        if not logs_df.empty:
+            logs_df["Model Version"] = MODEL_CACHE_VERSION
+            logs_df["Saved Scorecards"] = total_cards
+            logs_df["Saved Evidence Rows"] = total_evidence
+            logs_df["Clear Method"] = clear_info.get("method")
+        clear_cache()
+        progress.progress(1.0, text="Scorecard rebuild complete.")
+        progress.empty()
+        return logs_df
+
+    for idx, (gender, profile, discipline) in enumerate(slices, start=1):
+        label = f"{gender} · {profile} · {discipline}"
+        pct = 0.08 + (0.86 * (idx - 1) / max(total_slices, 1))
+        progress.progress(pct, text=f"Building slice {idx}/{total_slices}: {label}")
+
+        cards, evidence, log = build_scorecard_slice(
+            prep_df=prep_df,
+            gender=gender,
+            profile=profile,
+            discipline=discipline,
+            as_of_date=as_of_ts,
+            model_version=MODEL_CACHE_VERSION,
+            top_n=int(top_n),
+        )
+        log["Model Version"] = MODEL_CACHE_VERSION
+        logs.append(log)
+
+        if not clear_first:
+            _delete_scorecard_combo(gender, profile, discipline, as_of_ts)
+
+        card_rows = cache_safe_rows(pd.DataFrame(cards)) if cards else []
+        evidence_rows = cache_safe_rows(pd.DataFrame(evidence)) if evidence else []
+        if card_rows:
+            insert_chunks("athlete_scorecards", card_rows, chunk_size=500)
+            total_cards += len(card_rows)
+        if evidence_rows:
+            insert_chunks("athlete_scorecard_evidence", evidence_rows, chunk_size=500)
+            total_evidence += len(evidence_rows)
+
+        log["Saved Scorecards"] = len(card_rows)
+        log["Saved Evidence Rows"] = len(evidence_rows)
+        log["Clear Method"] = clear_info.get("method")
 
     clear_cache()
     progress.progress(1.0, text="Scorecard rebuild complete.")
     progress.empty()
-
-    logs_df = pd.DataFrame() if logs_df is None else logs_df.copy()
+    logs_df = pd.DataFrame(logs)
     if not logs_df.empty:
-        logs_df["Model Version"] = MODEL_CACHE_VERSION
-        logs_df["Saved Scorecards"] = len(scorecard_rows)
-        logs_df["Saved Evidence Rows"] = len(evidence_rows)
-        logs_df["Clear Method"] = clear_info.get("method")
+        logs_df["Total Saved Scorecards"] = total_cards
+        logs_df["Total Saved Evidence Rows"] = total_evidence
     return logs_df
 
 
@@ -6739,14 +6887,72 @@ elif page == "Model Cache":
 
     rebuild_date = st.date_input("Scorecards as of", value=date.today(), key="scorecards_asof")
 
-    st.subheader("Fast database rebuild")
-    st.caption("Recommended. This builds athlete_scorecards directly in Supabase from scoring_result_pool, so Streamlit does not have to load and rewrite thousands of rows.")
-    fast_clear = st.checkbox("Clear existing scorecards before rebuild", value=True, key="db_scorecard_clear")
-    fast_top_n = st.number_input("Top evidence rows per scorecard", min_value=1, max_value=10, value=int(TOP_SCORES_USED), step=1, key="db_scorecard_top_n")
+    st.subheader("Recommended: Python scorecard rebuild")
+    st.caption(
+        "Builds scorecards in 32 small slices (Men/Women × profile × discipline) using `score_engine.py`. "
+        "This avoids the Supabase statement timeout that hits the all-in-one database RPC."
+    )
+    py_clear = st.checkbox("Clear existing scorecards before rebuild", value=True, key="py_scorecard_clear")
+    py_top_n = st.number_input("Top evidence rows per scorecard", min_value=1, max_value=10, value=int(TOP_SCORES_USED), step=1, key="py_scorecard_top_n")
+    py_save_mode = st.selectbox(
+        "Save mode",
+        ["slice", "bulk"],
+        index=0,
+        format_func=lambda x: "Slice-by-slice (safest)" if x == "slice" else "One bulk save (faster, larger writes)",
+        key="py_scorecard_save_mode",
+    )
 
-    fast_cols = st.columns([2, 1])
-    with fast_cols[0]:
-        if st.button("Build scorecards in database", type="primary", width="stretch"):
+    py_cols = st.columns([2, 1])
+    with py_cols[0]:
+        if st.button("Rebuild scorecards", type="primary", width="stretch", key="rebuild_scorecards_python"):
+            loader = loading_card("Loading scoring pool", "Fetching only the last 730 days of scoring_result_pool...")
+            try:
+                results = fetch_scoring_pool_for_scorecards(rebuild_date, lookback_days=MAX_SCORECARD_POOL_LOOKBACK_DAYS)
+            finally:
+                loader.empty()
+            if results.empty:
+                st.warning("No scoring pool rows found in the selected date window.")
+                st.stop()
+            st.info(f"Loaded {len(results):,} scoring-pool rows for rebuild.")
+            loader = loading_card("Building athlete scorecards", "Computing and saving scorecards in small batches...")
+            try:
+                logs = rebuild_athlete_scorecards_batched(
+                    results=results,
+                    as_of_ts=pd.Timestamp(rebuild_date),
+                    clear_first=bool(py_clear),
+                    top_n=int(py_top_n),
+                    save_mode=str(py_save_mode),
+                )
+            finally:
+                loader.empty()
+            st.success("Finished rebuilding athlete scorecards.")
+            display_table(
+                logs,
+                ["Gender", "Profile", "Discipline", "Scorecard Rows", "Evidence Rows", "Saved Scorecards", "Saved Evidence Rows", "Status", "Lookback Days"],
+                height=520,
+            )
+            clear_cache()
+    with py_cols[1]:
+        if st.button("Clear scorecards", width="stretch", key="clear_scorecards_python_page"):
+            try:
+                info = clear_scorecard_tables_for_rebuild()
+                clear_cache()
+                st.success(f"Cleared scorecard tables using {info.get('method', 'batch delete')}.")
+            except Exception as e:
+                st.error("Could not clear scorecard tables.")
+                st.exception(e)
+
+    st.markdown("---")
+    with st.expander("Advanced: database-side RPC rebuild", expanded=False):
+        st.caption(
+            "Optional. This runs entirely inside Supabase and can time out on large pools "
+            "(error 57014). Use the Python rebuild above unless you have increased the "
+            "database statement timeout and installed `build_scorecards_from_pool_rpc.sql`."
+        )
+        fast_clear = st.checkbox("Clear existing scorecards before rebuild", value=True, key="db_scorecard_clear")
+        fast_top_n = st.number_input("Top evidence rows per scorecard", min_value=1, max_value=10, value=int(TOP_SCORES_USED), step=1, key="db_scorecard_top_n")
+
+        if st.button("Build scorecards in database", width="stretch", key="rebuild_scorecards_db_rpc"):
             loader = loading_card("Building athlete scorecards", "Running database-side scorecard builder from scoring_result_pool...")
             try:
                 rpc_result = supabase.rpc("build_athlete_scorecards_from_pool", {
@@ -6765,35 +6971,15 @@ elif page == "Model Cache":
                     st.json(data or {})
             except Exception as e:
                 loader.empty()
-                st.error("Database-side scorecard rebuild failed. Make sure `build_scorecards_from_pool_rpc.sql` has been run in Supabase.")
+                err_text = str(e)
+                if "57014" in err_text or "statement timeout" in err_text.lower():
+                    st.error(
+                        "Database rebuild timed out. Supabase canceled the query because it ran longer than the "
+                        "project statement timeout. Use **Rebuild scorecards** above instead."
+                    )
+                else:
+                    st.error("Database-side scorecard rebuild failed. Make sure `build_scorecards_from_pool_rpc.sql` has been run in Supabase.")
                 st.exception(e)
-    with fast_cols[1]:
-        if st.button("Clear scorecards", width="stretch", key="clear_scorecards_fast_page"):
-            try:
-                info = clear_scorecard_tables_for_rebuild()
-                clear_cache()
-                st.success(f"Cleared scorecard tables using {info.get('method', 'batch delete')}.")
-            except Exception as e:
-                st.error("Could not clear scorecard tables.")
-                st.exception(e)
-
-    st.markdown("---")
-    with st.expander("Fallback: Python / Polars rebuild", expanded=False):
-        st.caption("Use this only if the database-side RPC fails or you need to compare outputs. It loads scoring_result_pool into Streamlit and can take longer.")
-        if st.button("Run fallback scorecard rebuild", width="stretch"):
-            results = load_table("scoring_result_pool")
-            overrides = load_table("race_overrides")
-            if results.empty:
-                st.warning("No scoring pool rows found.")
-                st.stop()
-            loader = loading_card("Building athlete scorecards", "Saving profile + discipline scores and top evidence rows into Supabase...")
-            try:
-                logs = rebuild_all_athlete_scorecards(results, overrides, pd.Timestamp(rebuild_date))
-            finally:
-                loader.empty()
-            st.success("Finished rebuilding athlete scorecards.")
-            display_table(logs, ["Gender", "Profile", "Discipline", "Scorecard Rows", "Evidence Rows", "Status", "rows_after_gender", "rows_after_family", "athletes_ranked"], height=520)
-            clear_cache()
 
     card_count = count_rows("athlete_scorecards") or 0
     evidence_count = count_rows("athlete_scorecard_evidence") or 0
