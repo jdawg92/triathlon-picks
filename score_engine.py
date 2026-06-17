@@ -44,7 +44,7 @@ PROFILES = [
 ]
 DISCIPLINES = ["overall", "swim", "bike", "run"]
 
-MODEL_ENGINE_VERSION = "score_engine_v8_split_longcourse_52w"
+MODEL_ENGINE_VERSION = "score_engine_v9_longcourse_overall_52w"
 
 DEFAULT_LOOKBACK_DAYS = 365
 FULL_IM_LOOKBACK_DAYS = 365
@@ -416,6 +416,16 @@ def _split_evidence_mask(df: pd.DataFrame, profile: str, discipline: str) -> pd.
     if profile in {"Long Course / 70.3 + T100", "Full IRONMAN"} and discipline in {"swim", "bike", "run"}:
         txt = _race_text(df)
         families = txt.map(_distance_family_from_text)
+        return families.isin({"long_middle", "full"})
+    return _profile_mask(df, profile)
+
+
+def _overall_evidence_mask(df: pd.DataFrame, profile: str) -> pd.Series:
+    """Eligible evidence rows for overall rankings with profile transfer."""
+    if df.empty:
+        return pd.Series([], dtype=bool, index=df.index)
+    if profile in {"Long Course / 70.3 + T100", "Full IRONMAN"}:
+        families = _race_text(df).map(_distance_family_from_text)
         return families.isin({"long_middle", "full"})
     return _profile_mask(df, profile)
 
@@ -819,7 +829,7 @@ def _group_top_scores(
             "confidence":          confidence,
             "last_race_name":      _clean(last.get("race_name")),
             "last_race_date":      last_race_date,
-            "computed_source":     f"score_engine_v8 - split-longcourse-52w - {gender} - {profile} - {discipline}",
+            "computed_source":     f"score_engine_v9 - longcourse-overall-52w - {gender} - {profile} - {discipline}",
             "raw":                 _json_row(raw),
         })
 
@@ -910,7 +920,7 @@ def build_scorecard_slice(
     lookback     = _lookback_days(profile)
     window_start = as_of - pd.Timedelta(days=lookback)
     gdf_base     = prep_df[prep_df["gender"] == gender].copy()
-    evidence_mask = _profile_mask(gdf_base, profile) if discipline == "overall" else _split_evidence_mask(gdf_base, profile, discipline)
+    evidence_mask = _overall_evidence_mask(gdf_base, profile) if discipline == "overall" else _split_evidence_mask(gdf_base, profile, discipline)
     pdf = gdf_base[
         gdf_base["race_date"].notna()
         & (gdf_base["race_date"] >= window_start)
@@ -995,5 +1005,6 @@ def build_all_scorecards(
                 logs.append(log)
 
     return pd.DataFrame(cards), pd.DataFrame(evidence), pd.DataFrame(logs)
+
 
 

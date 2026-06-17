@@ -348,7 +348,7 @@ This means one outstanding race still shows as high ceiling evidence, but it no 
 Use the current scorecard model version consistently across app, engine, scorecards, evidence, and dashboard filters:
 
 ```text
-score_engine_v8_split_longcourse_52w
+score_engine_v9_longcourse_overall_52w
 ```
 
 If this changes, rebuild all scorecards and ensure dashboard filters are updated to the same version.
@@ -471,7 +471,7 @@ If it loads around 1,000 rows, pagination is broken or the deployed file is stal
 Make sure all references use the same version:
 
 ```text
-score_engine_v8_split_longcourse_52w
+score_engine_v9_longcourse_overall_52w
 ```
 
 Check:
@@ -537,6 +537,7 @@ When editing the app:
 - Keep old manual/CSV tables out of the new scoring model path.
 - Prefer stable IDs over names.
 - Make scorecard rankings explainable through evidence rows.
+
 
 
 

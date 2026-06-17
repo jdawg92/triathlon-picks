@@ -83,7 +83,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v8_split_longcourse_52w"
+MODEL_CACHE_VERSION = "score_engine_v9_longcourse_overall_52w"
 TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4079,7 +4079,8 @@ def humanize_dataframe_for_display(show: pd.DataFrame) -> pd.DataFrame:
         "dominance_score", "raw_score", "sof_cap", "field_cap", "race_type_cap",
         "final_cap", "SOF", "ORS", "Score", "OpenRank Score",
         "OpenRank Split Score", "Current Year Races", "Current Year Scored", "split_openrank_score", "openrank_position_score",
-        "openrank_sof_score", "openrank_time_score", "baseline_split"
+        "openrank_sof_score", "openrank_time_score", "baseline_split", "Race Pick Score",
+        "Race Evidence Score", "Race Performance Score", "Performance Score", "Performance Split Score",
     ]
     for col in numeric_cols:
         if col in show.columns:
@@ -4189,7 +4190,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v8_split_longcourse_52w"
+MODEL_CACHE_VERSION = "score_engine_v9_longcourse_overall_52w"
 TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4726,7 +4727,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "score_engine_v8_split_longcourse_52w"
+MODEL_CACHE_VERSION = "score_engine_v9_longcourse_overall_52w"
 TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -5222,7 +5223,62 @@ def missing_scorecards_for_startlist(scorecard: pd.DataFrame, start_athletes: pd
     return pd.DataFrame(missing)
 
 
-def race_pick_score_from_scorecard_row(row: pd.Series, section: str) -> float:
+def race_evidence_family(value: Any) -> str:
+    txt = clean_str(value).lower()
+    if re.search(r"\b140\.6\b|full ironman|\bfull\b", txt) or ("ironman" in txt and "70.3" not in txt and "t100" not in txt and "pto" not in txt):
+        return "full"
+    if re.search(r"70\.3|middle|challenge|t100|pto|100k|100 km|100km", txt):
+        return "long_middle"
+    if re.search(r"wtcs|world triathlon|olympic|sprint|continental cup|triathlon cup", txt):
+        return "short"
+    return "unknown"
+
+
+def race_overall_evidence_weight(family: str, profile: str) -> float:
+    if profile == "Long Course / 70.3 + T100":
+        return {"long_middle": 1.0, "full": 0.80}.get(family, 0.0)
+    if profile == "Full IRONMAN":
+        return {"full": 1.0, "long_middle": 0.78}.get(family, 0.0)
+    if profile == "Short Course / WTCS":
+        return {"short": 1.0, "long_middle": 0.45}.get(family, 0.0)
+    return 1.0
+
+
+def race_overall_scores_from_evidence(row: pd.Series, profile: str) -> Tuple[Optional[float], Optional[float], str]:
+    evidence = row.get("Score Evidence")
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence)
+        except Exception:
+            evidence = []
+    if not isinstance(evidence, list):
+        return None, None, ""
+
+    vals: List[float] = []
+    for ev in evidence:
+        if not isinstance(ev, dict):
+            continue
+        race_text = " ".join([clean_str(ev.get("Race")), clean_str(ev.get("Race Type"))])
+        family = race_evidence_family(race_text)
+        weight = race_overall_evidence_weight(family, profile)
+        if weight <= 0:
+            continue
+        base = safe_float(ev.get("Evidence Score")) or safe_float(ev.get("ORS"))
+        if base is None or base <= 0:
+            continue
+        vals.append(float(base) * float(weight))
+
+    vals = sorted(vals, reverse=True)[:TOP_SCORES_USED]
+    if not vals:
+        return None, None, ""
+    padded = vals + [0.0] * max(0, TOP_SCORES_USED - len(vals))
+    ranking_score = float(sum(padded[:TOP_SCORES_USED]) / TOP_SCORES_USED)
+    performance_score = float(np.mean(vals))
+    score_text = ", ".join(f"{x:.1f}" for x in padded[:TOP_SCORES_USED])
+    return ranking_score, performance_score, score_text
+
+
+def race_pick_score_from_scorecard_row(row: pd.Series, section: str, race_profile: str = "") -> float:
     """Race-analysis score: ceiling-weighted, but still sample-aware.
 
     Athlete Rankings use the strict OpenRank-style best-4 denominator. Race
@@ -5233,6 +5289,12 @@ def race_pick_score_from_scorecard_row(row: pd.Series, section: str) -> float:
     ranking_score = safe_float(row.get("Score")) or 0.0
     perf_col = "Performance Score" if section == "overall" else "Performance Split Score"
     performance_score = safe_float(row.get(perf_col))
+    if section == "overall" and race_profile:
+        evidence_rank, evidence_perf, _evidence_text = race_overall_scores_from_evidence(row, race_profile)
+        if evidence_rank is not None:
+            ranking_score = evidence_rank
+        if evidence_perf is not None:
+            performance_score = evidence_perf
     if performance_score is None:
         performance_score = ranking_score
 
@@ -5258,7 +5320,7 @@ def race_pick_score_from_scorecard_row(row: pd.Series, section: str) -> float:
     return round(float(max(0.0, min(score, 100.0))), 1)
 
 
-def filter_scorecard_to_startlist(scorecard: pd.DataFrame, start_athletes: pd.DataFrame, section: str) -> pd.DataFrame:
+def filter_scorecard_to_startlist(scorecard: pd.DataFrame, start_athletes: pd.DataFrame, section: str, race_profile: str = "") -> pd.DataFrame:
     """Join a global scorecard to the selected start list.
 
     Only scored athletes are returned here. Missing athletes are handled in a separate
@@ -5280,7 +5342,12 @@ def filter_scorecard_to_startlist(scorecard: pd.DataFrame, start_athletes: pd.Da
     out = out[out["Score"] > 0].copy()
     if out.empty:
         return out
-    out["Race Pick Score"] = out.apply(lambda r: race_pick_score_from_scorecard_row(r, section), axis=1)
+    if section == "overall" and race_profile:
+        derived = out.apply(lambda r: race_overall_scores_from_evidence(r, race_profile), axis=1)
+        out["Race Evidence Score"] = [round(x[0], 1) if x[0] is not None else None for x in derived]
+        out["Race Performance Score"] = [round(x[1], 1) if x[1] is not None else None for x in derived]
+        out["Race Evidence Scores"] = [x[2] for x in derived]
+    out["Race Pick Score"] = out.apply(lambda r: race_pick_score_from_scorecard_row(r, section, race_profile), axis=1)
     out = out.sort_values(["Race Pick Score", "Score"], ascending=[False, False]).reset_index(drop=True)
     if "Rank" in out.columns:
         out = out.drop(columns=["Rank"])
@@ -5859,11 +5926,13 @@ def build_race_prediction_from_scorecard_tables(starts: pd.DataFrame, selected_r
         "missing_scorecards": {},
     }
     for discipline in SCORECARD_DISCIPLINES:
-        scorecard, smeta = load_athlete_scorecard_display(selected_gender, profile, discipline, None)
+        source_profile = profile
+        scorecard, smeta = load_athlete_scorecard_display(selected_gender, source_profile, discipline, None)
         meta[f"{discipline}_scorecard_rows"] = int(len(scorecard)) if scorecard is not None else 0
+        meta[f"{discipline}_source_profile"] = source_profile
         if smeta.get("as_of_date"):
             meta[f"{discipline}_as_of_date"] = smeta.get("as_of_date")
-        selected = filter_scorecard_to_startlist(scorecard, start_athletes, discipline)
+        selected = filter_scorecard_to_startlist(scorecard, start_athletes, discipline, profile)
         missing_df = missing_scorecards_for_startlist(scorecard, start_athletes, discipline)
         meta[f"{discipline}_matched"] = int(len(selected))
         meta[f"{discipline}_missing_count"] = int(len(missing_df))
@@ -5925,7 +5994,7 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
 
     section_title("🏆", "Overall Picks")
     overall = _positive_score_rows(cached_section(cached_df, "overall"))
-    display_table(overall.head(20), ["Rank", "Athlete", "Race Pick Score", "Score", "Performance Score", "OpenRank Score", "Best Scores Used", "Best Scores Padded", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date"])
+    display_table(overall.head(20), ["Rank", "Athlete", "Race Pick Score", "Race Evidence Score", "Race Performance Score", "Race Evidence Scores", "Score", "Performance Score", "OpenRank Score", "Best Scores Used", "Best Scores Padded", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date"])
     render_score_evidence(overall, "Overall score evidence", limit=8)
     _render_missing_scorecards(params, "overall")
 
@@ -8518,6 +8587,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                             ["race_date", "race_name", "race_type", "distance", "place", "status", "gender", "sof", "sof_source", "ors", f"{disc}_split", "Has Split", "Profile Eligible", "Inside 52 Weeks", "Gender Compatible", "Why Not Used", "swim_seconds", "bike_seconds", "run_seconds"],
                             height=420,
                         )
+
 
 
 
