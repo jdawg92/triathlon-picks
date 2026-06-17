@@ -6351,6 +6351,48 @@ elif page == "Import CSVs":
             key="clear_scoring_pool_first",
         )
 
+
+        st.markdown("#### Fast database build")
+        st.caption("Recommended for large batches. Supabase builds the scoring pool inside the database instead of sending every row through Streamlit.")
+        if st.button("Build scoring pool in database", type="primary", key="build_scoring_pool_rpc"):
+            loader = loading_card("Building scoring pool", "Running server-side database build...")
+            try:
+                rpc_res = supabase.rpc(
+                    "build_scoring_result_pool_from_cache",
+                    {
+                        "p_offset": int(pool_offset),
+                        "p_limit": int(pool_limit),
+                        "p_as_of_date": str(pool_as_of),
+                        "p_lookback_days": int(pool_lookback),
+                        "p_clear": bool(clear_pool_first),
+                        "p_dry_run": pool_mode != "Write",
+                    },
+                ).execute()
+                payload = rpc_res.data or {}
+            except Exception as e:
+                payload = None
+                st.error("Database scoring-pool build failed. Make sure build_scoring_pool_rpc.sql has been run in Supabase.")
+                st.exception(e)
+            finally:
+                loader.empty()
+            if payload:
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("Source rows read", f"{int(payload.get('source_rows_read') or 0):,}")
+                r2.metric("Pool rows ready", f"{int(payload.get('pool_rows_ready') or 0):,}")
+                r3.metric("Rows affected", f"{int(payload.get('rows_affected') or 0):,}")
+                r4.metric("Missing SOF", f"{int(payload.get('missing_sof_rows') or 0):,}")
+                st.info(f"Next cached result offset: {int(payload.get('next_offset') or 0):,}")
+                if payload.get("done"):
+                    st.success("Scoring pool build is complete for the cached result set.")
+                elif pool_mode == "Write":
+                    st.success("Batch written. Continue with the next offset shown above.")
+                else:
+                    st.success("Preview complete. No scoring-pool rows were written.")
+                with st.expander("Build details", expanded=False):
+                    st.json(payload)
+
+        st.markdown("#### Legacy Streamlit build")
+
         if st.button("Build scoring pool batch", type="primary", key="build_scoring_pool_batch"):
             try:
                 cached_rows = load_trinews_results_batch(int(pool_offset), int(pool_limit))
