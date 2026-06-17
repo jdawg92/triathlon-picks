@@ -28,10 +28,13 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "scorecard_tables_v7_no_zero_padding"
+MODEL_CACHE_VERSION = "scorecard_tables_v8_full_im_lookback"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
+DEFAULT_SCORECARD_LOOKBACK_DAYS = 365
+FULL_IM_SCORECARD_LOOKBACK_DAYS = 730
+ALL_PROFILE_SCORECARD_LOOKBACK_DAYS = 730
 
 
 # ============================================================
@@ -3704,7 +3707,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "scorecard_tables_v7_no_zero_padding"
+MODEL_CACHE_VERSION = "scorecard_tables_v8_full_im_lookback"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4246,11 +4249,26 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "scorecard_tables_v7_no_zero_padding"
+MODEL_CACHE_VERSION = "scorecard_tables_v8_full_im_lookback"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
+# Full-distance athletes race less often, so Full IRONMAN scorecards use a longer
+# evidence window than 70.3/T100 or short course. Top scores used still means
+# "up to 5 best eligible scores"; missing slots are never padded with 0.0.
+DEFAULT_SCORECARD_LOOKBACK_DAYS = 365
+FULL_IM_SCORECARD_LOOKBACK_DAYS = 730
+ALL_PROFILE_SCORECARD_LOOKBACK_DAYS = 730
 RANKING_FAMILIES = ["Long Course / 70.3 + T100", "Short Course / WTCS", "Full IRONMAN", "All"]
+
+
+def scorecard_lookback_days(profile: str) -> int:
+    profile = clean_str(profile) or ""
+    if profile == "Full IRONMAN":
+        return FULL_IM_SCORECARD_LOOKBACK_DAYS
+    if profile == "All":
+        return ALL_PROFILE_SCORECARD_LOOKBACK_DAYS
+    return DEFAULT_SCORECARD_LOOKBACK_DAYS
 
 
 def scorecard_profile_from_race(race_name: Any, race_type: Any = None, distance: Any = None) -> str:
@@ -4354,13 +4372,14 @@ def score_overall(
     target_date: pd.Timestamp,
     target_year: int,
     top_n: int,
+    lookback_days: int = DEFAULT_SCORECARD_LOOKBACK_DAYS,
 ) -> pd.DataFrame:
     if results is None or results.empty or start_athletes is None or start_athletes.empty:
         return pd.DataFrame()
     start_urls = set(start_athletes.get("athlete_url", pd.Series(dtype=str)).dropna().astype(str).tolist())
     start_names = set(start_athletes.get("athlete_name", pd.Series(dtype=str)).dropna().astype(str).str.lower().tolist())
     df = results.copy()
-    window_start = pd.to_datetime(target_date) - pd.Timedelta(days=365)
+    window_start = pd.to_datetime(target_date) - pd.Timedelta(days=int(lookback_days or DEFAULT_SCORECARD_LOOKBACK_DAYS))
     df = df[(df["race_date"].notna()) & (df["race_date"] >= window_start) & (df["race_date"] <= target_date) & (~df["bad_status"])]
     df = df[(df["athlete_url"].isin(start_urls)) | (df["athlete_name"].fillna("").str.lower().isin(start_names))]
     df = df[df["ors"].notna()].copy()
@@ -4422,6 +4441,7 @@ def score_splits_for_start_list(
     target_date: pd.Timestamp,
     top_n: int,
     strong_sof_threshold: float,
+    lookback_days: int = DEFAULT_SCORECARD_LOOKBACK_DAYS,
 ) -> pd.DataFrame:
     if audit is None or audit.empty:
         return pd.DataFrame()
@@ -4433,7 +4453,7 @@ def score_splits_for_start_list(
     if df.empty:
         return pd.DataFrame()
     discipline = clean_str(df["discipline"].dropna().iloc[0]) if "discipline" in df.columns and df["discipline"].notna().any() else "swim"
-    window_start = pd.to_datetime(target_date) - pd.Timedelta(days=365)
+    window_start = pd.to_datetime(target_date) - pd.Timedelta(days=int(lookback_days or DEFAULT_SCORECARD_LOOKBACK_DAYS))
     df = df[(df["race_date"].notna()) & (df["race_date"] >= window_start) & (df["race_date"] <= target_date)].copy()
     if df.empty:
         return pd.DataFrame()
@@ -4612,7 +4632,7 @@ def _parse_best_scores(value: Any) -> List[float]:
     out = []
     for v in vals:
         fv = safe_float(v)
-        if fv is not None:
+        if fv is not None and float(fv) > 0:
             out.append(round(float(fv), 3))
     return out
 
@@ -4647,7 +4667,8 @@ def build_athlete_ranking_result(
         return pd.DataFrame(), {"rows_after_gender": 0, "rows_after_family": 0, "athletes_ranked": 0}
 
     year = int(pd.to_datetime(as_of_ts).year)
-    window_start_rank = pd.Timestamp(date(year - 2, 1, 1))
+    lookback_days = scorecard_lookback_days(race_family)
+    window_start_rank = pd.to_datetime(as_of_ts) - pd.Timedelta(days=lookback_days)
     ranking_results = results[(results["race_date"].notna()) & (results["race_date"] >= window_start_rank) & (results["race_date"] <= as_of_ts)].copy()
     pre_gender_count = len(ranking_results)
     ranking_results = filter_rankings_by_gender(ranking_results, gender)
@@ -4659,6 +4680,7 @@ def build_athlete_ranking_result(
         "rows_after_gender": int(post_gender_count),
         "rows_after_family": int(len(ranking_results)),
         "athletes_ranked": 0,
+        "lookback_days": int(lookback_days),
     }
     if ranking_results.empty:
         return pd.DataFrame(), metrics
@@ -4670,10 +4692,10 @@ def build_athlete_ranking_result(
     metrics["athletes_ranked"] = int(start_all["athlete_name"].nunique())
 
     if view_kind == "overall":
-        out = score_overall(ranking_results, start_all, overrides, as_of_ts, year, top_n)
+        out = score_overall(ranking_results, start_all, overrides, as_of_ts, year, top_n, lookback_days=lookback_days)
     else:
         aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, normalize_gender(gender) or gender, view_kind, min_field_size=LOW_SAMPLE_WARNING_THRESHOLD)
-        out = score_splits_for_start_list(aud, start_all, as_of_ts, top_n, strong_sof_threshold=STRONG_SOF_THRESHOLD)
+        out = score_splits_for_start_list(aud, start_all, as_of_ts, top_n, strong_sof_threshold=STRONG_SOF_THRESHOLD, lookback_days=lookback_days)
     if not out.empty:
         out["Cache View"] = view_kind
         out["Gender"] = gender
