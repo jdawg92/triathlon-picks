@@ -244,6 +244,55 @@ def apply_dashboard_theme() -> None:
             font-size: 0.98rem;
         }
 
+        .tri-hero.compact {
+            padding: 0.9rem 1.1rem;
+            border-radius: 1rem;
+            margin: 0.15rem 0 0.85rem 0;
+        }
+
+        .tri-hero.compact h1 {
+            font-size: 1.55rem;
+        }
+
+        .tri-hero.compact p {
+            display: none;
+        }
+
+        .tri-selected-strip {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.55rem;
+            padding: 0.7rem 0.8rem;
+            border-radius: 0.85rem;
+            border: 1px solid var(--tri-border);
+            background: rgba(15, 23, 42, 0.66);
+            margin: 0.45rem 0 0.8rem 0;
+        }
+
+        .tri-selected-strip .race {
+            color: var(--tri-text);
+            font-weight: 900;
+            font-size: 0.95rem;
+        }
+
+        .tri-selected-strip .meta {
+            color: var(--tri-muted);
+            font-size: 0.82rem;
+            font-weight: 720;
+        }
+
+        .tri-prediction-strip {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.5rem;
+            color: var(--tri-muted);
+            font-size: 0.84rem;
+            font-weight: 760;
+            margin: 0.2rem 0 0.7rem 0;
+        }
+
         .tri-race-card,
         [data-testid="stMetric"],
         div[data-testid="stExpander"] {
@@ -657,9 +706,10 @@ def apply_dashboard_theme() -> None:
 
 
 def render_app_hero(page_name: str) -> None:
+    compact = " compact" if page_name == "Race Dashboard" else ""
     st.markdown(
         f"""
-        <div class="tri-hero">
+        <div class="tri-hero{compact}">
             <div class="eyebrow">Triathlon Picks Lab</div>
             <h1>🏁 {page_name}</h1>
             <p>Race predictions, split picks, evidence drilldowns, and scoring audits powered by Supabase.</p>
@@ -6326,6 +6376,10 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
             continue
         for _, r in section_df.iterrows():
             rank = parse_int(r.get("Rank")) or 999
+            if section == "overall" and rank <= 5:
+                continue
+            if section in {"swim", "bike", "run"} and rank <= 1:
+                continue
             evidence_count = parse_int(r.get("Evidence Count")) or 0
             race_pick = safe_float(r.get("Race Pick Score")) or 0.0
             ranking_score = safe_float(r.get("Score")) or 0.0
@@ -6559,14 +6613,24 @@ def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
 def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional[Dict[str, Any]] = None) -> None:
     params = (cache_meta or {}).get("params", {}) if isinstance(cache_meta, dict) else {}
     computed_at = (cache_meta or {}).get("computed_at") if isinstance(cache_meta, dict) else None
-    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 0.8])
-    c1.metric("Scored rows", f"{len(cached_df) if cached_df is not None else 0:,}")
-    c2.metric("Start athletes", params.get("start_list_athletes", "—"))
-    c3.metric("Profile", params.get("prediction_scope", "—"))
-    c4.metric("Scorecards as of", clean_str(computed_at)[:19] if computed_at else "—")
-    with c5:
+    s1, s2 = st.columns([4, 0.9])
+    with s1:
+        st.markdown(
+            f"""
+            <div class="tri-prediction-strip">
+                <span>{len(cached_df) if cached_df is not None else 0:,} scored rows</span>
+                <span>|</span>
+                <span>{params.get("start_list_athletes", "-")} starters</span>
+                <span>|</span>
+                <span>{html.escape(clean_str(params.get("prediction_scope", "-")))}</span>
+                <span>|</span>
+                <span>Scorecards {html.escape(clean_str(computed_at)[:10] if computed_at else "-")}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with s2:
         pro_mode = st.toggle("Pro Mode", value=False, key="race_analysis_pro_mode", help="Show scoring diagnostics, evidence counts, and padded score columns.")
-    st.info("Fast mode: showing saved athlete scorecards joined to this start list. Missing/no-evidence athletes are shown in separate expanders instead of polluting the pick tables with 0.0 rows.")
     cached_df = prepare_cached_race_prediction_display(cached_df)
 
     section_title("🏆", "Overall Picks")
@@ -8887,14 +8951,12 @@ elif page in {"Race Dashboard", "Split Audit"}:
             axis=1,
         )
 
-        section_title("Race", "Choose Race")
-        with st.container(border=True):
-            f1, f2, f3 = st.columns([1.05, 1.15, 2.8])
-            gender_choices = ["All"] + [g for g in ["Men", "Women"] if g in set(race_options_df["gender"].dropna().astype(str))]
-            dash_gender_filter = f1.selectbox("Gender", gender_choices, index=0, key="dashboard_race_gender_filter")
-            profile_choices = ["All"] + sorted([p for p in race_options_df["profile"].dropna().unique().tolist() if p])
-            dash_profile_filter = f2.selectbox("Profile", profile_choices, index=0, key="dashboard_race_profile_filter")
-            dash_search = f3.text_input("Search race", value="", placeholder="Search race, date, series, or location...", key="dashboard_race_search")
+        f1, f2, f3 = st.columns([0.9, 1.0, 2.7])
+        gender_choices = ["All"] + [g for g in ["Men", "Women"] if g in set(race_options_df["gender"].dropna().astype(str))]
+        dash_gender_filter = f1.selectbox("Gender", gender_choices, index=0, key="dashboard_race_gender_filter")
+        profile_choices = ["All"] + sorted([p for p in race_options_df["profile"].dropna().unique().tolist() if p])
+        dash_profile_filter = f2.selectbox("Profile", profile_choices, index=0, key="dashboard_race_profile_filter")
+        dash_search = f3.text_input("Search race", value="", placeholder="Search race, date, series, or location...", key="dashboard_race_search")
 
         filtered_races = race_options_df.copy()
         if dash_gender_filter != "All":
@@ -8932,13 +8994,26 @@ elif page in {"Race Dashboard", "Split Audit"}:
             else:
                 default_index = max(0, len(filtered_labels) - 1)
 
-        selected_label = st.selectbox(
-            "Race to analyze",
-            filtered_labels,
-            index=default_index,
-            key="dashboard_selected_race_picker",
-            format_func=lambda x: label_to_picker.get(x, x),
-        )
+        if hasattr(st, "pills"):
+            selected_label = st.pills(
+                "Race to analyze",
+                filtered_labels,
+                default=filtered_labels[default_index],
+                key="dashboard_selected_race_picker",
+                format_func=lambda x: label_to_picker.get(x, x),
+                width="stretch",
+            )
+            if selected_label is None:
+                selected_label = filtered_labels[default_index]
+        else:
+            selected_label = st.radio(
+                "Race to analyze",
+                filtered_labels,
+                index=default_index,
+                key="dashboard_selected_race_picker",
+                format_func=lambda x: label_to_picker.get(x, x),
+                horizontal=False,
+            )
         st.session_state["dashboard_selected_race_label"] = selected_label
         selected_preview = filtered_races[filtered_races["label"] == selected_label].iloc[0]
         st.caption(
@@ -8974,13 +9049,24 @@ elif page in {"Race Dashboard", "Split Audit"}:
 
     prediction_scope = prediction_scope_from_race(selected_race, None, None)
 
-    render_race_card(selected_race, selected_gender, selected_date, window_start)
+    if page == "Race Dashboard":
+        st.markdown(
+            f"""
+            <div class="tri-selected-strip">
+                <span class="race">{html.escape(clean_str(selected_race))}</span>
+                <span class="meta">{html.escape(clean_str(selected_gender))} | {format_date(selected_date)} | {len(start_athletes):,} athletes | {html.escape(clean_str(prediction_scope))}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        render_race_card(selected_race, selected_gender, selected_date, window_start)
 
 
     if page == "Race Dashboard":
         table_prediction, table_meta = build_race_prediction_from_scorecard_tables(starts, selected_race, selected_date, selected_gender)
         if table_prediction is not None and not table_prediction.empty:
-            st.success("Loaded prediction from athlete_scorecards without scanning raw result tables.")
+            st.caption("Loaded saved prediction from athlete_scorecards.")
             display_cached_race_prediction(table_prediction, {"params": table_meta, "computed_at": max([v for k, v in table_meta.items() if k.endswith("_as_of_date")], default="")})
         else:
             st.warning("No saved scorecard prediction found for this race/profile. Rebuild athlete scorecards in ⚡ Model Cache after importing results or fixing athlete genders.")
