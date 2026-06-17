@@ -1423,6 +1423,58 @@ def fetch_scoring_pool_for_scorecards(
     return pd.DataFrame(all_rows)
 
 
+def fetch_scoring_pool_for_gender_window(
+    as_of_date: Any,
+    gender: str,
+    lookback_days: int = MAX_SCORECARD_POOL_LOOKBACK_DAYS,
+    page_size: int = 1000,
+) -> pd.DataFrame:
+    """Load a gender/date slice of scoring_result_pool for fast test rebuilds."""
+    as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
+    if pd.isna(as_of_ts):
+        as_of_ts = pd.Timestamp.today().normalize()
+    cutoff = (as_of_ts - pd.Timedelta(days=int(lookback_days or MAX_SCORECARD_POOL_LOOKBACK_DAYS))).strftime("%Y-%m-%d")
+    as_of_label = as_of_ts.strftime("%Y-%m-%d")
+    gender_norm = normalize_gender(gender) or gender
+
+    all_rows: List[Dict[str, Any]] = []
+    start = 0
+    page_size = max(100, min(int(page_size), 1000))
+    while True:
+        end = start + page_size - 1
+        q = (
+            supabase.table("scoring_result_pool")
+            .select(SCORING_POOL_SCORECARD_COLUMNS)
+            .gte("race_date", cutoff)
+            .lte("race_date", as_of_label)
+            .order("race_date", desc=False)
+            .range(start, end)
+        )
+        if gender_norm:
+            q = q.eq("gender", gender_norm)
+        try:
+            res = q.execute()
+            rows = res.data or []
+        except Exception:
+            q = (
+                supabase.table("scoring_result_pool")
+                .select("*")
+                .gte("race_date", cutoff)
+                .lte("race_date", as_of_label)
+                .order("race_date", desc=False)
+                .range(start, end)
+            )
+            if gender_norm:
+                q = q.eq("gender", gender_norm)
+            res = q.execute()
+            rows = res.data or []
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        start += page_size
+    return pd.DataFrame(all_rows)
+
+
 def fetch_all_filtered(table_name: str, filters: Tuple[Tuple[str, Any], ...], select: str = "*", page_size: int = 1000) -> List[Dict[str, Any]]:
     """Fetch rows with simple equality filters using pagination.
 
@@ -4864,6 +4916,143 @@ def _startlist_identity_sets(start_athletes: pd.DataFrame) -> Tuple[set, set, Di
     return urls, names, name_by_url
 
 
+def _filter_score_engine_rows_to_startlist(rows: List[Dict[str, Any]], start_athletes: pd.DataFrame) -> List[Dict[str, Any]]:
+    if not rows or start_athletes is None or start_athletes.empty:
+        return []
+    urls, names, _ = _startlist_identity_sets(start_athletes)
+    urls = {canonical_athlete_url(u) or clean_str(u) for u in urls if clean_str(u)}
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        u = canonical_athlete_url(row.get("athlete_url")) or clean_str(row.get("athlete_url"))
+        n = clean_str(row.get("athlete_name")).lower()
+        if (u and u in urls) or (n and n in names):
+            out.append(row)
+    return out
+
+
+def _rank_scorecard_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows = sorted(rows or [], key=lambda r: (-(safe_float(r.get("score")) or 0.0), clean_str(r.get("athlete_name"))))
+    for idx, row in enumerate(rows, start=1):
+        row["rank"] = idx
+    return rows
+
+
+def _delete_scorecard_rows_for_athletes(
+    gender: str,
+    profile: str,
+    discipline: str,
+    as_of_ts: pd.Timestamp,
+    start_athletes: pd.DataFrame,
+) -> None:
+    """Delete only selected athletes from one scorecard slice."""
+    as_of_label = iso_date(as_of_ts)
+    gender_norm = normalize_gender(gender) or gender
+    urls, names, _ = _startlist_identity_sets(start_athletes)
+    urls = sorted([canonical_athlete_url(u) or clean_str(u) for u in urls if clean_str(u)])
+    names = sorted({
+        clean_str(r.get("athlete_name"))
+        for _, r in start_athletes.iterrows()
+        if clean_str(r.get("athlete_name"))
+    })
+
+    def delete_chunk(table_name: str, col: str, values: List[str]) -> None:
+        for i in range(0, len(values), 100):
+            chunk = values[i:i + 100]
+            if not chunk:
+                continue
+            (
+                supabase.table(table_name)
+                .delete()
+                .eq("model_version", MODEL_CACHE_VERSION)
+                .eq("as_of_date", as_of_label)
+                .eq("gender", gender_norm)
+                .eq("profile", profile)
+                .eq("discipline", discipline)
+                .in_(col, chunk)
+                .execute()
+            )
+
+    for table_name in ["athlete_scorecard_evidence", "athlete_scorecards"]:
+        if urls:
+            delete_chunk(table_name, "athlete_url", urls)
+        if names:
+            delete_chunk(table_name, "athlete_name", names)
+
+
+def rebuild_startlist_scorecards_for_testing(
+    pool_rows: pd.DataFrame,
+    start_athletes: pd.DataFrame,
+    gender: str,
+    profile: str,
+    as_of_ts: pd.Timestamp,
+    top_n: int = TOP_SCORES_USED,
+) -> pd.DataFrame:
+    """Fast test rebuild for one selected race/start-list profile.
+
+    This intentionally updates only the start-list athletes for the chosen
+    gender/profile. It is meant for quick model testing, not for publishing a
+    full global ranking refresh.
+    """
+    if build_scorecard_slice is None or prep_score_results is None:
+        raise RuntimeError(f"score_engine.py could not be imported: {SCORE_ENGINE_IMPORT_ERROR}")
+    ensure_scorecard_tables()
+
+    as_of_ts = pd.to_datetime(as_of_ts, errors="coerce")
+    if pd.isna(as_of_ts):
+        as_of_ts = pd.Timestamp.today().normalize()
+    gender_norm = normalize_gender(gender) or gender
+    if pool_rows is None or pool_rows.empty:
+        return pd.DataFrame([{"Status": "empty scoring pool"}])
+    if start_athletes is None or start_athletes.empty:
+        return pd.DataFrame([{"Status": "empty start list"}])
+
+    progress = st.progress(0, text="Preparing scoped scorecard rebuild...")
+    prep_df = prep_score_results(pool_rows)
+    logs: List[Dict[str, Any]] = []
+    total_cards = 0
+    total_evidence = 0
+
+    for idx, discipline in enumerate(SCORE_ENGINE_DISCIPLINES, start=1):
+        progress.progress(0.10 + 0.75 * ((idx - 1) / max(len(SCORE_ENGINE_DISCIPLINES), 1)), text=f"Building {discipline} scorecards for selected start list...")
+        cards, evidence, log = build_scorecard_slice(
+            prep_df=prep_df,
+            gender=gender_norm,
+            profile=profile,
+            discipline=discipline,
+            as_of_date=as_of_ts,
+            model_version=MODEL_CACHE_VERSION,
+            top_n=int(top_n),
+        )
+        cards = _rank_scorecard_rows(_filter_score_engine_rows_to_startlist(cards, start_athletes))
+        evidence = _filter_score_engine_rows_to_startlist(evidence, start_athletes)
+
+        _delete_scorecard_rows_for_athletes(gender_norm, profile, discipline, as_of_ts, start_athletes)
+
+        card_rows = cache_safe_rows(pd.DataFrame(cards)) if cards else []
+        evidence_rows = cache_safe_rows(pd.DataFrame(evidence)) if evidence else []
+        if card_rows:
+            insert_chunks("athlete_scorecards", card_rows, chunk_size=500)
+        if evidence_rows:
+            insert_chunks("athlete_scorecard_evidence", evidence_rows, chunk_size=500)
+
+        log["Model Version"] = MODEL_CACHE_VERSION
+        log["Saved Scorecards"] = len(card_rows)
+        log["Saved Evidence Rows"] = len(evidence_rows)
+        log["Rebuild Scope"] = "selected start list"
+        logs.append(log)
+        total_cards += len(card_rows)
+        total_evidence += len(evidence_rows)
+
+    clear_cache()
+    progress.progress(1.0, text="Scoped scorecard rebuild complete.")
+    progress.empty()
+    logs_df = pd.DataFrame(logs)
+    if not logs_df.empty:
+        logs_df["Total Saved Scorecards"] = total_cards
+        logs_df["Total Saved Evidence Rows"] = total_evidence
+    return logs_df
+
+
 def missing_scorecards_for_startlist(scorecard: pd.DataFrame, start_athletes: pd.DataFrame, section: str) -> pd.DataFrame:
     """Return start-list athletes that do not have a saved positive scorecard row."""
     if start_athletes is None or start_athletes.empty:
@@ -7506,6 +7695,83 @@ elif page == "Model Cache":
         st.stop()
 
     rebuild_date = st.date_input("Scorecards as of", value=date.today(), key="scorecards_asof")
+
+    st.subheader("Fast testing rebuild")
+    st.caption(
+        "Use this while tuning the model. It rebuilds only one selected start list "
+        "for the matching gender/profile across overall, swim, bike, and run."
+    )
+    starts_light = load_start_lists_light()
+    if starts_light.empty:
+        st.info("No start lists available for a scoped rebuild.")
+    else:
+        test_races = starts_light.dropna(subset=["race_name"]).copy()
+        test_races["race_date_label"] = test_races["race_date"].map(format_date)
+        test_races["profile"] = test_races["race_name"].map(lambda x: prediction_scope_from_race(x, None, None))
+        test_races["label"] = (
+            test_races["race_date_label"].fillna("")
+            + " | " + test_races["gender"].fillna("")
+            + " | " + test_races["profile"].fillna("")
+            + " | " + test_races["race_name"].fillna("")
+        )
+        test_races = test_races.drop_duplicates(subset=["race_name", "race_date", "gender", "label"]).sort_values(["race_date", "race_name", "gender"], na_position="last")
+        test_labels = test_races["label"].tolist()
+        t1, t2 = st.columns([3, 1])
+        selected_test_label = t1.selectbox("Start list to rebuild for testing", test_labels, index=max(0, len(test_labels) - 1), key="test_scorecard_race")
+        test_top_n = t2.number_input("Evidence rows", min_value=1, max_value=10, value=int(TOP_SCORES_USED), step=1, key="test_scorecard_top_n")
+
+        selected_test = test_races[test_races["label"] == selected_test_label].iloc[0]
+        test_race = selected_test["race_name"]
+        test_gender = selected_test["gender"]
+        test_date = selected_test["race_date"]
+        test_profile = selected_test["profile"]
+        test_start = starts_light[(starts_light["race_name"] == test_race) & (starts_light["gender"] == test_gender)].copy()
+        if pd.notna(test_date):
+            test_start = test_start[test_start["race_date"] == test_date]
+        test_start = dedupe_start_athletes(test_start)
+        st.caption(
+            f"Scope: {len(test_start):,} start-list athletes · {test_gender} · {test_profile}. "
+            "Only these athletes' rows are replaced for this as-of date/profile."
+        )
+
+        if st.button("Rebuild selected race scorecards", type="primary", width="stretch", key="rebuild_selected_race_scorecards"):
+            if test_start.empty:
+                st.warning("Selected start list has no athletes.")
+                st.stop()
+            loader = loading_card("Loading scoped scoring pool", f"Fetching {test_gender} rows for the recent model window...")
+            try:
+                scoped_pool = fetch_scoring_pool_for_gender_window(
+                    rebuild_date,
+                    gender=test_gender,
+                    lookback_days=MAX_SCORECARD_POOL_LOOKBACK_DAYS,
+                )
+            finally:
+                loader.empty()
+            if scoped_pool.empty:
+                st.warning("No scoring-pool rows found for this gender/date window.")
+                st.stop()
+            st.info(f"Loaded {len(scoped_pool):,} {test_gender} scoring-pool rows for the scoped test rebuild.")
+            loader = loading_card("Building scoped scorecards", "Replacing selected start-list athletes only...")
+            try:
+                logs = rebuild_startlist_scorecards_for_testing(
+                    pool_rows=scoped_pool,
+                    start_athletes=test_start,
+                    gender=test_gender,
+                    profile=test_profile,
+                    as_of_ts=pd.Timestamp(rebuild_date),
+                    top_n=int(test_top_n),
+                )
+            finally:
+                loader.empty()
+            st.success("Finished selected-race scorecard rebuild.")
+            display_table(
+                logs,
+                ["Gender", "Profile", "Discipline", "Rows After Profile", "Candidate Score Rows", "Saved Scorecards", "Saved Evidence Rows", "Status", "Rebuild Scope"],
+                height=300,
+            )
+            clear_cache()
+
+    st.markdown("---")
 
     st.subheader("Recommended: Python scorecard rebuild")
     st.caption(
