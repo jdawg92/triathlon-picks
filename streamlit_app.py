@@ -36,7 +36,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v1_fullim730"
+MODEL_CACHE_VERSION = "score_engine_v2_fast_fix"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -3715,7 +3715,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v1_fullim730"
+MODEL_CACHE_VERSION = "score_engine_v2_fast_fix"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4257,7 +4257,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "score_engine_v1_fullim730"
+MODEL_CACHE_VERSION = "score_engine_v2_fast_fix"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4609,6 +4609,15 @@ def scorecard_tables_ready() -> bool:
         return True
     except Exception:
         return False
+
+
+def ensure_scorecard_tables() -> None:
+    """Stop the rebuild with a clear message if scorecard tables are missing."""
+    if not scorecard_tables_ready():
+        raise RuntimeError(
+            "Missing scorecard tables. Run athlete_scorecard_tables.sql in Supabase, "
+            "then redeploy and try the rebuild again."
+        )
 
 
 def _delete_scorecard_combo(gender: str, profile: str, discipline: str, as_of_ts: pd.Timestamp) -> None:
