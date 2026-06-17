@@ -83,7 +83,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v9_longcourse_overall_52w"
+MODEL_CACHE_VERSION = "score_engine_v10_lc_full_overall_95"
 TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4190,7 +4190,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v9_longcourse_overall_52w"
+MODEL_CACHE_VERSION = "score_engine_v10_lc_full_overall_95"
 TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4727,7 +4727,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "score_engine_v9_longcourse_overall_52w"
+MODEL_CACHE_VERSION = "score_engine_v10_lc_full_overall_95"
 TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -5236,7 +5236,7 @@ def race_evidence_family(value: Any) -> str:
 
 def race_overall_evidence_weight(family: str, profile: str) -> float:
     if profile == "Long Course / 70.3 + T100":
-        return {"long_middle": 1.0, "full": 0.80}.get(family, 0.0)
+        return {"long_middle": 1.0, "full": 0.95}.get(family, 0.0)
     if profile == "Full IRONMAN":
         return {"full": 1.0, "long_middle": 0.78}.get(family, 0.0)
     if profile == "Short Course / WTCS":
@@ -8645,6 +8645,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                             ["race_date", "race_name", "race_type", "distance", "place", "status", "gender", "sof", "sof_source", "ors", f"{disc}_split", "Has Split", "Profile Eligible", "Inside 52 Weeks", "Gender Compatible", "Why Not Used", "swim_seconds", "bike_seconds", "run_seconds"],
                             height=420,
                         )
+
 
 
 

@@ -44,7 +44,7 @@ PROFILES = [
 ]
 DISCIPLINES = ["overall", "swim", "bike", "run"]
 
-MODEL_ENGINE_VERSION = "score_engine_v9_longcourse_overall_52w"
+MODEL_ENGINE_VERSION = "score_engine_v10_lc_full_overall_95"
 
 DEFAULT_LOOKBACK_DAYS = 365
 FULL_IM_LOOKBACK_DAYS = 365
@@ -463,7 +463,7 @@ def _distance_transfer_weight_series(rows: pd.DataFrame, profile: str, disciplin
     elif profile == "Long Course / 70.3 + T100":
         weights = families.map({
             "long_middle": 1.00,
-            "full": 1.00 if discipline in {"swim", "bike"} else 0.95 if discipline == "run" else 0.80,
+            "full": 1.00 if discipline in {"swim", "bike"} else 0.95,
             "short": 0.50 if discipline in {"overall", "swim", "run"} else 0.30,
             "unknown": 0.60,
         }).astype("float64")
@@ -829,7 +829,7 @@ def _group_top_scores(
             "confidence":          confidence,
             "last_race_name":      _clean(last.get("race_name")),
             "last_race_date":      last_race_date,
-            "computed_source":     f"score_engine_v9 - longcourse-overall-52w - {gender} - {profile} - {discipline}",
+            "computed_source":     f"score_engine_v10 - lc-full-overall-95 - {gender} - {profile} - {discipline}",
             "raw":                 _json_row(raw),
         })
 
@@ -1005,6 +1005,7 @@ def build_all_scorecards(
                 logs.append(log)
 
     return pd.DataFrame(cards), pd.DataFrame(evidence), pd.DataFrame(logs)
+
 
 
 

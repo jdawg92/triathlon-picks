@@ -76,7 +76,7 @@ except Exception:
     DEFAULT_PROFILE = "Long Course / 70.3 + T100"
     DEFAULT_TOP_N_EVIDENCE = 4
     DEFAULT_TOP_ROWS = 40
-    MODEL_VERSION = "score_engine_v9_longcourse_overall_52w"
+    MODEL_VERSION = "score_engine_v10_lc_full_overall_95"
     WATCHLIST = []
     EXPECTATIONS = {}
 
@@ -752,6 +752,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 
