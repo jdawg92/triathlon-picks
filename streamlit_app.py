@@ -6792,55 +6792,94 @@ elif page == "Model Cache":
     st.header("⚡ Model Cache")
     st.caption("Rebuild durable athlete scorecards from scoring_result_pool. Rankings and race dashboards read the saved scorecard rows instead of recalculating live.")
 
-    results = load_table("scoring_result_pool")
-    overrides = load_table("race_overrides")
-    if results.empty:
-        st.warning("No scoring pool rows found. Build it first from API Sync → Build scoring pool.")
-        st.stop()
     if not scorecard_tables_ready():
         st.error("Scorecard tables are missing. Run `athlete_scorecard_tables.sql` in Supabase SQL Editor first.")
         st.stop()
 
+    pool_count = count_rows("scoring_result_pool") or 0
+    card_count = count_rows("athlete_scorecards") or 0
+    evidence_count = count_rows("athlete_scorecard_evidence") or 0
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Profiles", len(RANKING_FAMILIES))
-    c2.metric("Disciplines", len(SCORECARD_DISCIPLINES))
-    c3.metric("Top scores used", TOP_SCORES_USED)
-    c4.metric("Strong SOF", int(STRONG_SOF_THRESHOLD))
+    c1.metric("Scoring pool rows", f"{pool_count:,}")
+    c2.metric("Scorecard rows", f"{card_count:,}")
+    c3.metric("Evidence rows", f"{evidence_count:,}")
+    c4.metric("Top scores used", TOP_SCORES_USED)
+
+    if pool_count <= 0:
+        st.warning("No scoring pool rows found. Build it first from API Sync → Build scoring pool.")
+        st.stop()
 
     rebuild_date = st.date_input("Scorecards as of", value=date.today(), key="scorecards_asof")
-    st.info("Build/update scoring_result_pool first, then rebuild scorecards. Start-list edits usually do not require rebuilding scorecards unless new athletes/results were added.")
 
-    col_a, col_b = st.columns([2, 1])
-    if col_a.button("Rebuild all athlete scorecards", type="primary", width="stretch"):
-        loader = loading_card("Building athlete scorecards", "Saving profile + discipline scores and top-5 evidence rows into Supabase...")
-        try:
-            logs = rebuild_all_athlete_scorecards(results, overrides, pd.Timestamp(rebuild_date))
-        finally:
-            loader.empty()
-        st.success("Finished rebuilding athlete scorecards.")
-        display_table(logs, ["Gender", "Profile", "Discipline", "Scorecard Rows", "Evidence Rows", "Status", "rows_after_gender", "rows_after_family", "athletes_ranked"], height=520)
-        clear_cache()
+    st.subheader("Fast database rebuild")
+    st.caption("Recommended. This builds athlete_scorecards directly in Supabase from scoring_result_pool, so Streamlit does not have to load and rewrite thousands of rows.")
+    fast_clear = st.checkbox("Clear existing scorecards before rebuild", value=True, key="db_scorecard_clear")
+    fast_top_n = st.number_input("Top evidence rows per scorecard", min_value=1, max_value=10, value=int(TOP_SCORES_USED), step=1, key="db_scorecard_top_n")
 
-    if col_b.button("Clear scorecards", width="stretch"):
-        try:
-            info = clear_scorecard_tables_for_rebuild()
+    fast_cols = st.columns([2, 1])
+    with fast_cols[0]:
+        if st.button("Build scorecards in database", type="primary", width="stretch"):
+            loader = loading_card("Building athlete scorecards", "Running database-side scorecard builder from scoring_result_pool...")
+            try:
+                rpc_result = supabase.rpc("build_athlete_scorecards_from_pool", {
+                    "p_as_of_date": rebuild_date.isoformat(),
+                    "p_model_version": MODEL_CACHE_VERSION,
+                    "p_top_n": int(fast_top_n),
+                    "p_clear": bool(fast_clear),
+                }).execute()
+                clear_cache()
+                loader.empty()
+                data = rpc_result.data
+                st.success("Finished database-side scorecard rebuild.")
+                if isinstance(data, list):
+                    st.json(data[0] if data else {})
+                else:
+                    st.json(data or {})
+            except Exception as e:
+                loader.empty()
+                st.error("Database-side scorecard rebuild failed. Make sure `build_scorecards_from_pool_rpc.sql` has been run in Supabase.")
+                st.exception(e)
+    with fast_cols[1]:
+        if st.button("Clear scorecards", width="stretch", key="clear_scorecards_fast_page"):
+            try:
+                info = clear_scorecard_tables_for_rebuild()
+                clear_cache()
+                st.success(f"Cleared scorecard tables using {info.get('method', 'batch delete')}.")
+            except Exception as e:
+                st.error("Could not clear scorecard tables.")
+                st.exception(e)
+
+    st.markdown("---")
+    with st.expander("Fallback: Python / Polars rebuild", expanded=False):
+        st.caption("Use this only if the database-side RPC fails or you need to compare outputs. It loads scoring_result_pool into Streamlit and can take longer.")
+        if st.button("Run fallback scorecard rebuild", width="stretch"):
+            results = load_table("scoring_result_pool")
+            overrides = load_table("race_overrides")
+            if results.empty:
+                st.warning("No scoring pool rows found.")
+                st.stop()
+            loader = loading_card("Building athlete scorecards", "Saving profile + discipline scores and top evidence rows into Supabase...")
+            try:
+                logs = rebuild_all_athlete_scorecards(results, overrides, pd.Timestamp(rebuild_date))
+            finally:
+                loader.empty()
+            st.success("Finished rebuilding athlete scorecards.")
+            display_table(logs, ["Gender", "Profile", "Discipline", "Scorecard Rows", "Evidence Rows", "Status", "rows_after_gender", "rows_after_family", "athletes_ranked"], height=520)
             clear_cache()
-            st.success(f"Cleared scorecard tables using {info.get('method', 'batch delete')}.")
-        except Exception as e:
-            st.error("Could not clear scorecard tables.")
-            st.exception(e)
 
-    try:
-        cards = load_table("athlete_scorecards")
-        ev = load_table("athlete_scorecard_evidence")
-    except Exception:
-        cards, ev = pd.DataFrame(), pd.DataFrame()
+    card_count = count_rows("athlete_scorecards") or 0
+    evidence_count = count_rows("athlete_scorecard_evidence") or 0
     c1, c2 = st.columns(2)
-    c1.metric("Scorecard rows", f"{len(cards):,}")
-    c2.metric("Evidence rows", f"{len(ev):,}")
+    c1.metric("Scorecard rows", f"{card_count:,}")
+    c2.metric("Evidence rows", f"{evidence_count:,}")
+    try:
+        latest_resp = supabase.table("athlete_scorecards").select("*").order("computed_at", desc=True).limit(300).execute()
+        cards = pd.DataFrame(latest_resp.data or [])
+    except Exception:
+        cards = pd.DataFrame()
     if not cards.empty:
-        latest = cards.sort_values("computed_at", ascending=False).head(300) if "computed_at" in cards.columns else cards.head(300)
-        display_table(latest, ["gender", "profile", "discipline", "rank", "athlete_name", "score", "evidence_count", "as_of_date", "computed_at"], height=520)
+        display_table(cards, ["gender", "profile", "discipline", "rank", "athlete_name", "score", "evidence_count", "as_of_date", "computed_at"], height=520)
     else:
         st.info("No athlete_scorecards rows stored yet.")
 
