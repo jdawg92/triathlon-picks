@@ -1768,6 +1768,178 @@ def merge_start_list_rows(rows: List[Dict[str, Any]]) -> Tuple[int, int]:
     return len(to_insert), skipped
 
 
+def result_import_key(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """Stable key for one athlete race-result row.
+
+    Imports should merge on this key instead of appending another duplicate row.
+    It intentionally matches the database guard we tried to create earlier:
+    athlete_url + race_date + race_name + race_type.
+    """
+    athlete_key = canonical_athlete_url(row.get("athlete_url")) or (clean_str(row.get("athlete_name")) or "").strip().lower()
+    race_date = iso_date(row.get("race_date"))
+    race_name = (clean_str(row.get("race_name")) or "").strip().lower()
+    race_type = (clean_str(row.get("race_type")) or clean_str(row.get("distance")) or "").strip().lower()
+    return athlete_key, race_date, race_name, race_type
+
+
+def row_has_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, float) and math.isnan(value):
+        return False
+    if isinstance(value, (np.floating,)) and math.isnan(float(value)):
+        return False
+    if isinstance(value, str) and value.strip() == "":
+        return False
+    return True
+
+
+def result_row_quality(row: Dict[str, Any]) -> float:
+    """Score how complete a normalized result row is so duplicates keep the best copy."""
+    score = 0.0
+    for col in [
+        "athlete_url", "athlete_name", "gender", "race_date", "race_name", "race_url",
+        "race_type", "distance", "place", "sof", "ors", "status",
+        "swim_seconds", "bike_seconds", "run_seconds",
+    ]:
+        if row_has_value(row.get(col)):
+            score += 1.0
+    # ORS/SOF/splits matter more than descriptive fields.
+    for col in ["ors", "sof", "swim_seconds", "bike_seconds", "run_seconds"]:
+        if row_has_value(row.get(col)):
+            score += 2.0
+    return score
+
+
+def dedupe_result_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove duplicate result rows inside one uploaded CSV, keeping the best row."""
+    best: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    for row in rows or []:
+        row = dict(row)
+        row["athlete_url"] = canonical_athlete_url(row.get("athlete_url")) or row.get("athlete_url")
+        key = result_import_key(row)
+        # If we cannot identify athlete + race, leave the row in by making a unique fallback key.
+        if not key[0] or not key[1] or not key[2]:
+            key = (key[0] or f"missing-athlete-{len(best)}", key[1] or "missing-date", key[2] or f"missing-race-{len(best)}", key[3])
+        current = best.get(key)
+        if current is None or result_row_quality(row) > result_row_quality(current):
+            best[key] = row
+    return list(best.values())
+
+
+def build_existing_result_map(table_name: str) -> Dict[Tuple[str, str, str, str], Dict[str, Any]]:
+    """Map existing DB result rows by the same key used for imports."""
+    existing = load_table(table_name)
+    existing_map: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    if existing is None or existing.empty:
+        return existing_map
+    existing = canonicalize_athlete_url_column(existing)
+    for _, r in existing.iterrows():
+        rec = r.to_dict()
+        key = result_import_key(rec)
+        if not key[0] or not key[1] or not key[2]:
+            continue
+        current = existing_map.get(key)
+        if current is None or result_row_quality(rec) > result_row_quality(current):
+            existing_map[key] = rec
+    return existing_map
+
+
+def result_update_payload(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a safe update payload for an existing duplicate result row.
+
+    We update missing/weak fields from the imported row rather than inserting a
+    new duplicate. This lets imports repair missing ORS/SOF/gender/splits without
+    increasing row counts.
+    """
+    payload: Dict[str, Any] = {}
+    old_url = clean_str(existing.get("athlete_url"))
+    new_url = canonical_athlete_url(incoming.get("athlete_url"))
+    if new_url and old_url != new_url:
+        payload["athlete_url"] = new_url
+
+    text_cols = ["athlete_name", "race_url", "race_type", "distance", "place", "status"]
+    numeric_cols = ["sof", "ors", "swim_seconds", "bike_seconds", "run_seconds"]
+
+    for col in text_cols:
+        v = incoming.get(col)
+        if row_has_value(v) and clean_str(existing.get(col)) != clean_str(v):
+            # Do not replace a useful existing value with generic/blank-like values.
+            if not row_has_value(existing.get(col)) or col in ["status", "place", "race_type", "distance"]:
+                payload[col] = v
+
+    incoming_gender = normalize_gender(incoming.get("gender"))
+    existing_gender = normalize_gender(existing.get("gender"))
+    if incoming_gender in ["Men", "Women"] and existing_gender != incoming_gender:
+        payload["gender"] = incoming_gender
+
+    for col in numeric_cols:
+        v = incoming.get(col)
+        if row_has_value(v):
+            existing_missing = not row_has_value(existing.get(col))
+            if existing_missing:
+                payload[col] = v
+
+    # Keep raw payload if the existing row does not have it; do not constantly rewrite JSON.
+    if row_has_value(incoming.get("raw")) and not row_has_value(existing.get("raw")):
+        payload["raw"] = incoming.get("raw")
+    return payload
+
+
+def update_existing_result_row(table_name: str, existing: Dict[str, Any], payload: Dict[str, Any]) -> bool:
+    if not payload:
+        return False
+    try:
+        row_id = existing.get("id")
+        if row_id is not None and not (isinstance(row_id, float) and math.isnan(row_id)):
+            supabase.table(table_name).update(payload).eq("id", int(row_id)).execute()
+        else:
+            supabase.table(table_name).update(payload) \
+                .eq("athlete_url", existing.get("athlete_url")) \
+                .eq("race_date", iso_date(existing.get("race_date"))) \
+                .eq("race_name", existing.get("race_name")) \
+                .eq("race_type", existing.get("race_type")) \
+                .execute()
+        return True
+    except Exception:
+        return False
+
+
+def merge_result_rows(table_name: str, rows: List[Dict[str, Any]]) -> Tuple[int, int, int]:
+    """Merge result imports instead of appending duplicates.
+
+    Returns: inserted, skipped_duplicate, updated_existing.
+    """
+    rows = dedupe_result_rows(rows)
+    if not rows:
+        return 0, 0, 0
+
+    existing_map = build_existing_result_map(table_name)
+    to_insert: List[Dict[str, Any]] = []
+    skipped = 0
+    updated = 0
+    for row in rows:
+        row = dict(row)
+        row["athlete_url"] = canonical_athlete_url(row.get("athlete_url")) or row.get("athlete_url")
+        key = result_import_key(row)
+        existing = existing_map.get(key)
+        if existing:
+            payload = result_update_payload(existing, row)
+            if update_existing_result_row(table_name, existing, payload):
+                updated += 1
+            else:
+                skipped += 1
+            # Pretend the existing row now has the better fields for any later duplicate in this same upload.
+            existing_map[key] = {**existing, **payload}
+            continue
+        to_insert.append(row)
+        existing_map[key] = row
+
+    if to_insert:
+        insert_chunks(table_name, to_insert)
+    return len(to_insert), skipped, updated
+
+
 def delete_matching_start_lists(rows: List[Dict[str, Any]]) -> int:
     """Delete only the race/date/gender groups included in an uploaded start list."""
     groups = set()
@@ -3871,24 +4043,42 @@ def import_results_csv(df: pd.DataFrame, table_choice: str, replace: bool) -> No
     if table_choice == "Athlete Results":
         rows, athlete_rows = normalize_athlete_results(df)
         rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows)
+        rows = dedupe_result_rows(rows)
         before_count = count_rows("athlete_results")
         if replace:
             delete_all("athlete_results")
-        insert_chunks("athlete_results", rows)
+            insert_chunks("athlete_results", rows)
+            inserted, skipped, updated_existing = len(rows), 0, 0
+        else:
+            inserted, skipped, updated_existing = merge_result_rows("athlete_results", rows)
         clear_cache()
         after_count = count_rows("athlete_results")
-        st.success(f"Imported {len(rows):,} athlete result rows. Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
+        st.success(
+            f"Processed {len(rows):,} athlete result rows: {inserted:,} inserted, "
+            f"{updated_existing:,} existing rows updated, {skipped:,} duplicates skipped. "
+            f"Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. "
+            f"Gender propagated for {propagated:,} athletes."
+        )
         st.info(f"Supabase athlete_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
     elif table_choice == "Race Field Results":
         rows, athlete_rows = normalize_race_field_results(df)
         rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows)
+        rows = dedupe_result_rows(rows)
         before_count = count_rows("race_field_results")
         if replace:
             delete_all("race_field_results")
-        insert_chunks("race_field_results", rows)
+            insert_chunks("race_field_results", rows)
+            inserted, skipped, updated_existing = len(rows), 0, 0
+        else:
+            inserted, skipped, updated_existing = merge_result_rows("race_field_results", rows)
         clear_cache()
         after_count = count_rows("race_field_results")
-        st.success(f"Imported {len(rows):,} race-field result rows. Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
+        st.success(
+            f"Processed {len(rows):,} race-field result rows: {inserted:,} inserted, "
+            f"{updated_existing:,} existing rows updated, {skipped:,} duplicates skipped. "
+            f"Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. "
+            f"Gender propagated for {propagated:,} athletes."
+        )
         st.info(f"Supabase race_field_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
 
 
