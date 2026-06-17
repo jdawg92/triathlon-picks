@@ -5955,7 +5955,7 @@ elif page == "Import CSVs":
         st.caption("Copies rows from the cached TriNews results table into the app result tables used by rankings and scorecards.")
         pc1, pc2, pc3 = st.columns(3)
         publish_offset = pc1.number_input("Cached result offset", min_value=0, value=0, step=500, key="publish_cached_results_offset")
-        publish_limit = pc2.number_input("Rows this run", min_value=10, max_value=10000, value=1000, step=1000, key="publish_cached_results_limit")
+        publish_limit = pc2.number_input("Rows this run", min_value=10, max_value=50000, value=10000, step=5000, key="publish_cached_results_limit_v2")
         publish_mode = pc3.radio("Mode", ["Preview", "Write"], horizontal=True, key="publish_cached_results_mode")
         fast_publish = st.checkbox(
             "Fast publish for fresh tables",
@@ -5969,7 +5969,7 @@ elif page == "Import CSVs":
             help="Leave off if you already synced athletes. Turning this on can make large batches slower.",
             key="update_athletes_during_publish",
         )
-        st.caption("For large imports, publish in batches. Use up to 10,000 rows per run, then continue using the next offset shown after each successful write.")
+        st.caption("For large imports, publish in batches. Default is 10,000 rows per run. You can go higher if your Supabase project handles it, then continue using the next offset shown after each successful write.")
 
         if st.button("Publish cached results to app tables", type="primary", key="publish_cached_results_to_app_tables"):
             try:
@@ -6010,8 +6010,8 @@ elif page == "Import CSVs":
                             if fast_publish:
                                 # Fast path: use bulk upsert on the result unique key.
                                 # This is safe after a partial/failed publish because existing rows are updated instead of duplicated.
-                                ar_inserted, ar_updated = upsert_result_rows_fast("athlete_results", app_rows, chunk_size=500)
-                                rf_inserted, rf_updated = upsert_result_rows_fast("race_field_results", race_field_rows, chunk_size=500)
+                                ar_inserted, ar_updated = upsert_result_rows_fast("athlete_results", app_rows, chunk_size=1000)
+                                rf_inserted, rf_updated = upsert_result_rows_fast("race_field_results", race_field_rows, chunk_size=1000)
                             else:
                                 # Repair/import path: slower but tries to update matching existing rows instead of adding duplicates.
                                 ar_inserted, ar_skipped, ar_updated = merge_result_rows("athlete_results", app_rows)
