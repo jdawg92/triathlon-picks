@@ -28,7 +28,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "openrank_fixed_settings_v3"
+MODEL_CACHE_VERSION = "openrank_shortcourse_scope_v1"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -783,6 +783,49 @@ def filter_rankings_by_gender(df: pd.DataFrame, selected_gender: str) -> pd.Data
     return out.drop(columns=["__gender_norm"], errors="ignore")
 
 
+def short_course_predictor_mask(df: pd.DataFrame) -> pd.Series:
+    """Evidence scope for WTCS / short-course predictions and rankings.
+
+    Keep true elite short-course evidence: WTCS, World Triathlon Cup,
+    Olympic Games, and Olympic-distance continental/development races only when
+    they have enough SOF to be useful. Exclude development-cup Sprint /
+    Super Sprint rows, because tiny low-SOF samples can otherwise incorrectly
+    push athletes to the top of fastest-split boards.
+    """
+    if df is None or df.empty:
+        return pd.Series([], dtype=bool)
+
+    rt = df.get("race_type", pd.Series([None] * len(df), index=df.index)).map(lambda x: (clean_str(x) or "").lower())
+    race = df.get("race_name", pd.Series([None] * len(df), index=df.index)).map(lambda x: (clean_str(x) or "").lower())
+    dist = df.get("distance", pd.Series([None] * len(df), index=df.index)).map(lambda x: (clean_str(x) or "").lower())
+    txt = (rt + " " + race + " " + dist)
+    sof = pd.to_numeric(df.get("sof", pd.Series([np.nan] * len(df), index=df.index)), errors="coerce")
+
+    long_course = txt.str.contains("70.3|middle|challenge|t100|pto|full|140.6|ironman", regex=True, na=False)
+
+    wtcs = txt.str.contains("wtcs|world triathlon championship series", regex=True, na=False)
+    world_cup = txt.str.contains("world triathlon cup", regex=True, na=False)
+    olympic_games = txt.str.contains("olympic games|tokyo 2020|paris 2024", regex=True, na=False)
+
+    development_cup = txt.str.contains(
+        "continental cup|europe triathlon cup|europe cup|americas triathlon cup|africa triathlon cup|asia triathlon cup|oceania triathlon cup",
+        regex=True,
+        na=False,
+    )
+    olympic_distance = dist.str.contains("olympic", regex=True, na=False) | rt.eq("olympic")
+    sprint_distance = dist.str.contains("sprint|super sprint", regex=True, na=False) | rt.eq("sprint")
+
+    # Allow continental/development races only when they are Olympic-distance
+    # and have meaningful SOF. Do not use their Sprint / Super Sprint rows for
+    # WTCS fastest-split predictions.
+    continental_olympic_quality = development_cup & olympic_distance & (sof >= STRONG_SOF_THRESHOLD)
+
+    major_short_course = wtcs | world_cup | olympic_games
+    standalone_olympic = olympic_distance & ~development_cup
+
+    return (major_short_course | continental_olympic_quality | standalone_olympic) & ~long_course & ~(development_cup & sprint_distance)
+
+
 def ranking_scope_mask(df: pd.DataFrame, scope: str) -> pd.Series:
     """Return a boolean mask for the selected race-family ranking scope."""
     if df is None or df.empty:
@@ -799,7 +842,7 @@ def ranking_scope_mask(df: pd.DataFrame, scope: str) -> pd.Series:
     if scope == "Full IRONMAN":
         return txt.str.contains("full|140.6", regex=True, na=False) | ((txt.str.contains("ironman", na=False)) & ~txt.str.contains("70.3", na=False))
     if scope == "Short Course / WTCS":
-        return txt.str.contains("wtcs|world triathlon|continental|olympic|sprint", regex=True, na=False)
+        return short_course_predictor_mask(df)
     return pd.Series([True] * len(df), index=df.index)
 
 
@@ -827,10 +870,13 @@ def prediction_scope_from_race(race_name: Any, race_type: Any = None, distance: 
 def apply_prediction_scope(df: pd.DataFrame, scope: str) -> pd.DataFrame:
     """Filter results to the race family appropriate for the selected predictor.
 
-    Short-course/WTCS prediction uses only sprint, Olympic, WTCS, World
-    Triathlon Cup, and continental-cup style evidence. For 70.3/T100/full, we
-    leave the broader two-year window available because cross-family evidence
-    can still be useful and is already weighted/capped by the scoring model.
+    Short-course/WTCS prediction uses true elite short-course evidence:
+    WTCS, World Triathlon Cup, Olympic Games, and only high-SOF Olympic-distance
+    continental/development races. Development Sprint / Super Sprint cup rows
+    are excluded so tiny low-SOF samples do not distort fastest-split picks.
+    For 70.3/T100/full, we leave the broader two-year window available because
+    cross-family evidence can still be useful and is already weighted/capped by
+    the scoring model.
     """
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df
@@ -3593,7 +3639,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "openrank_fixed_settings_v2"
+MODEL_CACHE_VERSION = "openrank_shortcourse_scope_v1"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -5274,7 +5320,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
         c4.metric("Overrides", len(overrides) if not overrides.empty else 0)
         c5.metric("Model", f"Top {TOP_SCORES_USED} · SOF {int(STRONG_SOF_THRESHOLD)}")
         if prediction_scope == "Short Course / WTCS":
-            st.info("Short-course / WTCS predictor is restricted to Olympic, Sprint, WTCS, World Triathlon Cup, and Continental Cup evidence. 70.3 and full-distance rows are not used for this selected start list.")
+            st.info("Short-course / WTCS predictor now uses WTCS, World Triathlon Cup, Olympic Games, and only high-SOF Olympic-distance continental/development races. Sprint / Super Sprint Continental Cup rows are excluded; 70.3, T100, and full-distance rows are not used.")
 
         with st.expander("Split data health", expanded=False):
             health = []
