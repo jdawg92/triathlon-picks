@@ -1365,12 +1365,15 @@ MAX_SCORECARD_POOL_LOOKBACK_DAYS = ALL_PROFILE_SCORECARD_LOOKBACK_DAYS
 def fetch_scoring_pool_for_scorecards(
     as_of_date: Any,
     lookback_days: int = MAX_SCORECARD_POOL_LOOKBACK_DAYS,
-    page_size: int = 2000,
+    page_size: int = 1000,
 ) -> pd.DataFrame:
-    """Load only the scoring-pool rows needed for scorecard rebuilds.
+    """Load all scoring-pool rows needed for scorecard rebuilds.
 
-    This avoids pulling the full historical pool through Streamlit and keeps each
-    Supabase request small enough to avoid statement timeouts.
+    Supabase/PostgREST commonly caps one response at 1,000 rows even when a
+    larger range is requested. If this function asks for 2,000 rows and receives
+    1,000, the old logic thinks the pool is finished and only the first page gets
+    scored. Keep the page size at 1,000 and continue paging until a short page is
+    returned.
     """
     as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
     if pd.isna(as_of_ts):
@@ -1380,7 +1383,7 @@ def fetch_scoring_pool_for_scorecards(
 
     all_rows: List[Dict[str, Any]] = []
     start = 0
-    page_size = max(500, min(int(page_size), 5000))
+    page_size = max(100, min(int(page_size or 1000), 1000))
     while True:
         end = start + page_size - 1
         try:
@@ -6914,6 +6917,11 @@ elif page == "Model Cache":
                 st.warning("No scoring pool rows found in the selected date window.")
                 st.stop()
             st.info(f"Loaded {len(results):,} scoring-pool rows for rebuild.")
+            if pool_count and len(results) < int(pool_count * 0.90):
+                st.warning(
+                    f"Only loaded {len(results):,} of {pool_count:,} scoring-pool rows. "
+                    "Check the selected as-of date/lookback window before rebuilding."
+                )
             loader = loading_card("Building athlete scorecards", "Computing and saving scorecards in small batches...")
             try:
                 logs = rebuild_athlete_scorecards_batched(
