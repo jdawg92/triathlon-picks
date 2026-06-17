@@ -6629,43 +6629,21 @@ elif page == "Import CSVs":
                 source_rows = source_rows_all[: int(migrate_limit)]
                 start_rows, athlete_rows, mig_stats = start_rows_from_trinews_source_rows(source_rows)
 
-                # If the cached rows are only race/list headers, they are not directly
-                # migratable. Use those cached race slugs as a discovery list, fetch the
-                # actual athlete-entry rows from the API, cache them back into
-                # trinews_start_lists, then migrate the normalized app rows.
-                if not start_rows and source_rows and api_key and build_clean_start_list_sync is not None:
-                    race_slugs = sorted({clean_str(r.get("race_slug")) for r in source_rows if clean_str(r.get("race_slug"))})
-                    if race_slugs:
-                        st.info(
-                            "Cached trinews_start_lists rows look like race/list headers, not athlete entries. "
-                            "Fetching athlete entries from the TriNews API for those cached races."
-                        )
-                        api_payload = build_clean_start_list_sync(
-                            api_key=api_key,
-                            race_slugs=race_slugs,
-                            max_races=len(race_slugs),
-                            row_limit_per_race=1000,
-                        )
-                        api_source_rows = api_payload.get("trinews_start_lists", []) or []
-                        if api_source_rows:
-                            write_source_rows_safe("trinews_start_lists", api_source_rows, "id")
-                        start_rows = api_payload.get("start_lists", []) or []
-                        athlete_rows = api_payload.get("athletes", []) or []
-                        mig_stats["api_refetch"] = {
-                            "race_slugs": len(race_slugs),
-                            "api_source_rows": len(api_source_rows),
-                            "api_app_rows": len(start_rows),
-                            "logs": api_payload.get("logs", [])[-10:],
-                            "summary": api_payload.get("summary", {}) or {},
-                        }
-
+                # Important: migration is now local-only and fast. If the cached
+                # rows are only race/list headers, do not automatically probe the
+                # TriNews API from this button. Endpoint discovery can be slow and
+                # should be run separately in a small batch.
                 if not start_rows:
                     st.warning("No migratable cached start-list athlete rows found in trinews_start_lists.")
                     st.json(mig_stats)
                     if source_rows:
                         st.caption("Sample cached row shape")
                         st.json({k: source_rows[0].get(k) for k in list(source_rows[0].keys())[:12]})
-                    st.info("Those cached rows may be race/list headers only. Re-run Sync start lists after saving the updated trinews_api_refresh.py, then try migration again.")
+                    st.info(
+                        "These cached rows appear to be race/list headers only. They do not contain athlete_id, "
+                        "athlete_name, or athlete_slug, so there is nothing local to migrate. Use the small "
+                        "API refetch tool below for 1–3 cached race headers at a time."
+                    )
                 else:
                     if athlete_rows:
                         upsert_athletes_preserve_gender(athlete_rows)
@@ -6695,6 +6673,68 @@ elif page == "Import CSVs":
                 st.exception(e)
             finally:
                 loader.empty()
+
+        st.markdown("#### Refetch athlete entries for cached race headers")
+        st.caption(
+            "Use this only when trinews_start_lists contains header rows with no athletes. "
+            "Run a small batch first so endpoint discovery does not lock up the app."
+        )
+        ref1, ref2, ref3 = st.columns(3)
+        refetch_limit = ref1.number_input("Cached races to refetch", min_value=1, max_value=10, value=1, step=1, key="refetch_cached_start_race_limit")
+        refetch_offset = ref2.number_input("Cached race offset", min_value=0, value=0, step=1, key="refetch_cached_start_race_offset")
+        refetch_row_limit = ref3.number_input("Max athletes per race", min_value=10, max_value=500, value=150, step=10, key="refetch_cached_start_row_limit")
+        if st.button("Refetch athlete entries for cached race headers", type="secondary", key="refetch_cached_start_headers"):
+            if build_clean_start_list_sync is None:
+                st.error(f"Missing start-list API helper. Upload the latest trinews_api_refresh.py. {TRINEWS_API_IMPORT_ERROR}")
+            elif not api_key:
+                st.warning("Enter the TriNews API key.")
+            else:
+                source_rows_all = fetch_all("trinews_start_lists", select="race_slug,race_name,race_date,athlete_id,athlete_name,athlete_slug", page_size=1000)
+                header_slugs = []
+                seen_slugs = set()
+                for row in source_rows_all:
+                    slug = clean_str(row.get("race_slug"))
+                    has_athlete = bool(clean_str(row.get("athlete_id")) or clean_str(row.get("athlete_name")) or clean_str(row.get("athlete_slug")))
+                    if slug and not has_athlete and slug not in seen_slugs:
+                        seen_slugs.add(slug)
+                        header_slugs.append(slug)
+                selected_slugs = header_slugs[int(refetch_offset): int(refetch_offset) + int(refetch_limit)]
+                if not selected_slugs:
+                    st.info("No cached header-only race slugs found at that offset.")
+                else:
+                    loader = loading_card("Refetching athlete entries", f"Checking {len(selected_slugs):,} cached race header(s)...")
+                    try:
+                        payload = build_clean_start_list_sync(
+                            api_key=api_key,
+                            race_slugs=selected_slugs,
+                            max_races=len(selected_slugs),
+                            row_limit_per_race=int(refetch_row_limit),
+                            fast_probe=True,
+                        )
+                    finally:
+                        loader.empty()
+                    st.json(payload.get("summary", {}) or {})
+                    logs_df = pd.DataFrame(payload.get("logs", []) or [])
+                    if not logs_df.empty:
+                        with st.expander("Refetch discovery log", expanded=True):
+                            st.dataframe(logs_df, width="stretch", hide_index=True)
+                    api_source_rows = payload.get("trinews_start_lists", []) or []
+                    start_rows = dedupe_start_list_rows(payload.get("start_lists", []) or [])
+                    athlete_rows = payload.get("athletes", []) or []
+                    if api_source_rows:
+                        write_source_rows_safe("trinews_start_lists", api_source_rows, "id")
+                    if athlete_rows:
+                        upsert_athletes_preserve_gender(athlete_rows)
+                    if start_rows:
+                        deleted = delete_start_rows_for_races(start_rows)
+                        start_rows, sl_ath_ins, sl_ath_upd, sl_prop = sync_athlete_master_import(start_rows, athlete_rows)
+                        insert_chunks("start_lists", start_rows)
+                        clear_cache()
+                        st.success(f"Refetched and inserted {len(start_rows):,} start-list athlete rows. Deleted old app rows for these races: {deleted:,}.")
+                        st.dataframe(pd.DataFrame(start_rows).head(25), width="stretch", hide_index=True)
+                    else:
+                        st.warning("No athlete-entry rows found for this cached race header batch.")
+                        st.info("Try offset +1 for the next race. If every race returns zero, the public TriNews API may expose only list headers, not athlete entries, for these events.")
 
         st.divider()
         sl1, sl2, sl3 = st.columns(3)

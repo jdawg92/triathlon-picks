@@ -706,16 +706,9 @@ def build_full_clean_api_rebuild(
 
 START_LIST_CANDIDATE_TABLES = [
     "start_lists",
-    "startlists",
     "race_start_lists",
+    "startlists",
     "race_startlists",
-    "race_entries",
-    "entries",
-    "race_participants",
-    "participants",
-    "event_entries",
-    "event_participants",
-    "program_entries",
 ]
 
 START_LIST_FILTER_CANDIDATES = [
@@ -737,13 +730,8 @@ START_LIST_ENTRY_CANDIDATE_TABLES = [
     "startlist_entries",
     "race_start_list_entries",
     "race_startlist_entries",
-    "event_start_list_entries",
     "entries",
-    "race_entries",
     "participants",
-    "race_participants",
-    "event_participants",
-    "program_entries",
 ]
 
 START_LIST_ENTRY_FILTER_CANDIDATES = [
@@ -760,7 +748,7 @@ START_LIST_ENTRY_FILTER_CANDIDATES = [
 ]
 
 
-def _get_optional(api_key: str, path: str, params: Dict[str, Any], timeout: int = 25) -> Tuple[int, Any]:
+def _get_optional(api_key: str, path: str, params: Dict[str, Any], timeout: int = 6) -> Tuple[int, Any]:
     """GET a PostgREST path and return (status, json_or_text), never raise."""
     try:
         resp = requests.get(
@@ -778,7 +766,7 @@ def _get_optional(api_key: str, path: str, params: Dict[str, Any], timeout: int 
         return 0, {"error": str(e)}
 
 
-def probe_start_list_sources_for_race(api_key: str, race: Dict[str, Any], limit: int = 25) -> List[Dict[str, Any]]:
+def probe_start_list_sources_for_race(api_key: str, race: Dict[str, Any], limit: int = 10, max_attempts: int = 24) -> List[Dict[str, Any]]:
     """Try common public tables/views for start-list data for one race.
 
     This is intentionally read-only and small. It helps discover whether the
@@ -790,12 +778,16 @@ def probe_start_list_sources_for_race(api_key: str, race: Dict[str, Any], limit:
     slug = _clean(race.get("slug"))
     race_values = {"id": race_id, "event_hub_id": event_hub_id, "slug": slug}
 
+    attempts_used = 0
     for table in START_LIST_CANDIDATE_TABLES:
         for col, race_key in START_LIST_FILTER_CANDIDATES:
+            if attempts_used >= int(max_attempts):
+                return out
             val = race_values.get(race_key)
             if not val:
                 continue
             params = {"select": "*", col: f"eq.{val}", "limit": int(limit)}
+            attempts_used += 1
             status, data = _get_optional(api_key, table, params)
             rows = data if isinstance(data, list) else []
             athlete_rows = [r for r in rows if _start_list_has_athlete_identity(r)]
@@ -815,7 +807,7 @@ def probe_start_list_sources_for_race(api_key: str, race: Dict[str, Any], limit:
     return out
 
 
-def probe_start_list_entry_sources_for_race(api_key: str, race: Dict[str, Any], header_rows: List[Dict[str, Any]], limit: int = 25) -> List[Dict[str, Any]]:
+def probe_start_list_entry_sources_for_race(api_key: str, race: Dict[str, Any], header_rows: List[Dict[str, Any]], limit: int = 10, max_attempts: int = 36) -> List[Dict[str, Any]]:
     """Probe child entry tables using race/header rows from /start_lists."""
     out: List[Dict[str, Any]] = []
     race_id = _clean(race.get("id"))
@@ -828,13 +820,17 @@ def probe_start_list_entry_sources_for_race(api_key: str, race: Dict[str, Any], 
     if not value_sets:
         value_sets.append({"start_list_id": "", "race_id": race_id or "", "event_hub_id": event_hub_id or "", "race_slug": race_slug or ""})
 
+    attempts_used = 0
     for values in value_sets:
         for table in START_LIST_ENTRY_CANDIDATE_TABLES:
             for col, key in START_LIST_ENTRY_FILTER_CANDIDATES:
+                if attempts_used >= int(max_attempts):
+                    return out
                 val = values.get(key)
                 if not val:
                     continue
                 params = {"select": "*", col: f"eq.{val}", "limit": int(limit)}
+                attempts_used += 1
                 status, data = _get_optional(api_key, table, params)
                 rows = data if isinstance(data, list) else []
                 athlete_rows = [r for r in rows if _start_list_has_athlete_identity(r)]
@@ -852,16 +848,18 @@ def probe_start_list_entry_sources_for_race(api_key: str, race: Dict[str, Any], 
     return out
 
 
-def discover_start_list_rows_for_race(api_key: str, race: Dict[str, Any], limit: int = 1000) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def discover_start_list_rows_for_race(api_key: str, race: Dict[str, Any], limit: int = 1000, fast_probe: bool = False) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Return athlete-entry start-list rows, not race/list header rows."""
-    attempts = probe_start_list_sources_for_race(api_key, race, limit=min(25, int(limit)))
+    source_attempt_limit = 12 if fast_probe else 24
+    entry_attempt_limit = 18 if fast_probe else 36
+    attempts = probe_start_list_sources_for_race(api_key, race, limit=min(10, int(limit)), max_attempts=source_attempt_limit)
     header_rows: List[Dict[str, Any]] = []
     for a in attempts:
         if a.get("status") == 200 and int(a.get("row_count") or 0) > 0:
             table = a.get("table")
             col = a.get("filter_column")
             val = a.get("filter_value")
-            rows = _get(api_key, str(table), {"select": "*", str(col): f"eq.{val}", "limit": int(limit)}, timeout=45)
+            rows = _get(api_key, str(table), {"select": "*", str(col): f"eq.{val}", "limit": int(limit)}, timeout=12)
             athlete_rows = [r for r in rows if _start_list_has_athlete_identity(r)]
             if athlete_rows:
                 return athlete_rows, {
@@ -872,13 +870,13 @@ def discover_start_list_rows_for_race(api_key: str, race: Dict[str, Any], limit:
             # Keep possible race/list headers so we can probe child entry tables.
             header_rows.extend(rows[:10])
 
-    entry_attempts = probe_start_list_entry_sources_for_race(api_key, race, header_rows, limit=min(25, int(limit)))
+    entry_attempts = probe_start_list_entry_sources_for_race(api_key, race, header_rows, limit=min(10, int(limit)), max_attempts=entry_attempt_limit)
     for a in entry_attempts:
         if a.get("status") == 200 and int(a.get("athlete_row_count") or 0) > 0:
             table = a.get("table")
             col = a.get("filter_column")
             val = a.get("filter_value")
-            rows = _get(api_key, str(table), {"select": "*", str(col): f"eq.{val}", "limit": int(limit)}, timeout=45)
+            rows = _get(api_key, str(table), {"select": "*", str(col): f"eq.{val}", "limit": int(limit)}, timeout=12)
             athlete_rows = [r for r in rows if _start_list_has_athlete_identity(r)]
             return athlete_rows, {
                 "status": "ok", "table": table, "filter_column": col,
@@ -1075,6 +1073,7 @@ def build_clean_start_list_sync(
     brand: Optional[str] = None,
     max_races: int = 100,
     row_limit_per_race: int = 1000,
+    fast_probe: bool = False,
 ) -> Dict[str, Any]:
     """Build normalized start-list rows from any public TriNews start-list source discovered."""
     if not _clean(api_key):
@@ -1099,7 +1098,7 @@ def build_clean_start_list_sync(
     raw_start_rows: List[Tuple[Dict[str, Any], Dict[str, Any], str]] = []
     athlete_ids: List[str] = []
     for race in races[: int(max_races)]:
-        rows, log = discover_start_list_rows_for_race(api_key, race, int(row_limit_per_race))
+        rows, log = discover_start_list_rows_for_race(api_key, race, int(row_limit_per_race), fast_probe=bool(fast_probe))
         logs.append({"stage": "start_list_discovery", **{k: v for k, v in log.items() if k != "attempts"}})
         source = _clean(log.get("table"))
         for row in rows:
