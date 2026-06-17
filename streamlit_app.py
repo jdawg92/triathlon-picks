@@ -8946,11 +8946,6 @@ elif page in {"Race Dashboard", "Split Audit"}:
         )
         race_options_df = race_options_df.merge(start_counts, on=["race_name", "race_date", "gender"], how="left")
         race_options_df["start_count"] = pd.to_numeric(race_options_df.get("start_count"), errors="coerce").fillna(0).astype(int)
-        race_options_df["picker_label"] = race_options_df.apply(
-            lambda r: f"{clean_str(r.get('race_date_label')) or 'No date'} | {clean_str(r.get('gender')) or 'All'} | {clean_str(r.get('race_name'))} | {int(r.get('start_count') or 0)} athletes",
-            axis=1,
-        )
-
         f1, f2, f3 = st.columns([0.9, 1.0, 2.7])
         gender_choices = ["All"] + [g for g in ["Men", "Women"] if g in set(race_options_df["gender"].dropna().astype(str))]
         dash_gender_filter = f1.selectbox("Gender", gender_choices, index=0, key="dashboard_race_gender_filter")
@@ -8975,7 +8970,6 @@ elif page in {"Race Dashboard", "Split Audit"}:
 
         filtered_races = filtered_races.sort_values(["race_date_sort", "race_name", "gender"], ascending=[True, True, True], na_position="last")
         filtered_labels = filtered_races["label"].tolist()
-        label_to_picker = dict(zip(filtered_races["label"], filtered_races["picker_label"]))
         if not filtered_labels:
             st.warning("No start-list races match those filters.")
             st.stop()
@@ -8994,26 +8988,37 @@ elif page in {"Race Dashboard", "Split Audit"}:
             else:
                 default_index = max(0, len(filtered_labels) - 1)
 
-        if hasattr(st, "pills"):
-            selected_label = st.pills(
-                "Race to analyze",
-                filtered_labels,
-                default=filtered_labels[default_index],
-                key="dashboard_selected_race_picker",
-                format_func=lambda x: label_to_picker.get(x, x),
-                width="stretch",
-            )
-            if selected_label is None:
-                selected_label = filtered_labels[default_index]
-        else:
-            selected_label = st.radio(
-                "Race to analyze",
-                filtered_labels,
-                index=default_index,
-                key="dashboard_selected_race_picker",
-                format_func=lambda x: label_to_picker.get(x, x),
-                horizontal=False,
-            )
+        picker_source = filtered_races.reset_index(drop=True).copy()
+        picker_view = pd.DataFrame({
+            "Date": picker_source["race_date_label"].fillna(""),
+            "Gender": picker_source["gender"].fillna(""),
+            "Race": picker_source["race_name"].fillna(""),
+            "Athletes": picker_source["start_count"].fillna(0).astype(int),
+            "Profile": picker_source["profile"].fillna(""),
+        })
+        st.caption("Click a row to load that race.")
+        picker_state = st.dataframe(
+            picker_view,
+            width="stretch",
+            height=min(300, 40 + max(1, min(len(picker_view), 7)) * 34),
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            selection_default={"selection": {"rows": [default_index]}},
+            key="dashboard_selected_race_board",
+            column_config={
+                "Date": st.column_config.TextColumn("Date", width="small"),
+                "Gender": st.column_config.TextColumn("Gender", width="small"),
+                "Race": st.column_config.TextColumn("Race", width="large"),
+                "Athletes": st.column_config.NumberColumn("Athletes", width="small", format="%d"),
+                "Profile": st.column_config.TextColumn("Profile", width="medium"),
+            },
+        )
+        selection = getattr(picker_state, "selection", {}) or {}
+        selected_rows = selection.get("rows", []) if isinstance(selection, dict) else getattr(selection, "rows", [])
+        selected_index = int(selected_rows[0]) if selected_rows else default_index
+        selected_index = max(0, min(selected_index, len(picker_source) - 1))
+        selected_label = clean_str(picker_source.iloc[selected_index]["label"])
         st.session_state["dashboard_selected_race_label"] = selected_label
         selected_preview = filtered_races[filtered_races["label"] == selected_label].iloc[0]
         st.caption(
