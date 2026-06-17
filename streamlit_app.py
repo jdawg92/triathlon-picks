@@ -6384,8 +6384,36 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
             race_pick = safe_float(r.get("Race Pick Score")) or 0.0
             ranking_score = safe_float(r.get("Score")) or 0.0
             perf_score = safe_float(r.get("Performance Score" if section == "overall" else "Performance Split Score")) or race_pick
-            signal = _watch_signal_tags(r, section, race_pick, perf_score, ranking_score, evidence_count)
-            tags = signal.get("tags") or []
+            best_split, best_gap, best_split_race = _best_split_watch_signal(r) if section != "overall" else (None, None, "")
+            tags: List[str] = []
+            notes: List[str] = []
+            signal_strength = race_pick
+            signal_race = best_split_race or clean_str(r.get("Last Race"))
+            if section == "overall":
+                if race_pick >= 65:
+                    tags.append("Next podium option")
+                    notes.append("Best overall pick outside the top five.")
+                if evidence_count <= 2 and perf_score >= 76:
+                    tags.append("Small sample upside")
+                    notes.append("Limited evidence, but the ceiling is high.")
+                if race_pick - ranking_score >= 8 and race_pick >= 62:
+                    tags.append("Race fit boost")
+                    notes.append("Rates better for this race than the base ranking.")
+            else:
+                if best_split is not None and best_split >= 78:
+                    tags.append("Fast split option")
+                    notes.append(f"Best {section} signal is {best_split:.1f}.")
+                    signal_strength = max(signal_strength, best_split)
+                if best_gap is not None and best_gap <= 2.5:
+                    tags.append("Near fastest split")
+                    notes.append(f"Only {best_gap:.1f}% off the fastest {section}.")
+                    signal_strength = max(signal_strength, 82.0)
+                if evidence_count <= 2 and perf_score >= 74:
+                    tags.append("Limited sample")
+                    notes.append("Not much evidence, but enough to check manually.")
+            if not tags and race_pick >= (65 if section == "overall" else 72):
+                tags.append("Worth a manual look")
+                notes.append("Strong enough score after the automatic pick cutoff.")
             if not tags:
                 continue
             rows.append({
@@ -6396,12 +6424,12 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
                 "Performance": round(perf_score, 1),
                 "Ranking": round(ranking_score, 1),
                 "Evidence": evidence_count,
-                "Reason": clean_str(signal.get("note")),
+                "Reason": " ".join(notes[:2]),
                 "Tags": " | ".join(tags),
-                "Signal Strength": round(float(signal.get("signal_strength") or race_pick), 1),
-                "Best Split": round(signal.get("best_split"), 1) if signal.get("best_split") is not None else None,
-                "Gap %": round(signal.get("best_gap"), 2) if signal.get("best_gap") is not None else None,
-                "Signal Race": clean_str(signal.get("signal_race")),
+                "Signal Strength": round(float(signal_strength), 1),
+                "Best Split": round(best_split, 1) if best_split is not None else None,
+                "Gap %": round(best_gap, 2) if best_gap is not None else None,
+                "Signal Race": signal_race,
                 "Last Race": clean_str(r.get("Last Race")),
                 "Last Race Date": clean_str(r.get("Last Race Date")),
                 "PTN": canonical_athlete_url(r.get("Athlete URL")),
@@ -8968,7 +8996,14 @@ elif page in {"Race Dashboard", "Split Audit"}:
             ).str.lower()
             filtered_races = filtered_races[haystack.str.contains(re.escape(needle), na=False)]
 
-        filtered_races = filtered_races.sort_values(["race_date_sort", "race_name", "gender"], ascending=[True, True, True], na_position="last")
+        profile_order = {
+            "Short Course / WTCS": 0,
+            "Long Course / 70.3 + T100": 1,
+            "Full IRONMAN": 2,
+            "All": 3,
+        }
+        filtered_races["_profile_sort"] = filtered_races["profile"].map(lambda x: profile_order.get(clean_str(x), 99))
+        filtered_races = filtered_races.sort_values(["_profile_sort", "race_date_sort", "race_name", "gender"], ascending=[True, True, True, True], na_position="last")
         filtered_labels = filtered_races["label"].tolist()
         if not filtered_labels:
             st.warning("No start-list races match those filters.")
@@ -8988,37 +9023,22 @@ elif page in {"Race Dashboard", "Split Audit"}:
             else:
                 default_index = max(0, len(filtered_labels) - 1)
 
-        picker_source = filtered_races.reset_index(drop=True).copy()
-        picker_view = pd.DataFrame({
-            "Date": picker_source["race_date_label"].fillna(""),
-            "Gender": picker_source["gender"].fillna(""),
-            "Race": picker_source["race_name"].fillna(""),
-            "Athletes": picker_source["start_count"].fillna(0).astype(int),
-            "Profile": picker_source["profile"].fillna(""),
-        })
-        st.caption("Click a row to load that race.")
-        picker_state = st.dataframe(
-            picker_view,
-            width="stretch",
-            height=min(300, 40 + max(1, min(len(picker_view), 7)) * 34),
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            selection_default={"selection": {"rows": [default_index]}},
-            key="dashboard_selected_race_board",
-            column_config={
-                "Date": st.column_config.TextColumn("Date", width="small"),
-                "Gender": st.column_config.TextColumn("Gender", width="small"),
-                "Race": st.column_config.TextColumn("Race", width="large"),
-                "Athletes": st.column_config.NumberColumn("Athletes", width="small", format="%d"),
-                "Profile": st.column_config.TextColumn("Profile", width="medium"),
-            },
+        race_option_labels = {}
+        for _, rr in filtered_races.iterrows():
+            label = clean_str(rr.get("label"))
+            profile = clean_str(rr.get("profile")) or "Other"
+            date_label = clean_str(rr.get("race_date_label")) or "No date"
+            gender_label = clean_str(rr.get("gender")) or "All"
+            race_label = clean_str(rr.get("race_name"))
+            athletes_label = int(rr.get("start_count") or 0)
+            race_option_labels[label] = f"{profile}  |  {date_label}  |  {gender_label}  |  {race_label}  |  {athletes_label} athletes"
+        selected_label = st.selectbox(
+            "Race to analyze",
+            filtered_labels,
+            index=default_index,
+            key="dashboard_selected_race_picker",
+            format_func=lambda x: race_option_labels.get(x, x),
         )
-        selection = getattr(picker_state, "selection", {}) or {}
-        selected_rows = selection.get("rows", []) if isinstance(selection, dict) else getattr(selection, "rows", [])
-        selected_index = int(selected_rows[0]) if selected_rows else default_index
-        selected_index = max(0, min(selected_index, len(picker_source) - 1))
-        selected_label = clean_str(picker_source.iloc[selected_index]["label"])
         st.session_state["dashboard_selected_race_label"] = selected_label
         selected_preview = filtered_races[filtered_races["label"] == selected_label].iloc[0]
         st.caption(
