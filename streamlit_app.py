@@ -20,6 +20,14 @@ except Exception as _score_engine_import_error:
 else:
     SCORE_ENGINE_IMPORT_ERROR = None
 
+try:
+    from trinews_api_refresh import build_clean_results_refresh
+except Exception as _trinews_api_import_error:
+    build_clean_results_refresh = None
+    TRINEWS_API_IMPORT_ERROR = _trinews_api_import_error
+else:
+    TRINEWS_API_IMPORT_ERROR = None
+
 st.set_page_config(page_title="Triathlon Picks", page_icon="🏁", layout="wide")
 
 # ============================================================
@@ -1913,7 +1921,16 @@ def result_update_payload(existing: Dict[str, Any], incoming: Dict[str, Any]) ->
         v = incoming.get(col)
         if row_has_value(v):
             existing_missing = not row_has_value(existing.get(col))
-            if existing_missing:
+            should_replace = existing_missing
+            # Clean API refreshes should be allowed to repair corrupted split seconds
+            # from old spreadsheet imports, for example 0:32 saved as 32 seconds.
+            if col in ["swim_seconds", "bike_seconds", "run_seconds"]:
+                discipline = col.replace("_seconds", "")
+                incoming_valid = validate_split_seconds(parse_int(v), discipline, incoming.get("race_type") or existing.get("race_type"))
+                existing_valid = validate_split_seconds(parse_int(existing.get(col)), discipline, existing.get("race_type") or incoming.get("race_type"))
+                if incoming_valid is not None and existing_valid is None:
+                    should_replace = True
+            if should_replace:
                 payload[col] = v
 
     # Keep raw payload if the existing row does not have it; do not constantly rewrite JSON.
@@ -5435,7 +5452,88 @@ elif page == "Import CSVs":
                     st.error("Import failed.")
                     st.exception(e)
 
+
     with import_tabs[1]:
+        section_title("🔄", "Clean API results refresh")
+        st.write("Refresh athlete results from the clean TriNews API tables instead of the older spreadsheet import. This repairs corrupted split times like 0:32 or 3:14 when the API has the full leg time.")
+        if build_clean_results_refresh is None:
+            st.error(f"trinews_api_refresh.py could not be imported: {TRINEWS_API_IMPORT_ERROR}")
+            st.info("Add trinews_api_refresh.py to the repo root next to streamlit_app.py.")
+        else:
+            try:
+                default_trinews_key = st.secrets.get("TRINEWS_API_KEY", "")
+            except Exception:
+                default_trinews_key = ""
+            api_key = st.text_input(
+                "TriNews API key",
+                value=default_trinews_key,
+                type="password",
+                help="Use the permissioned public/anon API key. Add TRINEWS_API_KEY to Streamlit secrets to avoid pasting it each time.",
+                key="trinews_clean_refresh_key",
+            )
+            st.caption("Enter athlete names, athlete URLs, slugs, or TriNews athlete UUIDs. One per line.")
+            identifiers_text = st.text_area(
+                "Athletes to refresh",
+                value="Hanne De Vet",
+                height=120,
+                key="trinews_clean_refresh_identifiers",
+            )
+            c1, c2, c3 = st.columns(3)
+            result_limit = c1.number_input("Recent results per athlete", min_value=5, max_value=250, value=100, step=5)
+            include_fields = c2.checkbox("Refresh full race fields", value=True, help="Recommended. This pulls every athlete in each refreshed race so split scorecards have the correct field baseline.")
+            max_races = c3.number_input("Max race fields", min_value=1, max_value=100, value=40, step=1)
+            st.info("Recommended flow: refresh a small group first, review the log, then rebuild athlete scorecards.")
+            if st.button("Run clean API refresh", type="primary", key="run_clean_api_refresh"):
+                identifiers = [x.strip() for x in identifiers_text.splitlines() if x.strip()]
+                if not identifiers:
+                    st.warning("Enter at least one athlete.")
+                elif not api_key:
+                    st.warning("Enter the TriNews API key or add TRINEWS_API_KEY to Streamlit secrets.")
+                else:
+                    loader = loading_card("Refreshing clean API results", "Resolving athletes, races, results, and split times...")
+                    try:
+                        refresh_payload = build_clean_results_refresh(
+                            api_key=api_key,
+                            identifiers=identifiers,
+                            result_limit_per_athlete=int(result_limit),
+                            include_race_fields=bool(include_fields),
+                            max_races=int(max_races),
+                        )
+                    finally:
+                        loader.empty()
+
+                    athlete_rows = refresh_payload.get("athletes", []) or []
+                    athlete_result_rows = dedupe_result_rows(refresh_payload.get("athlete_results", []) or [])
+                    race_field_rows = dedupe_result_rows(refresh_payload.get("race_field_results", []) or [])
+
+                    # Save master athletes first. Manual gender overrides still win inside the normal sync path.
+                    a_inserted, a_updated = upsert_athletes_preserve_gender(athlete_rows)
+
+                    ar_rows, ar_ath_ins, ar_ath_upd, ar_prop = sync_athlete_master_import(athlete_result_rows, athlete_rows)
+                    rf_rows, rf_ath_ins, rf_ath_upd, rf_prop = sync_athlete_master_import(race_field_rows, athlete_rows)
+
+                    ar_inserted, ar_skipped, ar_updated = merge_result_rows("athlete_results", ar_rows)
+                    rf_inserted, rf_skipped, rf_updated = merge_result_rows("race_field_results", rf_rows)
+                    clear_cache()
+
+                    st.success(
+                        "Clean API refresh complete. "
+                        f"Athlete results: {ar_inserted:,} inserted, {ar_updated:,} updated, {ar_skipped:,} skipped. "
+                        f"Race-field results: {rf_inserted:,} inserted, {rf_updated:,} updated, {rf_skipped:,} skipped. "
+                        f"Athletes: {a_inserted + ar_ath_ins + rf_ath_ins:,} new, {a_updated + ar_ath_upd + rf_ath_upd:,} updated."
+                    )
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Resolved athletes", f"{len(athlete_rows):,}")
+                    m2.metric("Athlete result rows", f"{len(ar_rows):,}")
+                    m3.metric("Race-field rows", f"{len(rf_rows):,}")
+                    m4.metric("Races found", f"{refresh_payload.get('races_found', 0):,}")
+                    logs_df = pd.DataFrame(refresh_payload.get("logs", []) or [])
+                    if not logs_df.empty:
+                        st.subheader("API refresh log")
+                        st.dataframe(logs_df, width="stretch")
+                    st.info("Next step: Model Cache → Rebuild athlete scorecards.")
+
+    with import_tabs[2]:
         section_title("📋", "Start-list imports and updates")
         st.write("Use this when a start list changes. Replace a selected race/gender group, merge only new athletes, or import a CSV that already includes race/date/gender columns.")
         start_mode = st.radio(
@@ -5517,13 +5615,13 @@ elif page == "Import CSVs":
                         st.error("Start-list import failed.")
                         st.exception(e)
 
-    with import_tabs[2]:
+    with import_tabs[3]:
         section_title("🧬", "Manual gender fixes")
         st.write("Fix athlete gender from a small CSV. This writes to the athlete master and propagates the gender to linked result/start-list rows.")
         raw_athletes = load_table("athletes")
         render_manual_gender_override_import(raw_athletes, key_prefix="import_center_gender")
 
-    with import_tabs[3]:
+    with import_tabs[4]:
         section_title("⚙️", "Overrides and settings")
         admin_choice = st.radio("Admin CSV type", ["Race Overrides", "Scoring Settings"], horizontal=True)
         replace_admin = st.checkbox("Replace existing rows before importing", value=False, key="admin_replace_csv")
