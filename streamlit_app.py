@@ -28,7 +28,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "scorecard_tables_v6_gender_locks"
+MODEL_CACHE_VERSION = "scorecard_tables_v7_no_zero_padding"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -3434,8 +3434,8 @@ def add_split_openrank_scores(audit: pd.DataFrame) -> pd.DataFrame:
     """Add OpenRank-like split score columns to the audit table.
 
     Split score = 35% position + 35% SOF + 30% split-time quality.
-    Athlete ranking then uses best 4 split scores in a rolling 52-week window,
-    padding missing scores with zero exactly like OpenRank's best-4 model.
+    Athlete ranking uses up to the top configured split scores in the rolling 52-week window.
+    Missing evidence is not padded with zero; confidence/evidence_count carries the sample-size warning.
     """
     if audit is None or audit.empty:
         return pd.DataFrame() if audit is None else audit
@@ -3496,10 +3496,17 @@ def add_split_openrank_scores(audit: pd.DataFrame) -> pd.DataFrame:
 
 
 def best4_openrank_average(values: Iterable[Any], divisor: int = 4) -> Tuple[float, List[float]]:
-    vals = [float(v) for v in values if safe_float(v) is not None]
+    """Return the average of the available top scores, without padding missing slots.
+
+    `divisor` is now a max-count, not a forced denominator. If an athlete has
+    only 3 eligible races, we average those 3 and carry the lower sample size in
+    Evidence Count / Confidence instead of inserting 0.0 placeholder races.
+    """
+    vals = [float(v) for v in values if safe_float(v) is not None and float(v) > 0]
     vals = sorted(vals, reverse=True)[:divisor]
-    padded = vals + [0.0] * max(0, divisor - len(vals))
-    return (sum(padded) / divisor if divisor else 0.0), padded
+    if not vals:
+        return 0.0, []
+    return sum(vals) / len(vals), vals
 
 
 # Override previous split scoring with OpenRank-aligned split scoring.
@@ -3610,6 +3617,20 @@ def humanize_dataframe_for_display(show: pd.DataFrame) -> pd.DataFrame:
         show[col] = show[col].map(lambda x: "" if x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x) else str(x))
     return show
 
+
+
+def dynamic_table_height(df: pd.DataFrame, requested: Optional[int] = None, row_height: int = 34, header_height: int = 42, max_height: int = 650) -> Optional[int]:
+    """Choose a compact dataframe height so small result sets do not show a big empty grid."""
+    if df is None or df.empty:
+        return None
+    rows = int(len(df))
+    calc = min(max_height, header_height + max(rows, 1) * row_height)
+    if isinstance(requested, int) and requested > 0:
+        return min(requested, calc)
+    if rows <= 15:
+        return calc
+    return requested
+
 def display_table(df: pd.DataFrame, columns: List[str], height: Optional[int] = None):
     if df is None or df.empty:
         st.info("No data to show.")
@@ -3624,8 +3645,9 @@ def display_table(df: pd.DataFrame, columns: List[str], height: Optional[int] = 
         "width": "stretch",
         "hide_index": True,
     }
-    if isinstance(height, int) and height > 0:
-        kwargs["height"] = height
+    compact_height = dynamic_table_height(show, height)
+    if isinstance(compact_height, int) and compact_height > 0:
+        kwargs["height"] = compact_height
 
     st.dataframe(show, **kwargs)
 
@@ -3651,8 +3673,9 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
         "hide_index": True,
         "key": key,
     }
-    if isinstance(height, int) and height > 0:
-        kwargs["height"] = height
+    compact_height = dynamic_table_height(show, height)
+    if isinstance(compact_height, int) and compact_height > 0:
+        kwargs["height"] = compact_height
 
     try:
         event = st.dataframe(
@@ -3681,7 +3704,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "scorecard_tables_v6_gender_locks"
+MODEL_CACHE_VERSION = "scorecard_tables_v7_no_zero_padding"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4223,7 +4246,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "scorecard_tables_v6_gender_locks"
+MODEL_CACHE_VERSION = "scorecard_tables_v7_no_zero_padding"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4323,7 +4346,7 @@ def _split_evidence_rows(g: pd.DataFrame, top_n: int) -> List[Dict[str, Any]]:
     return rows
 
 
-# Simple overall score: top X ORS rows inside trailing 52 weeks, padded with zero.
+# Simple overall score: average the available top X ORS rows inside trailing 52 weeks; no zero padding.
 def score_overall(
     results: pd.DataFrame,
     start_athletes: pd.DataFrame,
@@ -4392,7 +4415,7 @@ def score_overall(
     return out
 
 
-# Simple split score: top X discipline-specific split scores inside trailing 52 weeks, padded with zero.
+# Simple split score: average the available top X discipline-specific split scores inside trailing 52 weeks; no zero padding.
 def score_splits_for_start_list(
     audit: pd.DataFrame,
     start_athletes: pd.DataFrame,
@@ -4995,7 +5018,7 @@ def build_race_prediction_from_scorecard_tables(starts: pd.DataFrame, selected_r
 def render_score_evidence(scored: pd.DataFrame, title: str, limit: int = 5) -> None:
     if scored is None or scored.empty or "Score Evidence" not in scored.columns:
         return
-    st.caption(f"Open an athlete to see the {TOP_SCORES_USED} race rows feeding the displayed score.")
+    st.caption(f"Open an athlete to see the up to {TOP_SCORES_USED} race rows feeding the displayed score. Missing slots are not padded with 0.0.")
     for _, r in scored.head(limit).iterrows():
         athlete = clean_str(r.get("Athlete")) or "Athlete"
         score = r.get("Score")
@@ -5028,7 +5051,7 @@ def _render_missing_scorecards(params: Dict[str, Any], discipline: str) -> None:
         missing = (params.get("missing_scorecards") or {}).get(discipline, []) or []
     if missing:
         with st.expander(f"Missing {discipline.title()} scorecards / no eligible evidence ({len(missing)})", expanded=False):
-            st.caption("These athletes are on the start list, but they do not have an eligible positive scorecard for this profile/discipline. They are separated from the picks table so they do not appear as fake 0.0 picks.")
+            st.caption("These athletes are on the start list, but they do not have an eligible positive scorecard for this profile/discipline. Use Split Audit → Raw imported career rows to see whether the cause is missing imports, missing splits, outside the 52-week window, wrong gender, or outside the selected profile.")
             display_table(pd.DataFrame(missing), ["Athlete", "Discipline", "Reason", "Athlete URL"], height=280)
 
 
@@ -6167,17 +6190,36 @@ elif page in {"Race Dashboard", "Split Audit"}:
 
             if athlete_filter != "All":
                 with st.expander(f"Raw imported career rows for {athlete_filter}", expanded=False):
-                    raw = results_window[results_window["athlete_name"].fillna("").eq(athlete_filter)].copy()
-                    if raw.empty:
-                        st.info("No raw imported result rows found for this athlete in the current analysis window.")
+                    # Show ALL imported rows in the two-year analysis window, not only rows that passed the
+                    # selected prediction profile. This is the fastest way to see whether a missing scorecard is
+                    # caused by missing imports, missing split seconds, wrong gender, outside the 52-week scoring
+                    # window, or a race-family filter.
+                    raw_all = results_window_all[results_window_all["athlete_name"].fillna("").eq(athlete_filter)].copy()
+                    if raw_all.empty:
+                        st.info("No raw imported result rows found for this athlete in the full analysis window.")
                     else:
                         split_col = f"{disc}_seconds"
-                        raw[f"{disc}_split"] = raw[split_col].map(format_seconds) if split_col in raw.columns else "—"
-                        raw = raw.sort_values("race_date", ascending=False)
-                        st.caption("This is the full imported career data in the analysis window. It explains why rows may not appear as included scoring rows: DNF/DNS/DSQ, missing split, draft-legal bike, or invalid split parsing.")
+                        raw_all[f"{disc}_split"] = raw_all[split_col].map(format_seconds) if split_col in raw_all.columns else "—"
+                        raw_all["Has Split"] = raw_all[split_col].notna() if split_col in raw_all.columns else False
+                        raw_all["Profile Eligible"] = ranking_scope_mask(raw_all, prediction_scope)
+                        trailing_start = selected_date - pd.Timedelta(days=365)
+                        raw_all["Inside 52 Weeks"] = (raw_all["race_date"].notna()) & (raw_all["race_date"] >= trailing_start) & (raw_all["race_date"] <= selected_date)
+                        raw_all["Gender Compatible"] = raw_all.apply(lambda rr: (normalize_gender(rr.get("gender")) == selected_gender) or pd.isna(rr.get("gender")) or race_gender_compatible(rr.get("race_name"), selected_gender), axis=1)
+                        raw_all["Why Not Used"] = raw_all.apply(
+                            lambda rr: "; ".join([x for x in [
+                                None if bool(rr.get("Gender Compatible")) else "gender mismatch",
+                                None if bool(rr.get("Profile Eligible")) else "outside selected profile",
+                                None if bool(rr.get("Inside 52 Weeks")) else "outside trailing 52 weeks",
+                                None if bool(rr.get("Has Split")) else f"missing {disc} split",
+                                "bad status" if bool(rr.get("bad_status")) else None,
+                            ] if x]) or "eligible for audit",
+                            axis=1,
+                        )
+                        raw_all = raw_all.sort_values("race_date", ascending=False)
+                        st.caption("This shows every imported row for the athlete in the full two-year analysis window. If only one row appears here, the app only has one imported result for that athlete. If rows appear but are not used, check the 'Why Not Used' column.")
                         display_table(
-                            raw,
-                            ["race_date", "race_name", "race_type", "distance", "place", "status", "bad_status", "sof", "sof_source", "sof_original", "ors", f"{disc}_split", "swim_seconds", "bike_seconds", "run_seconds"],
-                            height=400,
+                            raw_all,
+                            ["race_date", "race_name", "race_type", "distance", "place", "status", "gender", "sof", "sof_source", "ors", f"{disc}_split", "Has Split", "Profile Eligible", "Inside 52 Weeks", "Gender Compatible", "Why Not Used", "swim_seconds", "bike_seconds", "run_seconds"],
+                            height=420,
                         )
 
