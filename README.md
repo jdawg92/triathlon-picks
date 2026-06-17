@@ -344,11 +344,13 @@ ranking_score = sum(best 4 distance-weighted race scores) / 4
 
 This means one outstanding race still shows as high ceiling evidence, but it no longer automatically outranks athletes with repeated elite results. For long-course splits, swim and bike evidence transfers equally between 70.3/T100 and Full IRONMAN. Run evidence transfers with distance-specific weighting because 70.3/T100 and Full IM run performance do not always map perfectly.
 
+For short-course / WTCS scoring, imported SOF is used when available. If SOF is missing, the score engine seeds a conservative field-strength value from the race tier: Olympic Games, WTCS, World Triathlon Cup, and qualifying Olympic-distance continental cups each get different fallback SOF values so missing API SOF does not flatten elite short-course evidence.
+
 ## Model version
 Use the current scorecard model version consistently across app, engine, scorecards, evidence, and dashboard filters:
 
 ```text
-score_engine_v10_lc_full_overall_95
+score_engine_v11_wtcs_sof_watchcards
 ```
 
 If this changes, rebuild all scorecards and ensure dashboard filters are updated to the same version.
@@ -471,7 +473,7 @@ If it loads around 1,000 rows, pagination is broken or the deployed file is stal
 Make sure all references use the same version:
 
 ```text
-score_engine_v10_lc_full_overall_95
+score_engine_v11_wtcs_sof_watchcards
 ```
 
 Check:
@@ -537,6 +539,7 @@ When editing the app:
 - Keep old manual/CSV tables out of the new scoring model path.
 - Prefer stable IDs over names.
 - Make scorecard rankings explainable through evidence rows.
+
 
 
 

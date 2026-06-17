@@ -44,7 +44,7 @@ PROFILES = [
 ]
 DISCIPLINES = ["overall", "swim", "bike", "run"]
 
-MODEL_ENGINE_VERSION = "score_engine_v10_lc_full_overall_95"
+MODEL_ENGINE_VERSION = "score_engine_v11_wtcs_sof_watchcards"
 
 DEFAULT_LOOKBACK_DAYS = 365
 FULL_IM_LOOKBACK_DAYS = 365
@@ -368,11 +368,35 @@ def _race_text(df: pd.DataFrame) -> pd.Series:
     return parts[0] + " " + parts[1] + " " + parts[2]
 
 
+def _short_course_sof_seed_series(df: pd.DataFrame) -> pd.Series:
+    """Fallback SOF for short-course races when imported SOF is missing."""
+    if df is None or df.empty:
+        return pd.Series([], dtype=float)
+    txt = _race_text(df)
+    seed = pd.Series(np.nan, index=df.index, dtype="float64")
+    seed = seed.mask(txt.str.contains("olympic games|olympics", regex=True, na=False), 92.0)
+    seed = seed.mask(txt.str.contains("wtcs|world triathlon championship series|world triathlon championships", regex=True, na=False), 88.0)
+    seed = seed.mask(txt.str.contains("world triathlon cup", regex=True, na=False), 76.0)
+    olympic_conti = txt.str.contains(
+        "continental cup|europe triathlon cup|africa triathlon cup|americas triathlon cup|asia triathlon cup|oceania triathlon cup",
+        regex=True,
+        na=False,
+    ) & txt.str.contains("olympic|standard", regex=True, na=False)
+    seed = seed.mask(olympic_conti, 64.0)
+    return seed
+
+
+def _effective_sof_series(df: pd.DataFrame) -> pd.Series:
+    sof = pd.to_numeric(df.get("sof", pd.Series([np.nan] * len(df), index=df.index)), errors="coerce")
+    seeded = _short_course_sof_seed_series(df)
+    return sof.where(sof.notna() & (sof > 0), seeded)
+
+
 def _profile_mask(df: pd.DataFrame, profile: str) -> pd.Series:
     if df.empty:
         return pd.Series([], dtype=bool, index=df.index)
     txt = _race_text(df)
-    sof = pd.to_numeric(df.get("sof", pd.Series([np.nan] * len(df), index=df.index)), errors="coerce")
+    sof = _effective_sof_series(df)
 
     is_full = txt.str.contains(r"\b140\.6\b|full ironman|\bfull\b", regex=True, na=False) | (
         txt.str.contains("ironman", na=False)
@@ -584,7 +608,7 @@ def _prior_score_map(work: pd.DataFrame, top_n: int) -> Dict[str, Tuple[float, i
 
 def _quality_flags(rows: pd.DataFrame, profile: str, discipline: str) -> Tuple[pd.Series, pd.Series]:
     txt = _race_text(rows)
-    sof = pd.to_numeric(rows.get("sof", pd.Series([np.nan] * len(rows), index=rows.index)), errors="coerce").fillna(0)
+    sof = _effective_sof_series(rows).fillna(0)
     premium = txt.str.contains("world championship|championship final|t100|pto|olympic games|wtcs", regex=True, na=False)
     if profile == "Full IRONMAN":
         premium = premium | txt.str.contains(
@@ -671,7 +695,8 @@ def _split_score_rows(
     sample         = work["sample_size"].clip(lower=1)
     rank           = work["split_rank_num"].fillna(sample)
     position_score = 100 * (sample - rank + 1) / sample
-    sof_score      = pd.to_numeric(work["sof"], errors="coerce").fillna(0).clip(lower=0, upper=100)
+    effective_sof  = _effective_sof_series(work)
+    sof_score      = effective_sof.fillna(0).clip(lower=0, upper=100)
     time_score     = (100 - work["pct_behind_fastest"].fillna(0) * 8).clip(lower=0, upper=100)
 
     # OpenRank-style blend: position + SOF + time. Splits use split rank/time
@@ -682,7 +707,7 @@ def _split_score_rows(
     score = (base_score * transfer_vals).clip(upper=100)
 
     # Guardrails: prevent weak-field / no-SOF results from dominating
-    missing_sof = pd.to_numeric(work["sof"], errors="coerce").isna() | (pd.to_numeric(work["sof"], errors="coerce") <= 0)
+    missing_sof = effective_sof.isna() | (effective_sof <= 0)
     score = score.mask(missing_sof, np.minimum(score, 55))
     score = score.mask(work["sample_size"] < 3, np.minimum(score, 45))
 
@@ -690,6 +715,7 @@ def _split_score_rows(
     work["premium_evidence"]  = premium
     work["strong_evidence"]   = strong
     work["score_value"]       = score.round(4)
+    work["effective_sof"]     = effective_sof.round(3)
     work["recency_factor"]    = 1.0
     work["relevance_factor"]  = transfer_vals.round(3)
     work["distance_transfer_weight"] = transfer_vals.round(3)
@@ -829,7 +855,7 @@ def _group_top_scores(
             "confidence":          confidence,
             "last_race_name":      _clean(last.get("race_name")),
             "last_race_date":      last_race_date,
-            "computed_source":     f"score_engine_v10 - lc-full-overall-95 - {gender} - {profile} - {discipline}",
+            "computed_source":     f"score_engine_v11 - wtcs-sof-watchcards - {gender} - {profile} - {discipline}",
             "raw":                 _json_row(raw),
         })
 
@@ -850,7 +876,7 @@ def _group_top_scores(
                 "race_name":        _clean(ev.get("race_name")),
                 "race_type":        _clean(ev.get("race_type")),
                 "place":            _clean(ev.get("place")),
-                "sof":              _safe_float(ev.get("sof")),
+                "sof":              _safe_float(ev.get("effective_sof")) or _safe_float(ev.get("sof")),
                 "ors":              _safe_float(ev.get("ors")),
                 "split_text":       _clean(ev.get("split_text")) if discipline != "overall" else "",
                 "split_rank":       _clean(ev.get("split_rank_display")) if discipline != "overall" else "",
@@ -861,7 +887,8 @@ def _group_top_scores(
                     "Race":               _clean(ev.get("race_name")),
                     "Race Type":          _clean(ev.get("race_type")),
                     "Place":              _clean(ev.get("place")),
-                    "SOF":                _safe_float(ev.get("sof")),
+                    "SOF":                _safe_float(ev.get("effective_sof")) or _safe_float(ev.get("sof")),
+                    "Imported SOF":       _safe_float(ev.get("sof")),
                     "ORS":                _safe_float(ev.get("ors")),
                     "Split":              _clean(ev.get("split_text")),
                     "Split Rank":         _clean(ev.get("split_rank_display")),
@@ -1005,6 +1032,7 @@ def build_all_scorecards(
                 logs.append(log)
 
     return pd.DataFrame(cards), pd.DataFrame(evidence), pd.DataFrame(logs)
+
 
 
 

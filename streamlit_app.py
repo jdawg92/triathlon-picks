@@ -83,7 +83,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v10_lc_full_overall_95"
+MODEL_CACHE_VERSION = "score_engine_v11_wtcs_sof_watchcards"
 TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4190,7 +4190,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v10_lc_full_overall_95"
+MODEL_CACHE_VERSION = "score_engine_v11_wtcs_sof_watchcards"
 TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4727,7 +4727,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "score_engine_v10_lc_full_overall_95"
+MODEL_CACHE_VERSION = "score_engine_v11_wtcs_sof_watchcards"
 TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -5998,6 +5998,7 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
         if section_df.empty:
             continue
         for _, r in section_df.iterrows():
+            rank = parse_int(r.get("Rank")) or 999
             evidence_count = parse_int(r.get("Evidence Count")) or 0
             race_pick = safe_float(r.get("Race Pick Score")) or 0.0
             ranking_score = safe_float(r.get("Score")) or 0.0
@@ -6005,6 +6006,8 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
             premium = parse_int(r.get("Premium Evidence Count")) or 0
             strong = parse_int(r.get("Strong Evidence Count")) or 0
             reasons = []
+            if rank > 5 and race_pick >= 60:
+                reasons.append("best outside top 5")
             if evidence_count <= 2 and perf_score >= 78:
                 reasons.append("limited sample, high ceiling")
             if race_pick - ranking_score >= 12 and race_pick >= 65:
@@ -6016,6 +6019,7 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
             rows.append({
                 "Athlete": clean_str(r.get("Athlete")),
                 "Signal": label,
+                "Rank": rank,
                 "Watch Score": round(race_pick, 1),
                 "Performance": round(perf_score, 1),
                 "Ranking": round(ranking_score, 1),
@@ -6031,6 +6035,39 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
+    if watch is None or watch.empty:
+        return
+    sections = ["Overall", "Swim", "Bike", "Run"]
+    picks = []
+    for section in sections:
+        w = watch[watch["Signal"] == section].copy()
+        if w.empty:
+            continue
+        outside = w[pd.to_numeric(w.get("Rank"), errors="coerce").fillna(999) > 5].copy()
+        pick = (outside if not outside.empty else w).sort_values(["Watch Score", "Performance"], ascending=[False, False]).head(1)
+        if not pick.empty:
+            picks.append(pick.iloc[0].to_dict())
+    if not picks:
+        return
+
+    section_title("👀", "Keep An Eye On")
+    cols = st.columns(min(4, len(picks)))
+    for col, row in zip(cols, picks):
+        with col:
+            st.markdown(
+                f"""
+                <div class="tri-card">
+                    <div class="kicker">{clean_str(row.get("Signal"))} · Rank {parse_int(row.get("Rank")) or "—"}</div>
+                    <div class="title">{clean_str(row.get("Athlete"))}</div>
+                    <div class="body">Watch {safe_float(row.get("Watch Score")) or 0:.1f} · Perf {safe_float(row.get("Performance")) or 0:.1f} · Evidence {parse_int(row.get("Evidence")) or 0}</div>
+                    <div class="body">{clean_str(row.get("Reason"))}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
 def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional[Dict[str, Any]] = None) -> None:
     params = (cache_meta or {}).get("params", {}) if isinstance(cache_meta, dict) else {}
     computed_at = (cache_meta or {}).get("computed_at") if isinstance(cache_meta, dict) else None
@@ -6042,19 +6079,20 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
     st.info("Fast mode: showing saved athlete scorecards joined to this start list. Missing/no-evidence athletes are shown in separate expanders instead of polluting the pick tables with 0.0 rows.")
 
     section_title("🏆", "Overall Picks")
+    watch = build_keep_an_eye_table(cached_df)
+    render_keep_an_eye_cards(watch)
+    if not watch.empty:
+        with st.expander(f"Keep an eye on details ({len(watch)})", expanded=False):
+            display_table(
+                watch.head(30),
+                ["Athlete", "Signal", "Rank", "Watch Score", "Performance", "Ranking", "Evidence", "Reason", "Last Race", "Last Race Date"],
+                height=360,
+            )
+
     overall = _positive_score_rows(cached_section(cached_df, "overall"))
     display_table(overall.head(20), ["Rank", "Athlete", "Race Pick Score", "Race Evidence Score", "Race Performance Score", "Race Evidence Scores", "Score", "Performance Score", "OpenRank Score", "Best Scores Used", "Best Scores Padded", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date"])
     render_score_evidence(overall, "Overall score evidence", limit=8)
     _render_missing_scorecards(params, "overall")
-
-    watch = build_keep_an_eye_table(cached_df)
-    if not watch.empty:
-        with st.expander(f"Keep an eye on ({len(watch)})", expanded=False):
-            display_table(
-                watch.head(30),
-                ["Athlete", "Signal", "Watch Score", "Performance", "Ranking", "Evidence", "Reason", "Last Race", "Last Race Date"],
-                height=360,
-            )
 
     st.divider()
     tabs = st.tabs(["🏊 Fastest Swim", "🚴 Fastest Bike", "🏃 Fastest Run"])
@@ -8645,6 +8683,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
                             ["race_date", "race_name", "race_type", "distance", "place", "status", "gender", "sof", "sof_source", "ors", f"{disc}_split", "Has Split", "Profile Eligible", "Inside 52 Weeks", "Gender Compatible", "Why Not Used", "swim_seconds", "bike_seconds", "run_seconds"],
                             height=420,
                         )
+
 
 
 
