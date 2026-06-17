@@ -2930,304 +2930,6 @@ def build_split_audit(
 
     return pd.DataFrame(audit_rows)
 
-def score_splits_for_start_list(
-    audit: pd.DataFrame,
-    start_athletes: pd.DataFrame,
-    target_date: pd.Timestamp,
-    top_n: int,
-    strong_sof_threshold: float,
-) -> pd.DataFrame:
-    if audit.empty:
-        return pd.DataFrame()
-    start_urls = set(start_athletes["athlete_url"].dropna().astype(str).tolist())
-    start_names = set(start_athletes["athlete_name"].dropna().astype(str).str.lower().tolist())
-    df = audit.copy()
-    df = df[df["included"]]
-    df = df[(df["athlete_url"].isin(start_urls)) | (df["athlete_name"].fillna("").str.lower().isin(start_names))]
-    if df.empty:
-        return pd.DataFrame()
-
-    discipline = clean_str(df["discipline"].dropna().iloc[0]) if "discipline" in df.columns and df["discipline"].notna().any() else "swim"
-
-    # Recompute quality flags using the current sidebar threshold. Premium =
-    # T100 / championship / very-high-SOF / elite-relevant evidence. Strong =
-    # useful evidence. The final score is anchored to premium first so normal
-    # low/medium-field wins cannot outrank athletes who repeatedly prove it in
-    # T100 / World Championship / very high SOF races.
-    df["premium_evidence"] = df.apply(lambda r: is_premium_split_evidence(r, discipline, strong_sof_threshold), axis=1)
-    df["strong_evidence"] = df.apply(lambda r: is_strong_split_evidence(r, discipline, strong_sof_threshold), axis=1)
-    df["quality_tier"] = df.apply(lambda r: evidence_quality_label(r, discipline, strong_sof_threshold), axis=1)
-
-    rows = []
-    for athlete_key, g in df.groupby(df["athlete_url"].fillna(df["athlete_name"])):
-        g = g.sort_values("race_date", ascending=False).copy()
-        recent = g.head(top_n).copy()
-        recent_scored = recent
-
-        if recent_scored.empty:
-            continue
-
-        scores = recent_scored["evidence_score"].astype(float).tolist()
-        weights = recent_scored["evidence_weight"].astype(float).tolist()
-        recent_score = weighted_avg(scores, weights) or 0
-
-        premium = recent_scored[recent_scored["premium_evidence"].astype(bool)].copy()
-        strong = recent_scored[recent_scored["strong_evidence"].astype(bool)].copy()
-        medium_or_better = recent_scored[recent_scored["quality_tier"].isin(["Premium", "Strong", "Medium"])].copy()
-
-        premium_score = weighted_avg(premium["evidence_score"].astype(float).tolist(), premium["evidence_weight"].astype(float).tolist()) if not premium.empty else 0
-        premium_weights = premium["evidence_weight"].astype(float).tolist() if not premium.empty else []
-        premium_top3_rate = weighted_avg((premium["split_rank"] <= 3).astype(float).tolist(), premium_weights) if not premium.empty else 0
-        premium_fastest_rate = weighted_avg((premium["split_rank"] == 1).astype(float).tolist(), premium_weights) if not premium.empty else 0
-        premium_avg_behind = weighted_avg(premium["pct_behind_fastest"].astype(float).tolist(), premium_weights) if not premium.empty else None
-        premium_count = len(premium)
-
-        strong_score = weighted_avg(strong["evidence_score"].astype(float).tolist(), strong["evidence_weight"].astype(float).tolist()) if not strong.empty else 0
-        strong_weights = strong["evidence_weight"].astype(float).tolist() if not strong.empty else []
-        strong_top3_rate = weighted_avg((strong["split_rank"] <= 3).astype(float).tolist(), strong_weights) if not strong.empty else 0
-        strong_fastest_rate = weighted_avg((strong["split_rank"] == 1).astype(float).tolist(), strong_weights) if not strong.empty else 0
-        strong_avg_behind = weighted_avg(strong["pct_behind_fastest"].astype(float).tolist(), strong_weights) if not strong.empty else None
-        strong_count = len(strong)
-
-        all_top3_rate = weighted_avg((recent_scored["split_rank"] <= 3).astype(float).tolist(), weights) or 0
-        all_fastest_rate = weighted_avg((recent_scored["split_rank"] == 1).astype(float).tolist(), weights) or 0
-        avg_behind = weighted_avg(recent_scored["pct_behind_fastest"].astype(float).tolist(), weights)
-        evidence_count = len(recent_scored)
-        count_score = min(100, evidence_count / 5 * 100)
-
-        if premium_count > 0:
-            final = (
-                0.70 * premium_score
-                + 0.12 * strong_score
-                + 0.08 * recent_score
-                + 0.06 * (premium_top3_rate or 0) * 100
-                + 0.04 * count_score
-            )
-        elif strong_count > 0:
-            # Strong but not premium: can rank well, but should not outrank
-            # repeated T100/World/very-high-SOF proof unless the strong rows are
-            # exceptional and numerous.
-            final = (
-                0.55 * strong_score
-                + 0.20 * recent_score
-                + 0.12 * (strong_top3_rate or 0) * 100
-                + 0.05 * (strong_fastest_rate or 0) * 100
-                + 0.08 * count_score
-            )
-        else:
-            # No strong rows: useful but capped. Low-SOF/development wins belong
-            # here unless the athlete also has premium/strong proof.
-            final = (
-                0.45 * recent_score
-                + 0.18 * all_top3_rate * 100
-                + 0.07 * all_fastest_rate * 100
-                + 0.05 * count_score
-            )
-
-        # Premium/strong-field closeness gates. Being close in a premium race
-        # matters more than winning a normal/weak race. Repeatedly being far back
-        # in premium/strong races should cap the athlete.
-        gate_behind = premium_avg_behind if premium_avg_behind is not None else strong_avg_behind
-        if gate_behind is not None:
-            if gate_behind > 6:
-                final = min(final, 55)
-            elif gate_behind > 4:
-                final = min(final, 68)
-            elif gate_behind > 2.5:
-                final = min(final, 78)
-        elif avg_behind is not None:
-            if avg_behind > 8:
-                final = min(final, 45)
-            elif avg_behind > 5:
-                final = min(final, 58)
-            elif avg_behind > 3.5:
-                final = min(final, 68)
-
-        # If no recent top-5 and not close by percentage, cap hard.
-        if len(recent_scored) and not (recent_scored["split_rank"] <= 5).any() and (avg_behind is None or avg_behind > 2.5):
-            final = min(final, 50)
-
-        # Run-specific consistency gates. A single good run should not outrank
-        # an athlete with repeated elite 70.3/T100/full-IM run proof if the rest
-        # of the recent run profile is mediocre. Full IM runs can be strong when
-        # they are top-3/top-5 in a high-SOF field, but the recent average gap
-        # still matters more for run than for swim/bike.
-        if discipline == "run":
-            close_strong = recent_scored[
-                recent_scored["strong_evidence"].astype(bool)
-                & (
-                    (recent_scored["pct_behind_fastest"].astype(float) <= 2.5)
-                    | (recent_scored["split_rank"].astype(float) <= 3)
-                )
-            ]
-            close_strong_count = len(close_strong)
-            if avg_behind is not None:
-                if avg_behind > 7:
-                    final = min(final, 45)
-                elif avg_behind > 5:
-                    final = min(final, 55)
-                elif avg_behind > 3.5:
-                    final = min(final, 65)
-            if close_strong_count == 0:
-                final = min(final, 50)
-            elif close_strong_count == 1 and evidence_count >= 4 and avg_behind is not None and avg_behind > 3:
-                final = min(final, 60)
-
-        # Quality confidence caps. This is the main fix for "three nobodies ahead
-        # of Jamie". A normal high-SOF 70.3 win can support a profile, but the
-        # very top should require premium proof unless the athlete has multiple
-        # strong rows with excellent closeness.
-        if premium_count == 0:
-            if strong_count == 0:
-                cap = 50 if len(medium_or_better) >= 3 else 45
-                final = min(final, cap)
-                confidence = "Low - no strong-field proof"
-            elif strong_count == 1:
-                final = min(final, 55)
-                confidence = "Medium - 1 strong row, no premium"
-            elif strong_count == 2:
-                final = min(final, 60)
-                confidence = "Medium - strong rows, no premium"
-            else:
-                final = min(final, 63)
-                confidence = "Good - repeated strong rows, no premium"
-        elif premium_count == 1:
-            final = min(final, 72)
-            confidence = "Good - 1 premium row"
-        elif premium_count == 2:
-            confidence = "High - 2 premium rows"
-        else:
-            confidence = "Elite - repeated premium proof"
-
-        # Evidence-count confidence caps. A single validated split should not
-        # rank beside athletes with several recent validated splits.
-        if evidence_count <= 1:
-            final = min(final, 45)
-            confidence = "Low - 1 split"
-        elif evidence_count == 2:
-            final = min(final, 60)
-            if premium_count < 2:
-                confidence = "Low - 2 splits"
-        elif evidence_count == 3 and premium_count == 0 and strong_count == 0:
-            final = min(final, 56)
-            confidence = "Low - 3 weak/medium splits"
-
-        best_row = recent_scored.sort_values(["evidence_score", "race_date"], ascending=[False, False]).head(1)
-        last_row = recent.head(1)
-        rows.append({
-            "Athlete": g["athlete_name"].dropna().iloc[0] if g["athlete_name"].notna().any() else athlete_key,
-            "Athlete URL": g["athlete_url"].dropna().iloc[0] if g["athlete_url"].notna().any() else None,
-            "Score": round(final, 1),
-            "Confidence": confidence,
-            "Premium Evidence Count": premium_count,
-            "Strong Evidence Count": strong_count,
-            "Evidence Count": evidence_count,
-            "Premium Field Score": round(premium_score, 1),
-            "Strong Field Score": round(strong_score, 1),
-            "Recent Score": round(recent_score, 1),
-            "Premium Avg Behind %": None if premium_avg_behind is None else round(premium_avg_behind, 2),
-            "Strong Avg Behind %": None if strong_avg_behind is None else round(strong_avg_behind, 2),
-            "Recent Avg Behind %": None if avg_behind is None else round(avg_behind, 2),
-            "Premium Top 3 %": round((premium_top3_rate or 0) * 100, 1),
-            "Premium Fastest %": round((premium_fastest_rate or 0) * 100, 1),
-            "Strong Top 3 %": round((strong_top3_rate or 0) * 100, 1),
-            "Strong Fastest %": round((strong_fastest_rate or 0) * 100, 1),
-            "Recent Top 3 %": round(all_top3_rate * 100, 1),
-            "Recent Fastest %": round(all_fastest_rate * 100, 1),
-            "Last Race": clean_str(last_row["race_name"].iloc[0]) if not last_row.empty else "",
-            "Last Race Date": format_date(last_row["race_date"].iloc[0]) if not last_row.empty else "",
-            "Last Rank": clean_str(last_row["rank_display"].iloc[0]) if not last_row.empty else "",
-            "Best Recent Split": clean_str(best_row["split"].iloc[0]) if not best_row.empty else "",
-        })
-
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    out = out.sort_values("Score", ascending=False).reset_index(drop=True)
-    out.insert(0, "Rank", range(1, len(out) + 1))
-    return out
-def score_overall(
-    results: pd.DataFrame,
-    start_athletes: pd.DataFrame,
-    overrides: pd.DataFrame,
-    target_date: pd.Timestamp,
-    target_year: int,
-    top_n: int,
-) -> pd.DataFrame:
-    if results.empty or start_athletes.empty:
-        return pd.DataFrame()
-    start_urls = set(start_athletes["athlete_url"].dropna().astype(str).tolist())
-    start_names = set(start_athletes["athlete_name"].dropna().astype(str).str.lower().tolist())
-    df = results.copy()
-    df = df[(df["race_date"].notna()) & (df["race_date"] <= target_date) & (~df["bad_status"])]
-    df = df[(df["athlete_url"].isin(start_urls)) | (df["athlete_name"].fillna("").str.lower().isin(start_names))]
-    df = df[df["ors"].notna()]
-    if df.empty:
-        return pd.DataFrame()
-
-    start_lookup, name_start_lookup = start_lookup_maps(start_athletes)
-    rows = []
-    for athlete_key, g in df.groupby(df["athlete_url"].fillna(df["athlete_name"])):
-        g = g.sort_values("race_date", ascending=False).copy()
-        scored_rows = []
-        for _, r in g.iterrows():
-            excluded, mult, reason = match_override(r, overrides, "Overall")
-            if excluded:
-                continue
-            rr = r.copy()
-            rr["overall_weight"] = recency_weight(r.get("race_date"), target_date) * mult
-            rr["override_reason"] = reason
-            scored_rows.append(rr)
-        if not scored_rows:
-            continue
-        gg = pd.DataFrame(scored_rows).sort_values("race_date", ascending=False)
-        recent = gg.head(top_n).copy()
-        recent_scored = recent
-        current_year = gg[gg["race_date"].dt.year == target_year]
-        strong = recent_scored[(recent_scored["sof"].fillna(0) >= 70) | (recent_scored["race_type"].isin(["T100", "WTCS"]))]
-        championship_score = 0.0
-        if not recent_scored.empty:
-            champ_scores = recent_scored.apply(championship_result_score, axis=1)
-            championship_score = safe_float(champ_scores.max()) or 0.0
-
-        weights = recent_scored["overall_weight"].astype(float).tolist()
-        recent_score = weighted_avg(recent_scored["ors"].astype(float).tolist(), weights) or 0
-        current_year_score = weighted_avg(current_year["ors"].astype(float).tolist(), current_year["overall_weight"].astype(float).tolist()) if not current_year.empty else recent_score
-        best_recent = safe_float(recent_scored["ors"].max()) or 0
-        strong_score = weighted_avg(strong["ors"].astype(float).tolist(), strong["overall_weight"].astype(float).tolist()) if not strong.empty else 0
-        name = g["athlete_name"].dropna().iloc[0] if g["athlete_name"].notna().any() else str(athlete_key)
-        url = g["athlete_url"].dropna().iloc[0] if g["athlete_url"].notna().any() else None
-        start_row = start_lookup.get(url) if url else name_start_lookup.get(name.lower())
-        open_rank = parse_int(start_row.get("open_rank")) if isinstance(start_row, dict) else None
-        open_rank_score = 0
-        if open_rank:
-            open_rank_score = clamp(105 - open_rank * 3.5, 0, 100)
-
-        final = (
-            0.38 * recent_score
-            + 0.20 * current_year_score
-            + 0.16 * best_recent
-            + 0.14 * strong_score
-            + 0.08 * championship_score
-            + 0.04 * open_rank_score
-        )
-        rows.append({
-            "Athlete": name,
-            "Athlete URL": url,
-            "Score": round(final, 1),
-            "Recent Form ORS": round(recent_score, 1),
-            "Current Year ORS": round(current_year_score, 1) if current_year_score is not None else None,
-            "Best Recent ORS": round(best_recent, 1),
-            "Strong Field ORS": round(strong_score, 1),
-            "Championship Score": round(championship_score, 1),
-            "Recent Races Used": len(recent_scored),
-            "OpenRank": open_rank,
-            "Last Race": clean_str(recent.iloc[0].get("race_name")) if len(recent) else "",
-            "Last Race Date": format_date(recent.iloc[0].get("race_date")) if len(recent) else "",
-        })
-    out = pd.DataFrame(rows).sort_values("Score", ascending=False).reset_index(drop=True)
-    out.insert(0, "Rank", range(1, len(out) + 1))
-    return out
 
 
 
@@ -3413,186 +3115,6 @@ def best4_openrank_average(values: Iterable[Any], divisor: int = 4) -> Tuple[flo
 
 
 # Override previous split scoring with OpenRank-aligned split scoring.
-def score_splits_for_start_list(
-    audit: pd.DataFrame,
-    start_athletes: pd.DataFrame,
-    target_date: pd.Timestamp,
-    top_n: int,
-    strong_sof_threshold: float,
-) -> pd.DataFrame:
-    if audit is None or audit.empty:
-        return pd.DataFrame()
-    start_urls = set(start_athletes.get("athlete_url", pd.Series(dtype=str)).dropna().astype(str).tolist())
-    start_names = set(start_athletes.get("athlete_name", pd.Series(dtype=str)).dropna().astype(str).str.lower().tolist())
-    df = add_split_openrank_scores(audit)
-    df = df[df.get("included", False).astype(bool)].copy()
-    df = df[(df["athlete_url"].isin(start_urls)) | (df["athlete_name"].fillna("").str.lower().isin(start_names))]
-    if df.empty:
-        return pd.DataFrame()
-
-    discipline = clean_str(df["discipline"].dropna().iloc[0]) if "discipline" in df.columns and df["discipline"].notna().any() else "swim"
-    window_start = pd.to_datetime(target_date) - pd.Timedelta(days=365)
-    df = df[(df["race_date"].notna()) & (df["race_date"] >= window_start) & (df["race_date"] <= target_date)].copy()
-    if df.empty:
-        return pd.DataFrame()
-
-    # Recompute quality flags using the current sidebar threshold.
-    df["premium_evidence"] = df.apply(lambda r: is_premium_split_evidence(r, discipline, strong_sof_threshold), axis=1)
-    df["strong_evidence"] = df.apply(lambda r: is_strong_split_evidence(r, discipline, strong_sof_threshold), axis=1)
-    df["quality_tier"] = df.apply(lambda r: evidence_quality_label(r, discipline, strong_sof_threshold), axis=1)
-
-    rows = []
-    for athlete_key, g in df.groupby(df["athlete_url"].fillna(df["athlete_name"])):
-        g = g.sort_values("race_date", ascending=False).copy()
-        score_values = pd.to_numeric(g.get("split_openrank_score"), errors="coerce").dropna().tolist()
-        openrank_score, best_scores = best4_openrank_average(score_values, top_n)
-        recent = g.head(max(5, top_n)).copy()
-        premium = g[g["premium_evidence"].astype(bool)]
-        strong = g[g["strong_evidence"].astype(bool)]
-        recent_weights = g.get("evidence_weight", pd.Series(1.0, index=g.index)).astype(float).tolist()
-        avg_behind = weighted_avg(pd.to_numeric(g.get("pct_behind_fastest"), errors="coerce").dropna().tolist(), None)
-        premium_avg_behind = weighted_avg(pd.to_numeric(premium.get("pct_behind_fastest", pd.Series(dtype=float)), errors="coerce").dropna().tolist(), None) if not premium.empty else None
-        strong_avg_behind = weighted_avg(pd.to_numeric(strong.get("pct_behind_fastest", pd.Series(dtype=float)), errors="coerce").dropna().tolist(), None) if not strong.empty else None
-        premium_count = len(premium)
-        strong_count = len(strong)
-        evidence_count = len(g)
-        # Confidence caps: OpenRank best-4 already pads missing races with zero,
-        # but keep a light cap for one-off samples so a single perfect split does
-        # not dominate a board.
-        final = float(openrank_score)
-        if evidence_count <= 1:
-            final = min(final, 45)
-            confidence = "Low - 1 split"
-        elif evidence_count == 2:
-            final = min(final, 62)
-            confidence = "Medium - 2 splits"
-        elif premium_count >= 2:
-            confidence = "High - repeated premium proof"
-        elif premium_count == 1:
-            confidence = "Good - 1 premium row"
-        elif strong_count >= 2:
-            confidence = "Good - repeated strong proof"
-        elif strong_count == 1:
-            confidence = "Medium - 1 strong row"
-        else:
-            # Weak-only evidence should never sit above proven 70.3/T100/full/WTCS swimmers.
-            # This especially prevents development sprint cup rows with tiny samples or missing
-            # SOF from topping a 70.3 fastest-split board.
-            final = min(final, 28)
-            confidence = "Low - no strong race proof"
-
-        best_row = g.sort_values(["split_openrank_score", "race_date"], ascending=[False, False]).head(1)
-        last_row = g.sort_values("race_date", ascending=False).head(1)
-        rows.append({
-            "Athlete": g["athlete_name"].dropna().iloc[0] if g["athlete_name"].notna().any() else athlete_key,
-            "Athlete URL": g["athlete_url"].dropna().iloc[0] if g["athlete_url"].notna().any() else None,
-            "Score": round(final, 1),
-            "OpenRank Split Score": round(openrank_score, 1),
-            "Best Split Scores Used": ", ".join([f"{x:.1f}" for x in best_scores]),
-            "Confidence": confidence,
-            "Premium Evidence Count": premium_count,
-            "Strong Evidence Count": strong_count,
-            "Evidence Count": evidence_count,
-            "Premium Field Score": round(pd.to_numeric(premium.get("split_openrank_score", pd.Series(dtype=float)), errors="coerce").mean(), 1) if not premium.empty else 0,
-            "Strong Field Score": round(pd.to_numeric(strong.get("split_openrank_score", pd.Series(dtype=float)), errors="coerce").mean(), 1) if not strong.empty else 0,
-            "Recent Score": round(pd.to_numeric(recent.get("split_openrank_score", pd.Series(dtype=float)), errors="coerce").mean(), 1) if not recent.empty else 0,
-            "Premium Avg Behind %": None if premium_avg_behind is None else round(premium_avg_behind, 2),
-            "Strong Avg Behind %": None if strong_avg_behind is None else round(strong_avg_behind, 2),
-            "Recent Avg Behind %": None if avg_behind is None else round(avg_behind, 2),
-            "Premium Top 3 %": round(((premium["split_rank"] <= 3).mean() * 100), 1) if not premium.empty else 0,
-            "Premium Fastest %": round(((premium["split_rank"] == 1).mean() * 100), 1) if not premium.empty else 0,
-            "Strong Top 3 %": round(((strong["split_rank"] <= 3).mean() * 100), 1) if not strong.empty else 0,
-            "Strong Fastest %": round(((strong["split_rank"] == 1).mean() * 100), 1) if not strong.empty else 0,
-            "Recent Top 3 %": round(((g["split_rank"] <= 3).mean() * 100), 1),
-            "Recent Fastest %": round(((g["split_rank"] == 1).mean() * 100), 1),
-            "Last Race": clean_str(last_row["race_name"].iloc[0]) if not last_row.empty else "",
-            "Last Race Date": format_date(last_row["race_date"].iloc[0]) if not last_row.empty else "",
-            "Last Rank": clean_str(last_row["rank_display"].iloc[0]) if not last_row.empty else "",
-            "Best Recent Split": clean_str(best_row["split"].iloc[0]) if not best_row.empty else "",
-        })
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    out = out.sort_values("Score", ascending=False).reset_index(drop=True)
-    out.insert(0, "Rank", range(1, len(out) + 1))
-    return out
-
-
-# Override previous overall scoring with OpenRank's best-4-in-52-weeks model.
-def score_overall(
-    results: pd.DataFrame,
-    start_athletes: pd.DataFrame,
-    overrides: pd.DataFrame,
-    target_date: pd.Timestamp,
-    target_year: int,
-    top_n: int,
-) -> pd.DataFrame:
-    if results is None or results.empty or start_athletes is None or start_athletes.empty:
-        return pd.DataFrame()
-    start_urls = set(start_athletes.get("athlete_url", pd.Series(dtype=str)).dropna().astype(str).tolist())
-    start_names = set(start_athletes.get("athlete_name", pd.Series(dtype=str)).dropna().astype(str).str.lower().tolist())
-    df = results.copy()
-    window_start = pd.to_datetime(target_date) - pd.Timedelta(days=365)
-    df = df[(df["race_date"].notna()) & (df["race_date"] >= window_start) & (df["race_date"] <= target_date) & (~df["bad_status"])]
-    df = df[(df["athlete_url"].isin(start_urls)) | (df["athlete_name"].fillna("").str.lower().isin(start_names))]
-    df = df[df["ors"].notna()].copy()
-    if df.empty:
-        return pd.DataFrame()
-
-    start_lookup, name_start_lookup = start_lookup_maps(start_athletes)
-    rows = []
-    for athlete_key, g in df.groupby(df["athlete_url"].fillna(df["athlete_name"])):
-        scored_rows = []
-        for _, r in g.sort_values("race_date", ascending=False).iterrows():
-            excluded, mult, reason = match_override(r, overrides, "Overall")
-            if excluded:
-                continue
-            rr = r.copy()
-            rr["ors_for_rank"] = (safe_float(r.get("ors")) or 0.0) * mult
-            scored_rows.append(rr)
-        if not scored_rows:
-            continue
-        gg = pd.DataFrame(scored_rows).sort_values("race_date", ascending=False)
-        rank_score_val, best_scores = best4_openrank_average(gg["ors_for_rank"].tolist(), top_n)
-        current_year = gg[gg["race_date"].dt.year == target_year].copy()
-        current_year_values = pd.to_numeric(current_year.get("ors_for_rank", pd.Series(dtype=float)), errors="coerce").dropna().tolist() if not current_year.empty else []
-        # Display a real current-year ORS average from scored current-year races.
-        # Do not pad this display value with zeros; padding is only for the main
-        # OpenRank-style ranking score. This makes it obvious when an athlete has
-        # races this year but none of those rows carried an ORS value.
-        current_year_score = float(np.mean(sorted(current_year_values, reverse=True)[:top_n])) if current_year_values else None
-        current_year_races = int(len(current_year))
-        current_year_scored = int(len(current_year_values))
-        strong = gg[(gg["sof"].fillna(0) >= 70) | (gg["race_type"].isin(["T100", "WTCS"]))]
-        strong_score = pd.to_numeric(strong.get("ors_for_rank", pd.Series(dtype=float)), errors="coerce").mean() if not strong.empty else 0
-        name = g["athlete_name"].dropna().iloc[0] if g["athlete_name"].notna().any() else str(athlete_key)
-        url = g["athlete_url"].dropna().iloc[0] if g["athlete_url"].notna().any() else None
-        start_row = start_lookup.get(url) if url else name_start_lookup.get(name.lower())
-        open_rank = parse_int(start_row.get("open_rank")) if isinstance(start_row, dict) else None
-        rows.append({
-            "Athlete": name,
-            "Athlete URL": url,
-            "Score": round(rank_score_val, 1),
-            "OpenRank Score": round(rank_score_val, 1),
-            "Best Scores Used": ", ".join([f"{x:.1f}" for x in best_scores]),
-            "Recent Form ORS": round(rank_score_val, 1),
-            "Current Year ORS": round(float(current_year_score), 1) if current_year_score is not None and not pd.isna(current_year_score) else None,
-            "Current Year Races": current_year_races,
-            "Current Year Scored": current_year_scored,
-            "Best Recent ORS": round(max(best_scores), 1) if best_scores else 0,
-            "Strong Field ORS": round(float(strong_score), 1) if strong_score is not None and not pd.isna(strong_score) else 0,
-            "Championship Score": round(championship_result_score(gg.sort_values("race_date", ascending=False).iloc[0]), 1) if not gg.empty else 0,
-            "Recent Races Used": len([x for x in best_scores if x > 0]),
-            "OpenRank": open_rank,
-            "Last Race": clean_str(gg.iloc[0].get("race_name")) if len(gg) else "",
-            "Last Race Date": format_date(gg.iloc[0].get("race_date")) if len(gg) else "",
-        })
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    out = out.sort_values("Score", ascending=False).reset_index(drop=True)
-    out.insert(0, "Rank", range(1, len(out) + 1))
-    return out
 
 
 
@@ -3804,187 +3326,8 @@ def cache_rows_to_df(rows: Any) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def stable_cache_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
 
 
-def make_cache_key(cache_kind: str, params: Dict[str, Any]) -> str:
-    payload = {"kind": cache_kind, "version": MODEL_CACHE_VERSION, **params}
-    digest = hashlib.md5(stable_cache_json(payload).encode("utf-8")).hexdigest()
-    return digest
-
-
-def cache_table_ready() -> bool:
-    try:
-        supabase.table("model_cache").select("id").limit(1).execute()
-        return True
-    except Exception:
-        return False
-
-
-def load_model_cache_df(cache_kind: str, cache_key: str) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]]]:
-    try:
-        res = (
-            supabase.table("model_cache")
-            .select("cache_kind,cache_key,cache_label,params,rows,row_count,computed_at")
-            .eq("cache_kind", cache_kind)
-            .eq("cache_key", cache_key)
-            .limit(1)
-            .execute()
-        )
-        data = res.data or []
-        if not data:
-            return pd.DataFrame(), None
-        row = data[0]
-        return cache_rows_to_df(row.get("rows")), row
-    except Exception:
-        return pd.DataFrame(), None
-
-
-def _json_dict(value: Any) -> Dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
-def _cache_param_equal(key: str, left: Any, right: Any) -> bool:
-    if key in {"top_n", "min_field_size"}:
-        try:
-            return int(left) == int(right)
-        except Exception:
-            return clean_str(left) == clean_str(right)
-    if key == "strong_sof_threshold":
-        try:
-            return abs(float(left) - float(right)) < 0.0001
-        except Exception:
-            return clean_str(left) == clean_str(right)
-    return clean_str(left) == clean_str(right)
-
-
-def load_race_prediction_cache_best_match(
-    selected_race: str,
-    selected_date: pd.Timestamp,
-    selected_gender: str,
-    top_n: int,
-    min_field_size: int,
-    strong_sof_threshold: float,
-    prediction_scope: str,
-) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]], str, List[str]]:
-    """Load an exact race-prediction cache, falling back to the latest saved cache for the same race.
-
-    Race Dashboard sliders can differ from the settings used during a bulk rebuild.
-    Exact cache keys are still preferred, but this fallback keeps the dashboard fast and makes
-    the settings difference visible instead of silently dropping to live calculation.
-    """
-    target = race_prediction_cache_params(
-        selected_race,
-        selected_date,
-        selected_gender,
-        top_n,
-        min_field_size,
-        strong_sof_threshold,
-        prediction_scope,
-    )
-    exact_key = make_cache_key("race_prediction", target)
-    exact_df, exact_meta = load_model_cache_df("race_prediction", exact_key)
-    if exact_df is not None and not exact_df.empty:
-        return exact_df, exact_meta, "exact", []
-
-    try:
-        res = (
-            supabase.table("model_cache")
-            .select("cache_kind,cache_key,cache_label,params,rows,row_count,computed_at")
-            .eq("cache_kind", "race_prediction")
-            .order("computed_at", desc=True)
-            .limit(1000)
-            .execute()
-        )
-        candidates = res.data or []
-    except Exception:
-        return pd.DataFrame(), None, "missing", []
-
-    target_race = clean_str(target.get("race_name"))
-    target_date = clean_str(target.get("race_date"))
-    target_gender = normalize_gender(target.get("gender")) or clean_str(target.get("gender"))
-    target_scope = clean_str(target.get("prediction_scope"))
-
-    for row in candidates:
-        params = _json_dict(row.get("params"))
-        if clean_str(params.get("version")) != MODEL_CACHE_VERSION:
-            continue
-        row_race = clean_str(params.get("race_name"))
-        row_date = clean_str(params.get("race_date"))
-        row_gender = normalize_gender(params.get("gender")) or clean_str(params.get("gender"))
-        row_scope = clean_str(params.get("prediction_scope"))
-        if row_race != target_race or row_date != target_date or row_gender != target_gender:
-            continue
-        # Prefer same prediction scope, but allow old caches with a missing scope.
-        if row_scope and target_scope and row_scope != target_scope:
-            continue
-        cached_df = cache_rows_to_df(row.get("rows"))
-        if cached_df is None or cached_df.empty:
-            continue
-        if cached_section(cached_df, "overall").empty and cached_section(cached_df, "swim").empty and cached_section(cached_df, "bike").empty and cached_section(cached_df, "run").empty:
-            continue
-        diffs = []
-        labels = {
-            "top_n": "Top scores used",
-            "min_field_size": "Minimum split sample",
-            "strong_sof_threshold": "Strong SOF",
-            "prediction_scope": "Prediction profile",
-        }
-        for key, label in labels.items():
-            if not _cache_param_equal(key, params.get(key), target.get(key)):
-                diffs.append(f"{label}: cached {params.get(key, '—')} / current {target.get(key, '—')}")
-        return cached_df, row, ("settings_mismatch" if diffs else "race_match"), diffs
-
-    return pd.DataFrame(), None, "missing", []
-
-
-def save_model_cache_df(cache_kind: str, cache_key: str, cache_label: str, params: Dict[str, Any], df: pd.DataFrame, limit: Optional[int] = None) -> int:
-    rows = cache_safe_rows(df, limit=limit)
-    payload = {
-        "cache_kind": cache_kind,
-        "cache_key": cache_key,
-        "cache_label": cache_label,
-        "params": json_safe_row(params),
-        "rows": rows,
-        "row_count": len(rows),
-        "computed_at": datetime.utcnow().isoformat(),
-    }
-    supabase.table("model_cache").upsert(payload, on_conflict="cache_kind,cache_key").execute()
-    return len(rows)
-
-
-def clear_model_cache(cache_kind: Optional[str] = None) -> None:
-    if cache_kind:
-        supabase.table("model_cache").delete().eq("cache_kind", cache_kind).execute()
-    else:
-        supabase.table("model_cache").delete().neq("cache_key", "__never__").execute()
-
-
-def distinct_start_list_races(starts: pd.DataFrame) -> pd.DataFrame:
-    """Return one row per imported race/date/gender for cache rebuilds."""
-    if starts is None or starts.empty:
-        return pd.DataFrame()
-    df = starts.copy()
-    for col in ["race_name", "race_date", "gender"]:
-        if col not in df.columns:
-            return pd.DataFrame()
-    df = df[df["race_name"].notna() & (df["race_name"].astype(str).str.strip() != "")].copy()
-    if df.empty:
-        return pd.DataFrame()
-    df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
-    df["gender"] = df["gender"].map(lambda x: normalize_gender(x) or clean_str(x))
-    df = df[df["gender"].isin(["Men", "Women"])].copy()
-    df = df.drop_duplicates(subset=["race_name", "race_date", "gender"]).copy()
-    return df.sort_values(["race_date", "race_name", "gender"], na_position="last")
 
 
 def ranking_view_to_kind(view_label: str) -> str:
@@ -3996,179 +3339,6 @@ def ranking_view_to_kind(view_label: str) -> str:
     }.get(view_label, str(view_label).lower().strip())
 
 
-def athlete_ranking_cache_params(gender: str, race_family: str, as_of_ts: pd.Timestamp, top_n: int, view_kind: str) -> Dict[str, Any]:
-    return {
-        "gender": normalize_gender(gender) or gender,
-        "race_family": race_family,
-        "as_of_date": format_date(as_of_ts),
-        "top_n": int(top_n),
-        "view": view_kind,
-        "version": MODEL_CACHE_VERSION,
-    }
-
-
-def build_athlete_ranking_result(
-    results: pd.DataFrame,
-    overrides: pd.DataFrame,
-    gender: str,
-    race_family: str,
-    as_of_ts: pd.Timestamp,
-    top_n: int,
-    view_kind: str,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    if results is None or results.empty:
-        return pd.DataFrame(), {"rows_after_gender": 0, "rows_after_family": 0, "athletes_ranked": 0}
-
-    year = int(pd.to_datetime(as_of_ts).year)
-    window_start_rank = pd.Timestamp(date(year - 2, 1, 1))
-    ranking_results = results[(results["race_date"].notna()) & (results["race_date"] >= window_start_rank) & (results["race_date"] <= as_of_ts)].copy()
-    pre_gender_count = len(ranking_results)
-    ranking_results = filter_rankings_by_gender(ranking_results, gender)
-    post_gender_count = len(ranking_results)
-    ranking_results = ranking_results[ranking_scope_mask(ranking_results, race_family)].copy()
-
-    metrics = {
-        "rows_before_gender": int(pre_gender_count),
-        "rows_after_gender": int(post_gender_count),
-        "rows_after_family": int(len(ranking_results)),
-        "athletes_ranked": 0,
-    }
-    if ranking_results.empty:
-        return pd.DataFrame(), metrics
-
-    candidate_cols = ["athlete_url", "athlete_name", "gender"]
-    start_all = ranking_results[candidate_cols].drop_duplicates().dropna(subset=["athlete_name"]).copy()
-    start_all["race_name"] = f"Global Rankings — {race_family}"
-    start_all["race_date"] = as_of_ts
-    start_all["open_rank"] = None
-    metrics["athletes_ranked"] = int(start_all["athlete_name"].nunique())
-
-    if view_kind == "overall":
-        out = score_overall(ranking_results, start_all, overrides, as_of_ts, year, top_n)
-    else:
-        aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, normalize_gender(gender) or gender, view_kind, min_field_size=5)
-        out = score_splits_for_start_list(aud, start_all, as_of_ts, top_n, strong_sof_threshold=STRONG_SOF_THRESHOLD)
-    if not out.empty:
-        out["Cache View"] = view_kind
-        out["Gender"] = gender
-        out["Race Family"] = race_family
-        out["As Of"] = format_date(as_of_ts)
-    return out, metrics
-
-
-def save_athlete_ranking_cache(
-    results: pd.DataFrame,
-    overrides: pd.DataFrame,
-    gender: str,
-    race_family: str,
-    as_of_ts: pd.Timestamp,
-    top_n: int,
-    view_kind: str,
-) -> Tuple[int, Dict[str, Any]]:
-    params = athlete_ranking_cache_params(gender, race_family, as_of_ts, top_n, view_kind)
-    cache_key = make_cache_key("athlete_ranking", params)
-    df, metrics = build_athlete_ranking_result(results, overrides, gender, race_family, as_of_ts, top_n, view_kind)
-    label = f"{gender} · {race_family} · {view_kind} · top {top_n} · {format_date(as_of_ts)}"
-    rows = save_model_cache_df("athlete_ranking", cache_key, label, {**params, **metrics}, df, limit=500)
-    return rows, metrics
-
-
-def race_prediction_cache_params(
-    race_name: str,
-    race_date: pd.Timestamp,
-    gender: str,
-    top_n: int,
-    min_field_size: int,
-    strong_sof_threshold: float,
-    prediction_scope: str,
-) -> Dict[str, Any]:
-    return {
-        "race_name": clean_str(race_name),
-        "race_date": format_date(race_date),
-        "gender": normalize_gender(gender) or gender,
-        "top_n": int(top_n),
-        "min_field_size": int(min_field_size),
-        "strong_sof_threshold": float(strong_sof_threshold),
-        "prediction_scope": prediction_scope,
-        "version": MODEL_CACHE_VERSION,
-    }
-
-
-def build_race_prediction_result(
-    results: pd.DataFrame,
-    starts: pd.DataFrame,
-    overrides: pd.DataFrame,
-    selected_race: str,
-    selected_date: pd.Timestamp,
-    selected_gender: str,
-    top_n: int,
-    min_field_size: int,
-    strong_sof_threshold: float,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    if results is None or results.empty or starts is None or starts.empty:
-        return pd.DataFrame(), {}
-
-    selected_date = pd.to_datetime(selected_date) if not pd.isna(selected_date) else pd.Timestamp.today().normalize()
-    target_year = int(selected_date.year)
-    window_start = pd.Timestamp(date(target_year - 2, 1, 1))
-    prediction_scope = prediction_scope_from_race(selected_race, None, None)
-
-    start_athletes = starts[(starts["race_name"] == selected_race) & (starts["gender"] == selected_gender)].copy()
-    if "race_date" in start_athletes.columns:
-        start_athletes = start_athletes[start_athletes["race_date"] == selected_date]
-    imported_start_rows = len(start_athletes)
-    start_athletes = dedupe_start_athletes(start_athletes)
-    duplicate_start_rows = imported_start_rows - len(start_athletes)
-
-    results_window_all = results[(results["race_date"].notna()) & (results["race_date"] >= window_start) & (results["race_date"] <= selected_date)].copy()
-    results_window = apply_prediction_scope(results_window_all, prediction_scope)
-
-    combined_rows: List[Dict[str, Any]] = []
-    overall = score_overall(results_window, start_athletes, overrides, selected_date, target_year, top_n)
-    for row in cache_safe_rows(overall.head(75)):
-        row["_section"] = "overall"
-        combined_rows.append(row)
-
-    audit_source_by_disc = {
-        disc: filter_results_to_startlist_races(results_window, start_athletes, disc)
-        for disc in ["swim", "bike", "run"]
-    }
-    for disc in ["swim", "bike", "run"]:
-        aud = build_split_audit(audit_source_by_disc[disc], start_athletes, overrides, selected_date, selected_gender, disc, min_field_size)
-        scored = score_splits_for_start_list(aud, start_athletes, selected_date, top_n, strong_sof_threshold)
-        for row in cache_safe_rows(scored.head(75)):
-            row["_section"] = disc
-            combined_rows.append(row)
-
-    meta = {
-        "start_list_athletes": int(len(start_athletes)),
-        "duplicate_start_rows": int(duplicate_start_rows),
-        "rows_used": int(len(results_window)),
-        "rows_available_before_scope": int(len(results_window_all)),
-        "prediction_scope": prediction_scope,
-        "window_start": format_date(window_start),
-    }
-    return pd.DataFrame(combined_rows), meta
-
-
-def save_race_prediction_cache(
-    results: pd.DataFrame,
-    starts: pd.DataFrame,
-    overrides: pd.DataFrame,
-    selected_race: str,
-    selected_date: pd.Timestamp,
-    selected_gender: str,
-    top_n: int,
-    min_field_size: int,
-    strong_sof_threshold: float,
-) -> Tuple[int, Dict[str, Any], str]:
-    prediction_scope = prediction_scope_from_race(selected_race, None, None)
-    params = race_prediction_cache_params(selected_race, selected_date, selected_gender, top_n, min_field_size, strong_sof_threshold, prediction_scope)
-    cache_key = make_cache_key("race_prediction", params)
-    df, meta = build_race_prediction_result(results, starts, overrides, selected_race, selected_date, selected_gender, top_n, min_field_size, strong_sof_threshold)
-    label = f"{format_date(selected_date)} · {selected_gender} · {selected_race} · top {top_n}"
-    rows = save_model_cache_df("race_prediction", cache_key, label, {**params, **meta}, df, limit=500)
-    return rows, meta, cache_key
 
 
 def cached_section(cached_df: pd.DataFrame, section: str) -> pd.DataFrame:
@@ -4187,34 +3357,6 @@ def cached_section(cached_df: pd.DataFrame, section: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional[Dict[str, Any]] = None) -> None:
-    if cached_df is None or cached_df.empty:
-        st.info("No cached prediction rows found.")
-        return
-    params = (cache_meta or {}).get("params", {}) if isinstance(cache_meta, dict) else {}
-    computed_at = (cache_meta or {}).get("computed_at") if isinstance(cache_meta, dict) else None
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Cached rows", f"{len(cached_df):,}")
-    c2.metric("Start athletes", params.get("start_list_athletes", "—"))
-    c3.metric("Rows used", params.get("rows_used", "—"))
-    c4.metric("Cached at", clean_str(computed_at)[:19] if computed_at else "—")
-    st.info("Fast mode: showing saved model output. Use Model Cache → Rebuild selected race, or turn off cache in the sidebar, to recalculate live evidence.")
-
-    section_title("🏆", "Overall Picks")
-    overall = cached_section(cached_df, "overall")
-    display_table(overall.head(15), ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "OpenRank", "Last Race", "Last Race Date"])
-
-    st.divider()
-    tabs = st.tabs(["🏊 Fastest Swim", "🚴 Fastest Bike", "🏃 Fastest Run"])
-    for tab, disc, title in zip(tabs, ["swim", "bike", "run"], ["Fastest Swim", "Fastest Bike", "Fastest Run"]):
-        with tab:
-            section_title("🏊" if disc == "swim" else "🚴" if disc == "bike" else "🏃", title)
-            scored = cached_section(cached_df, disc)
-            display_table(
-                scored.head(12),
-                ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
-                height=360,
-            )
 
 
 
@@ -4829,67 +3971,6 @@ def filter_scorecard_to_startlist(scorecard: pd.DataFrame, start_athletes: pd.Da
     return out
 
 
-def build_race_prediction_result(
-    results: pd.DataFrame,
-    starts: pd.DataFrame,
-    overrides: pd.DataFrame,
-    selected_race: str,
-    selected_date: pd.Timestamp,
-    selected_gender: str,
-    top_n: int,
-    min_field_size: int,
-    strong_sof_threshold: float,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Build a race prediction by joining the start list to global athlete scorecards."""
-    if results is None or results.empty or starts is None or starts.empty:
-        return pd.DataFrame(), {}
-    selected_date = pd.to_datetime(selected_date) if not pd.isna(selected_date) else pd.Timestamp.today().normalize()
-    prediction_scope = scorecard_profile_from_race(selected_race, None, None)
-    start_athletes = starts[(starts["race_name"] == selected_race) & (starts["gender"] == selected_gender)].copy()
-    if "race_date" in start_athletes.columns:
-        start_athletes = start_athletes[start_athletes["race_date"] == selected_date]
-    imported_start_rows = len(start_athletes)
-    start_athletes = dedupe_start_athletes(start_athletes)
-    duplicate_start_rows = imported_start_rows - len(start_athletes)
-
-    combined_rows: List[Dict[str, Any]] = []
-    metrics_by_view: Dict[str, Any] = {}
-    for view_kind in ["overall", "swim", "bike", "run"]:
-        scorecard, metrics = build_athlete_ranking_result(results, overrides, selected_gender, prediction_scope, selected_date, top_n, view_kind)
-        metrics_by_view[f"{view_kind}_scorecard_rows"] = int(len(scorecard)) if scorecard is not None else 0
-        selected = filter_scorecard_to_startlist(scorecard, start_athletes, view_kind)
-        for row in cache_safe_rows(selected.head(100)):
-            combined_rows.append(row)
-
-    meta = {
-        "start_list_athletes": int(len(start_athletes)),
-        "duplicate_start_rows": int(duplicate_start_rows),
-        "prediction_scope": prediction_scope,
-        "scoring_source": "athlete_scorecards",
-        "top_scores_used": int(top_n),
-        **metrics_by_view,
-    }
-    return pd.DataFrame(combined_rows), meta
-
-
-def save_race_prediction_cache(
-    results: pd.DataFrame,
-    starts: pd.DataFrame,
-    overrides: pd.DataFrame,
-    selected_race: str,
-    selected_date: pd.Timestamp,
-    selected_gender: str,
-    top_n: int,
-    min_field_size: int,
-    strong_sof_threshold: float,
-) -> Tuple[int, Dict[str, Any], str]:
-    prediction_scope = scorecard_profile_from_race(selected_race, None, None)
-    params = race_prediction_cache_params(selected_race, selected_date, selected_gender, top_n, LOW_SAMPLE_WARNING_THRESHOLD, STRONG_SOF_THRESHOLD, prediction_scope)
-    cache_key = make_cache_key("race_prediction", params)
-    df, meta = build_race_prediction_result(results, starts, overrides, selected_race, selected_date, selected_gender, top_n, LOW_SAMPLE_WARNING_THRESHOLD, STRONG_SOF_THRESHOLD)
-    label = f"{format_date(selected_date)} · {selected_gender} · {selected_race} · {prediction_scope} · top {top_n}"
-    rows = save_model_cache_df("race_prediction", cache_key, label, {**params, **meta}, df, limit=500)
-    return rows, meta, cache_key
 
 
 
@@ -4957,6 +4038,55 @@ def _evidence_list(value: Any) -> List[Dict[str, Any]]:
             return []
     return []
 
+
+
+def build_athlete_ranking_result(
+    results: pd.DataFrame,
+    overrides: pd.DataFrame,
+    gender: str,
+    race_family: str,
+    as_of_ts: pd.Timestamp,
+    top_n: int,
+    view_kind: str,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Build one saved scorecard view from normalized result rows."""
+    if results is None or results.empty:
+        return pd.DataFrame(), {"rows_after_gender": 0, "rows_after_family": 0, "athletes_ranked": 0}
+
+    year = int(pd.to_datetime(as_of_ts).year)
+    window_start_rank = pd.Timestamp(date(year - 2, 1, 1))
+    ranking_results = results[(results["race_date"].notna()) & (results["race_date"] >= window_start_rank) & (results["race_date"] <= as_of_ts)].copy()
+    pre_gender_count = len(ranking_results)
+    ranking_results = filter_rankings_by_gender(ranking_results, gender)
+    post_gender_count = len(ranking_results)
+    ranking_results = ranking_results[ranking_scope_mask(ranking_results, race_family)].copy()
+
+    metrics = {
+        "rows_before_gender": int(pre_gender_count),
+        "rows_after_gender": int(post_gender_count),
+        "rows_after_family": int(len(ranking_results)),
+        "athletes_ranked": 0,
+    }
+    if ranking_results.empty:
+        return pd.DataFrame(), metrics
+
+    start_all = ranking_results[["athlete_url", "athlete_name", "gender"]].drop_duplicates().dropna(subset=["athlete_name"]).copy()
+    start_all["race_name"] = f"Global Rankings — {race_family}"
+    start_all["race_date"] = as_of_ts
+    start_all["open_rank"] = None
+    metrics["athletes_ranked"] = int(start_all["athlete_name"].nunique())
+
+    if view_kind == "overall":
+        out = score_overall(ranking_results, start_all, overrides, as_of_ts, year, top_n)
+    else:
+        aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, normalize_gender(gender) or gender, view_kind, min_field_size=LOW_SAMPLE_WARNING_THRESHOLD)
+        out = score_splits_for_start_list(aud, start_all, as_of_ts, top_n, strong_sof_threshold=STRONG_SOF_THRESHOLD)
+    if not out.empty:
+        out["Cache View"] = view_kind
+        out["Gender"] = gender
+        out["Race Family"] = race_family
+        out["As Of"] = format_date(as_of_ts)
+    return out, metrics
 
 def save_athlete_scorecard_combo(
     results: pd.DataFrame,
@@ -5922,192 +5052,59 @@ elif page == "Gender Tools":
 
 elif page == "Model Cache":
     st.header("⚡ Model Cache")
-    st.caption("Precompute the expensive rankings and race predictions once, save them in Supabase, then the dashboard reads the saved rows instead of recalculating on every click.")
-
-    if not cache_table_ready():
-        st.error("The `model_cache` table does not exist yet. Run the `model_cache_tables.sql` script in Supabase SQL Editor first.")
-        st.stop()
+    st.caption("Rebuild durable athlete scorecards. Rankings and race dashboards read these saved rows instead of recalculating live.")
 
     results, starts, athletes, overrides = prepare_dataframes()
     if results.empty:
         st.warning("No athlete results found. Import Athlete Results first.")
         st.stop()
+    if not scorecard_tables_ready():
+        st.error("Scorecard tables are missing. Run `athlete_scorecard_tables.sql` in Supabase SQL Editor first.")
+        st.stop()
 
-    tab_scorecards, tab_rankings, tab_races, tab_manage = st.tabs(["Athlete Scorecards", "Legacy JSON Rankings", "Race Prediction Cache", "Manage Cache"])
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Profiles", len(RANKING_FAMILIES))
+    c2.metric("Disciplines", len(SCORECARD_DISCIPLINES))
+    c3.metric("Top scores used", TOP_SCORES_USED)
+    c4.metric("Strong SOF", int(STRONG_SOF_THRESHOLD))
 
-    with tab_scorecards:
-        st.subheader("Relational Athlete Scorecards")
-        st.caption("This is the faster long-term model: one saved row per athlete/profile/discipline, plus a separate evidence table for the five races that created the score.")
-        if not scorecard_tables_ready():
-            st.error("Scorecard tables are missing. Run `athlete_scorecard_tables.sql` in Supabase SQL Editor first.")
-        else:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Profiles", len(RANKING_FAMILIES))
-            c2.metric("Disciplines", len(SCORECARD_DISCIPLINES))
-            c3.metric("Top scores used", TOP_SCORES_USED)
-            c4.metric("Strong SOF", int(STRONG_SOF_THRESHOLD))
-            rebuild_date = st.date_input("Scorecards as of", value=date.today(), key="scorecards_asof")
-            st.info("Rebuild scorecards after importing new results or fixing athlete genders. Start-list edits usually do not require rebuilding scorecards unless new athletes/results were also added.")
-            if st.button("Rebuild all athlete scorecards", type="primary", width="stretch"):
-                loader = loading_card("Building athlete scorecards", "Saving profile + discipline scores and top-5 evidence rows into Supabase...")
-                try:
-                    logs = rebuild_all_athlete_scorecards(results, overrides, pd.Timestamp(rebuild_date))
-                finally:
-                    loader.empty()
-                st.success("Finished rebuilding athlete scorecards.")
-                display_table(logs, ["Gender", "Profile", "Discipline", "Scorecard Rows", "Evidence Rows", "Status", "rows_after_gender", "rows_after_family", "athletes_ranked"], height=520)
-            try:
-                cards = load_table("athlete_scorecards")
-                ev = load_table("athlete_scorecard_evidence")
-            except Exception:
-                cards, ev = pd.DataFrame(), pd.DataFrame()
-            if not cards.empty:
-                latest = cards.sort_values("computed_at", ascending=False).head(200) if "computed_at" in cards.columns else cards.head(200)
-                display_table(latest, ["gender", "profile", "discipline", "rank", "athlete_name", "score", "evidence_count", "as_of_date", "computed_at"], height=420)
-                c1, c2 = st.columns(2)
-                c1.metric("Scorecard rows", f"{len(cards):,}")
-                c2.metric("Evidence rows", f"{len(ev):,}")
-            else:
-                st.info("No athlete_scorecards rows stored yet.")
+    rebuild_date = st.date_input("Scorecards as of", value=date.today(), key="scorecards_asof")
+    st.info("Rebuild scorecards after importing new results or fixing athlete genders. Start-list edits usually do not require rebuilding scorecards unless new athletes/results were added.")
 
-    with tab_rankings:
-        st.subheader("Athlete Rankings Cache")
-        c1, c2, c3, c4 = st.columns([1, 1.25, 1, 1])
-        cache_gender = c1.selectbox("Gender", ["Men", "Women"], key="cache_rank_gender")
-        cache_family = c2.selectbox("Race family", RANKING_FAMILIES, index=1, key="cache_rank_family")
-        cache_as_of = c3.date_input("As of date", value=date.today(), key="cache_rank_asof")
-        cache_top_n = TOP_SCORES_USED
-        c4.metric("Top scores used", TOP_SCORES_USED)
-        cache_view = st.radio("Ranking view", RANKING_VIEW_LABELS, horizontal=True, key="cache_rank_view")
-        view_kind = ranking_view_to_kind(cache_view)
-        if st.button("Rebuild selected ranking cache", type="primary", width="stretch"):
-            with st.spinner("Building selected ranking cache..."):
-                rows, metrics = save_athlete_ranking_cache(results, overrides, cache_gender, cache_family, pd.Timestamp(cache_as_of), cache_top_n, view_kind)
-            st.success(f"Saved {rows:,} cached rows for {cache_gender} · {cache_family} · {view_kind}.")
-            st.json(metrics)
-            clear_cache()
-
-        with st.expander("Rebuild all common athlete ranking caches", expanded=False):
-            st.warning("This can take a few minutes because it calculates Men/Women × race families × overall/swim/bike/run. Run it after big imports or scoring-code changes.")
-            if st.button("Rebuild all athlete ranking caches", width="stretch"):
-                progress = st.progress(0, text="Starting cache rebuild...")
-                total = len(["Men", "Women"]) * len(RANKING_FAMILIES) * len(["overall", "swim", "bike", "run"])
-                done = 0
-                logs = []
-                for g in ["Men", "Women"]:
-                    for fam in RANKING_FAMILIES:
-                        for vk in ["overall", "swim", "bike", "run"]:
-                            rows, metrics = save_athlete_ranking_cache(results, overrides, g, fam, pd.Timestamp(cache_as_of), cache_top_n, vk)
-                            logs.append({"Gender": g, "Race Family": fam, "View": vk, "Rows Saved": rows, **metrics})
-                            done += 1
-                            progress.progress(done / total, text=f"Built {done}/{total}: {g} · {fam} · {vk}")
-                progress.empty()
-                st.success("Finished rebuilding athlete ranking caches.")
-                display_table(pd.DataFrame(logs), ["Gender", "Race Family", "View", "Rows Saved", "rows_after_gender", "rows_after_family", "athletes_ranked"], height=420)
-                clear_cache()
-
-    with tab_races:
-        st.subheader("Race Prediction Cache")
-        if starts.empty:
-            st.warning("No start lists found. Import Start Lists first.")
-        else:
-            race_options_df = starts.dropna(subset=["race_name"]).copy()
-            race_options_df["race_date_label"] = race_options_df["race_date"].map(format_date)
-            race_options_df["label"] = race_options_df["race_date_label"].fillna("") + " | " + race_options_df["gender"].fillna("") + " | " + race_options_df["race_name"].fillna("")
-            race_options_df = race_options_df.drop_duplicates(subset=["race_name", "race_date", "gender", "label"]).sort_values(["race_date", "race_name", "gender"], na_position="last")
-            labels = race_options_df["label"].tolist()
-            if labels:
-                selected_cache_label = st.selectbox("Race / Gender", labels, index=max(0, len(labels) - 1), key="cache_race_label")
-                c1, c2, c3 = st.columns(3)
-                race_top_n = TOP_SCORES_USED
-                race_min_field = LOW_SAMPLE_WARNING_THRESHOLD
-                race_sof = STRONG_SOF_THRESHOLD
-                c1.metric("Top scores used", TOP_SCORES_USED)
-                c2.metric("Minimum split sample", LOW_SAMPLE_WARNING_THRESHOLD)
-                c3.metric("Strong SOF", int(STRONG_SOF_THRESHOLD))
-                selected_meta = race_options_df[race_options_df["label"] == selected_cache_label].iloc[0]
-                selected_race = selected_meta["race_name"]
-                selected_gender = selected_meta["gender"]
-                selected_date = selected_meta["race_date"]
-                if pd.isna(selected_date):
-                    selected_date = pd.Timestamp.today().normalize()
-                if st.button("Rebuild selected race prediction cache", type="primary", width="stretch"):
-                    with st.spinner("Building race prediction cache..."):
-                        rows, meta, _ = save_race_prediction_cache(results, starts, overrides, selected_race, selected_date, selected_gender, race_top_n, race_min_field, race_sof)
-                    st.success(f"Saved {rows:,} cached prediction rows for {selected_gender} · {selected_race}.")
-                    st.json(meta)
-                    clear_cache()
-
-    with tab_manage:
-        st.subheader("Manage Cache")
-        st.caption("Refresh database cache only clears Streamlit's in-memory data. It does not rebuild saved model outputs. Use the rebuild buttons below to regenerate saved rankings/predictions.")
-
-        with st.expander("Rebuild everything", expanded=True):
-            st.warning("This rebuilds all athlete ranking caches and all imported start-list race prediction caches. It can take several minutes on large data sets.")
-            b1, b2, b3, b4 = st.columns(4)
-            all_as_of = b1.date_input("As of date", value=date.today(), key="cache_all_asof")
-            all_top_n = TOP_SCORES_USED
-            all_min_field = LOW_SAMPLE_WARNING_THRESHOLD
-            all_sof = STRONG_SOF_THRESHOLD
-            b2.metric("Top scores used", TOP_SCORES_USED)
-            b3.metric("Minimum split sample", LOW_SAMPLE_WARNING_THRESHOLD)
-            b4.metric("Strong SOF", int(STRONG_SOF_THRESHOLD))
-            race_rebuilds = distinct_start_list_races(starts)
-            ranking_total = len(["Men", "Women"]) * len(RANKING_FAMILIES) * len(["overall", "swim", "bike", "run"])
-            race_total = len(race_rebuilds)
-            st.caption(f"Will rebuild {ranking_total} ranking caches and {race_total} race prediction caches.")
-            if st.button("Rebuild everything now", type="primary", width="stretch"):
-                progress = st.progress(0, text="Starting full model cache rebuild...")
-                total = max(ranking_total + race_total, 1)
-                done = 0
-                logs = []
-                for g in ["Men", "Women"]:
-                    for fam in RANKING_FAMILIES:
-                        for vk in ["overall", "swim", "bike", "run"]:
-                            try:
-                                rows, metrics = save_athlete_ranking_cache(results, overrides, g, fam, pd.Timestamp(all_as_of), all_top_n, vk)
-                                logs.append({"Cache": "athlete_ranking", "Gender": g, "Race Family": fam, "View": vk, "Race": "", "Rows Saved": rows, "Status": "saved", **metrics})
-                            except Exception as e:
-                                logs.append({"Cache": "athlete_ranking", "Gender": g, "Race Family": fam, "View": vk, "Race": "", "Rows Saved": 0, "Status": f"error: {e}"})
-                            done += 1
-                            progress.progress(done / total, text=f"Built {done}/{total}: rankings · {g} · {fam} · {vk}")
-                for _, r in race_rebuilds.iterrows():
-                    race_name = r.get("race_name")
-                    race_date = r.get("race_date")
-                    race_gender = r.get("gender")
-                    try:
-                        rows, meta, _ = save_race_prediction_cache(results, starts, overrides, race_name, race_date, race_gender, all_top_n, all_min_field, all_sof)
-                        logs.append({"Cache": "race_prediction", "Gender": race_gender, "Race Family": meta.get("prediction_scope", ""), "View": "all", "Race": race_name, "Rows Saved": rows, "Status": "saved", **meta})
-                    except Exception as e:
-                        logs.append({"Cache": "race_prediction", "Gender": race_gender, "Race Family": "", "View": "all", "Race": race_name, "Rows Saved": 0, "Status": f"error: {e}"})
-                    done += 1
-                    progress.progress(done / total, text=f"Built {done}/{total}: race prediction · {race_gender} · {race_name}")
-                progress.empty()
-                clear_cache()
-                st.success("Finished full model cache rebuild.")
-                display_table(pd.DataFrame(logs), ["Cache", "Gender", "Race Family", "View", "Race", "Rows Saved", "Status", "rows_after_gender", "rows_after_family", "athletes_ranked", "start_list_athletes", "rows_used", "prediction_scope"], height=520)
-
+    col_a, col_b = st.columns([2, 1])
+    if col_a.button("Rebuild all athlete scorecards", type="primary", width="stretch"):
+        loader = loading_card("Building athlete scorecards", "Saving profile + discipline scores and top-5 evidence rows into Supabase...")
         try:
-            cache_df = load_table("model_cache")
-        except Exception:
-            cache_df = pd.DataFrame()
-        if cache_df.empty:
-            st.info("No cache rows stored yet.")
-        else:
-            display_table(cache_df.sort_values("computed_at", ascending=False).head(200), ["cache_kind", "cache_label", "row_count", "computed_at", "cache_key"], height=520)
-        c1, c2, c3 = st.columns(3)
-        if c1.button("Clear athlete ranking cache", width="stretch"):
-            clear_model_cache("athlete_ranking")
+            logs = rebuild_all_athlete_scorecards(results, overrides, pd.Timestamp(rebuild_date))
+        finally:
+            loader.empty()
+        st.success("Finished rebuilding athlete scorecards.")
+        display_table(logs, ["Gender", "Profile", "Discipline", "Scorecard Rows", "Evidence Rows", "Status", "rows_after_gender", "rows_after_family", "athletes_ranked"], height=520)
+        clear_cache()
+
+    if col_b.button("Clear scorecards", width="stretch"):
+        try:
+            delete_all("athlete_scorecard_evidence")
+            delete_all("athlete_scorecards")
             clear_cache()
-            st.success("Cleared athlete ranking cache.")
-        if c2.button("Clear race prediction cache", width="stretch"):
-            clear_model_cache("race_prediction")
-            clear_cache()
-            st.success("Cleared race prediction cache.")
-        if c3.button("Clear all model cache", width="stretch"):
-            clear_model_cache()
-            clear_cache()
-            st.success("Cleared all model cache.")
+            st.success("Cleared scorecard tables.")
+        except Exception as e:
+            st.error("Could not clear scorecard tables.")
+            st.exception(e)
+
+    try:
+        cards = load_table("athlete_scorecards")
+        ev = load_table("athlete_scorecard_evidence")
+    except Exception:
+        cards, ev = pd.DataFrame(), pd.DataFrame()
+    c1, c2 = st.columns(2)
+    c1.metric("Scorecard rows", f"{len(cards):,}")
+    c2.metric("Evidence rows", f"{len(ev):,}")
+    if not cards.empty:
+        latest = cards.sort_values("computed_at", ascending=False).head(300) if "computed_at" in cards.columns else cards.head(300)
+        display_table(latest, ["gender", "profile", "discipline", "rank", "athlete_name", "score", "evidence_count", "as_of_date", "computed_at"], height=520)
+    else:
+        st.info("No athlete_scorecards rows stored yet.")
 
 elif page == "Athlete Rankings":
     st.header("🥇 Athlete Rankings")
@@ -6213,7 +5210,6 @@ elif page in {"Race Dashboard", "Split Audit"}:
         min_field_size = LOW_SAMPLE_WARNING_THRESHOLD
         strong_sof_threshold = STRONG_SOF_THRESHOLD
         st.caption(f"Model settings: top {TOP_SCORES_USED} scores · strong SOF {int(STRONG_SOF_THRESHOLD)}")
-        use_model_cache = st.checkbox("Use saved model cache", value=True, help="Fast mode: load saved predictions when available instead of recalculating everything live.")
 
     selected_meta = race_options_df[race_options_df["label"] == selected_label].iloc[0]
     selected_race = selected_meta["race_name"]
@@ -6243,40 +5239,14 @@ elif page in {"Race Dashboard", "Split Audit"}:
     render_race_card(selected_race, selected_gender, selected_date, window_start)
 
 
-    if page == "Race Dashboard" and use_model_cache:
+    if page == "Race Dashboard":
         table_prediction, table_meta = build_race_prediction_from_scorecard_tables(starts, selected_race, selected_date, selected_gender)
         if table_prediction is not None and not table_prediction.empty:
-            st.success("Loaded prediction from relational athlete_scorecards table.")
+            st.success("Loaded prediction from athlete_scorecards.")
             display_cached_race_prediction(table_prediction, {"params": table_meta, "computed_at": max([v for k, v in table_meta.items() if k.endswith("_as_of_date")], default="")})
-            st.stop()
-        elif scorecard_tables_ready():
-            st.info("No relational scorecard prediction found yet for this race/profile. Falling back to legacy cache or live calculation. Rebuild athlete scorecards to use the faster path.")
-        cache_prediction_scope = prediction_scope_from_race(selected_race, None, None)
-        cached_prediction, cached_meta, cache_match, cache_diffs = load_race_prediction_cache_best_match(
-            selected_race,
-            selected_date,
-            selected_gender,
-            top_n,
-            min_field_size,
-            strong_sof_threshold,
-            cache_prediction_scope,
-        )
-        if cached_prediction is not None and not cached_prediction.empty:
-            if cache_match == "settings_mismatch":
-                st.warning(
-                    "Loaded the latest saved cache for this race, but the current sidebar settings do not exactly match the cache. "
-                    "Rebuild this race cache if you want the current settings saved.\n\n"
-                    + "\n".join(f"- {d}" for d in cache_diffs)
-                )
-            elif cache_match == "race_match":
-                st.info("Loaded a saved race cache for this race.")
-            display_cached_race_prediction(cached_prediction, cached_meta)
-            st.stop()
         else:
-            st.warning(
-                "No saved race prediction cache found for this race. Showing live calculation. "
-                "Use ⚡ Model Cache → Race Prediction Cache to save this race, or run Rebuild everything."
-            )
+            st.warning("No saved scorecard prediction found for this race/profile. Rebuild athlete scorecards in ⚡ Model Cache after importing results or fixing athlete genders.")
+        st.stop()
 
     # Performance: build each split audit only from races relevant to the
     # selected start-list athletes, not from every result row in the 2-year
