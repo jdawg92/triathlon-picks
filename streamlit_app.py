@@ -3,7 +3,7 @@ import json
 import math
 import re
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -21,9 +21,10 @@ else:
     SCORE_ENGINE_IMPORT_ERROR = None
 
 try:
-    from trinews_api_refresh import build_clean_results_refresh
+    from trinews_api_refresh import build_clean_results_refresh, build_full_clean_api_rebuild
 except Exception as _trinews_api_import_error:
     build_clean_results_refresh = None
+    build_full_clean_api_rebuild = None
     TRINEWS_API_IMPORT_ERROR = _trinews_api_import_error
 else:
     TRINEWS_API_IMPORT_ERROR = None
@@ -5552,6 +5553,156 @@ elif page == "Import CSVs":
                         st.subheader("API refresh log")
                         st.dataframe(logs_df, width="stretch")
                     st.info("Next step: Model Cache → Rebuild athlete scorecards.")
+
+            st.divider()
+            section_title("🧱", "Full clean API rebuild")
+            st.write("Rebuild the core imported data from TriNews API: athletes, races, clean race results, and optionally start lists. This is the clean reset path for removing corrupted spreadsheet split data.")
+            st.warning("Use Preview first. Execute mode can clear and replace athlete_results, race_field_results, athletes, and start_lists. It does not delete gender overrides, scoring settings, or race overrides.")
+
+            r1, r2, r3, r4 = st.columns(4)
+            full_start_date = r1.date_input("Start date", value=date(2024, 1, 1), key="trinews_full_start_date")
+            full_end_date = r2.date_input("End date", value=date.today(), key="trinews_full_end_date")
+            full_circuit = r3.selectbox("Circuit", ["all", "long_course", "short_course"], index=0, key="trinews_full_circuit")
+            full_brand = r4.selectbox("Brand", ["all", "t100", "ironman", "world_triathlon", "pto"], index=0, key="trinews_full_brand")
+
+            rr1, rr2, rr3, rr4 = st.columns(4)
+            full_max_races = rr1.number_input("Max races to pull", min_value=1, max_value=5000, value=250, step=25, key="trinews_full_max_races")
+            full_result_limit = rr2.number_input("Max results per race", min_value=10, max_value=2000, value=1000, step=50, key="trinews_full_result_limit")
+            full_sync_all_pro = rr3.checkbox("Also sync all pro athlete profiles", value=False, key="trinews_full_sync_all_pro")
+            full_max_athletes = rr4.number_input("Max athlete profiles", min_value=100, max_value=50000, value=10000, step=500, key="trinews_full_max_athletes")
+
+            st.markdown("**Start lists**")
+            sl1, sl2, sl3 = st.columns(3)
+            sync_start_lists_api = sl1.checkbox("Also import start lists from API", value=True, key="trinews_full_sync_start_lists")
+            start_list_start_date = sl2.date_input("Start-list start date", value=date.today(), key="trinews_full_start_list_start_date")
+            start_list_end_date = sl3.date_input("Start-list end date", value=date.today() + timedelta(days=180), key="trinews_full_start_list_end_date")
+            sl4, sl5 = st.columns(2)
+            max_start_list_races = sl4.number_input("Max races to check for start lists", min_value=1, max_value=1000, value=150, step=25, key="trinews_full_max_start_list_races")
+            replace_start_lists = sl5.checkbox("Replace start_lists table too", value=True, key="trinews_full_replace_start_lists")
+
+            preview_only = st.checkbox("Preview only - do not write to Supabase", value=True, key="trinews_full_preview_only")
+            replace_athletes_master = st.checkbox("Replace athletes master table too", value=True, key="trinews_full_replace_athletes")
+            write_source_tables = st.checkbox("Also write raw source cache tables if installed", value=True, help="Optional tables: trinews_athletes, trinews_races, trinews_results, trinews_start_lists. Run trinews_clean_source_tables.sql first if you want these.", key="trinews_full_write_source_tables")
+            confirm_rebuild = st.text_input("For execute mode, type REBUILD", value="", key="trinews_full_confirm")
+
+            if st.button("Build full clean API rebuild", type="primary", key="trinews_full_rebuild_btn"):
+                if build_full_clean_api_rebuild is None:
+                    st.error("trinews_api_refresh.py does not include build_full_clean_api_rebuild. Upload the latest trinews_api_refresh.py file.")
+                elif not api_key:
+                    st.warning("Enter the TriNews API key or add TRINEWS_API_KEY to Streamlit secrets.")
+                else:
+                    loader = loading_card("Building full clean API rebuild", "Fetching races, result fields, athlete profiles, and clean split times...")
+                    try:
+                        full_payload = build_full_clean_api_rebuild(
+                            api_key=api_key,
+                            start_date=str(full_start_date),
+                            end_date=str(full_end_date),
+                            circuit=None if full_circuit == "all" else full_circuit,
+                            brand=None if full_brand == "all" else full_brand,
+                            max_races=int(full_max_races),
+                            race_result_limit=int(full_result_limit),
+                            sync_all_pro_athletes=bool(full_sync_all_pro),
+                            max_athletes=int(full_max_athletes),
+                            sync_start_lists=bool(sync_start_lists_api),
+                            start_list_start_date=str(start_list_start_date),
+                            start_list_end_date=str(start_list_end_date),
+                            max_start_list_races=int(max_start_list_races),
+                        )
+                    finally:
+                        loader.empty()
+
+                    summary = full_payload.get("summary", {}) or {}
+                    s1, s2, s3, s4, s5, s6 = st.columns(6)
+                    s1.metric("Races", f"{summary.get('races', 0):,}")
+                    s2.metric("Results", f"{summary.get('results', 0):,}")
+                    s3.metric("Athletes", f"{summary.get('athletes', 0):,}")
+                    s4.metric("Rows w/ swim", f"{summary.get('rows_with_swim', 0):,}")
+                    s5.metric("Start-list rows", f"{summary.get('start_list_rows', 0):,}")
+                    s6.metric("Computed SOF", f"{summary.get('computed_sof_races', 0):,}")
+
+                    logs_df = pd.DataFrame(full_payload.get("logs", []) or [])
+                    if not logs_df.empty:
+                        with st.expander("API rebuild log", expanded=False):
+                            st.dataframe(logs_df, width="stretch")
+
+                    sample_rows = pd.DataFrame((full_payload.get("athlete_results", []) or [])[:25])
+                    if not sample_rows.empty:
+                        st.subheader("Sample normalized result rows")
+                        cols = [c for c in ["athlete_name", "gender", "race_date", "race_name", "race_type", "place", "sof", "ors", "swim_seconds", "bike_seconds", "run_seconds", "status"] if c in sample_rows.columns]
+                        st.dataframe(sample_rows[cols], width="stretch", hide_index=True)
+
+                    sample_start_rows = pd.DataFrame((full_payload.get("start_lists", []) or [])[:25])
+                    if not sample_start_rows.empty:
+                        st.subheader("Sample API start-list rows")
+                        start_cols = [c for c in ["race_date", "race_name", "gender", "athlete_name", "athlete_url", "open_rank"] if c in sample_start_rows.columns]
+                        st.dataframe(sample_start_rows[start_cols], width="stretch", hide_index=True)
+
+                    if preview_only:
+                        st.info("Preview complete. Uncheck Preview only and type REBUILD to replace the core imported data.")
+                    else:
+                        if confirm_rebuild.strip() != "REBUILD":
+                            st.error("Type REBUILD to execute the destructive replace.")
+                        else:
+                            with st.spinner("Replacing Supabase imported data with clean API data..."):
+                                # Clear scorecards first because they depend on the imported result tables.
+                                score_clear = clear_scorecard_tables_for_rebuild()
+
+                                if replace_athletes_master:
+                                    delete_all("athletes")
+                                delete_all("athlete_results")
+                                delete_all("race_field_results")
+                                if replace_start_lists:
+                                    delete_all("start_lists")
+
+                                athlete_rows = full_payload.get("athletes", []) or []
+                                a_inserted, a_updated = upsert_athletes_preserve_gender(athlete_rows)
+
+                                athlete_result_rows = dedupe_result_rows(full_payload.get("athlete_results", []) or [])
+                                race_field_rows = dedupe_result_rows(full_payload.get("race_field_results", []) or [])
+                                ar_rows, ar_ath_ins, ar_ath_upd, ar_prop = sync_athlete_master_import(athlete_result_rows, athlete_rows)
+                                rf_rows, rf_ath_ins, rf_ath_upd, rf_prop = sync_athlete_master_import(race_field_rows, athlete_rows)
+                                insert_chunks("athlete_results", ar_rows)
+                                insert_chunks("race_field_results", rf_rows)
+
+                                start_rows = dedupe_start_list_rows(full_payload.get("start_lists", []) or [])
+                                if start_rows:
+                                    # Start-list athletes must use the same canonical athlete identity as result rows.
+                                    start_rows, sl_ath_ins, sl_ath_upd, sl_prop = sync_athlete_master_import(start_rows, athlete_rows)
+                                    insert_chunks("start_lists", start_rows)
+                                else:
+                                    sl_ath_ins = sl_ath_upd = 0
+
+                                source_writes = {}
+                                if write_source_tables:
+                                    for table_name, payload_key in [
+                                        ("trinews_athletes", "trinews_athletes"),
+                                        ("trinews_races", "trinews_races"),
+                                        ("trinews_results", "trinews_results"),
+                                        ("trinews_start_lists", "trinews_start_lists"),
+                                    ]:
+                                        rows_to_write = full_payload.get(payload_key, []) or []
+                                        try:
+                                            delete_all(table_name)
+                                            upsert_chunks(table_name, rows_to_write, on_conflict="id")
+                                            source_writes[table_name] = f"{len(rows_to_write):,} rows"
+                                        except Exception as e:
+                                            source_writes[table_name] = f"Skipped/error: {str(e)[:160]}"
+
+                                clear_cache()
+
+                            st.success(
+                                "Full clean API rebuild complete. "
+                                f"Athlete results inserted: {len(ar_rows):,}. "
+                                f"Race-field results inserted: {len(rf_rows):,}. "
+                                f"Start-list rows inserted: {len(start_rows):,}. "
+                                f"Athletes inserted/updated: {a_inserted + ar_ath_ins + rf_ath_ins + sl_ath_ins:,} / {a_updated + ar_ath_upd + rf_ath_upd + sl_ath_upd:,}."
+                            )
+                            st.caption(f"Scorecard clear method: {score_clear.get('method')}")
+                            if source_writes:
+                                st.subheader("Optional source table writes")
+                                st.json(source_writes)
+                            st.info("Next step: Model Cache → Rebuild athlete scorecards.")
+
 
     with start_lists_tab:
         section_title("📋", "Start-list imports and updates")

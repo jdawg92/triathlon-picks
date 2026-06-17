@@ -395,3 +395,751 @@ def build_clean_results_refresh(
         "races_found": len(race_map),
         "race_fields_refreshed": len(set(_clean(r.get("race_id")) for r in race_field_raw if _clean(r.get("race_id")))) if include_race_fields else 0,
     }
+
+
+
+def _as_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def computed_race_sof_from_results(results: List[Dict[str, Any]], top_n: int = 10) -> Optional[float]:
+    """Estimate race SOF from the top OpenRank values in the field.
+
+    TriNews sometimes leaves races.strength_of_field blank while each result has
+    points.openrank. The old app needs a race-level SOF number for evidence
+    weighting, so this computes a stable field-quality proxy from the race field.
+    """
+    vals: List[float] = []
+    for r in results or []:
+        if (_clean(r.get('status')) or '').upper() not in {'FIN', 'OK', 'FINISH'}:
+            # DNS/DNF rows can be present and should not define field quality.
+            pass
+        v = points_openrank(r)
+        if v is not None and v > 0:
+            vals.append(float(v))
+    vals = sorted(vals, reverse=True)
+    if not vals:
+        return None
+    n = min(max(3, top_n), len(vals))
+    return round(sum(vals[:n]) / n, 1)
+
+
+def fetch_races(
+    api_key: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    circuit: Optional[str] = None,
+    brand: Optional[str] = None,
+    max_races: int = 250,
+    page_size: int = 200,
+) -> List[Dict[str, Any]]:
+    """Fetch race metadata from /races with safe pagination."""
+    if max_races <= 0:
+        return []
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+    page_size = max(1, min(int(page_size), 1000))
+    while len(rows) < max_races:
+        params: Dict[str, Any] = {
+            'select': '*',
+            'has_results': 'eq.true',
+            'order': 'date.desc',
+            'limit': min(page_size, max_races - len(rows)),
+            'offset': offset,
+        }
+        and_clauses = []
+        sd = _clean(start_date)
+        ed = _clean(end_date)
+        if sd:
+            and_clauses.append(f'date.gte.{sd}')
+        if ed:
+            and_clauses.append(f'date.lte.{ed}')
+        if and_clauses:
+            params['and'] = '(' + ','.join(and_clauses) + ')'
+        c = _clean(circuit)
+        if c and c.lower() not in {'all', 'any'}:
+            params['circuit'] = f'eq.{c}'
+        b = _clean(brand)
+        if b and b.lower() not in {'all', 'any'}:
+            params['brand'] = f'eq.{b}'
+        page = _get(api_key, 'races', params, timeout=45)
+        rows.extend(page)
+        if len(page) < int(params['limit']):
+            break
+        offset += int(params['limit'])
+    return rows[:max_races]
+
+
+def fetch_all_pro_athletes(api_key: str, max_athletes: int = 10000, page_size: int = 1000) -> List[Dict[str, Any]]:
+    """Optionally fetch lightweight pro athlete profiles from /athletes."""
+    if max_athletes <= 0:
+        return []
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+    page_size = max(1, min(int(page_size), 1000))
+    while len(rows) < max_athletes:
+        params = {
+            'select': '*',
+            'is_pro': 'eq.true',
+            'order': 'full_name.asc',
+            'limit': min(page_size, max_athletes - len(rows)),
+            'offset': offset,
+        }
+        page = _get(api_key, 'athletes', params, timeout=45)
+        rows.extend(page)
+        if len(page) < int(params['limit']):
+            break
+        offset += int(params['limit'])
+    return rows[:max_athletes]
+
+
+def trinews_race_source_row(race: Dict[str, Any], computed_sof: Optional[float] = None) -> Dict[str, Any]:
+    race_id = _clean(race.get('id'))
+    sof = _as_float(race.get('strength_of_field'))
+    if sof is None:
+        sof = computed_sof
+    return {
+        'id': race_id,
+        'name': _clean(race.get('name')),
+        'slug': _clean(race.get('slug')),
+        'race_date': date_from_api(race.get('date')),
+        'organization': _clean(race.get('organization')),
+        'distance_category': _clean(race.get('distance_category')),
+        'tier': _clean(race.get('tier')),
+        'brand': _clean(race.get('brand')),
+        'circuit': _clean(race.get('circuit')),
+        'venue': _clean(race.get('venue')),
+        'city': _clean(race.get('city')),
+        'country_name': _clean(race.get('country_name')),
+        'country_iso2': _clean(race.get('country_iso2')),
+        'strength_of_field': sof,
+        'difficulty_score': _as_float(race.get('difficulty_score')),
+        'has_results': bool(race.get('has_results')),
+        'updated_at': _clean(race.get('updated_at')),
+        'raw': race,
+    }
+
+
+def trinews_result_source_row(result: Dict[str, Any], race: Optional[Dict[str, Any]], athlete: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    pts = result.get('points')
+    if isinstance(pts, str):
+        try:
+            pts = json.loads(pts)
+        except Exception:
+            pts = {}
+    if not isinstance(pts, dict):
+        pts = {}
+    return {
+        'id': _clean(result.get('id')),
+        'race_id': _clean(result.get('race_id')),
+        'athlete_id': _clean(result.get('athlete_id')),
+        'race_slug': _clean((race or {}).get('slug')),
+        'race_name': _clean((race or {}).get('name')),
+        'race_date': date_from_api((race or {}).get('date')),
+        'athlete_name': athlete_name_from_api(athlete, _clean(result.get('athlete_id'))),
+        'athlete_slug': _clean((athlete or {}).get('slug')),
+        'gender': gender_from_api(athlete, result),
+        'program_name': _clean(result.get('program_name')),
+        'placement': result.get('placement'),
+        'status': _clean(result.get('status')),
+        'finish_time': _clean(result.get('finish_time')),
+        'swim_time': _clean(result.get('swim_time')),
+        'bike_time': _clean(result.get('bike_time')),
+        'run_time': _clean(result.get('run_time')),
+        'swim_seconds': seconds_from_api_time(result.get('swim_time')),
+        'bike_seconds': seconds_from_api_time(result.get('bike_time')),
+        'run_seconds': seconds_from_api_time(result.get('run_time')),
+        'swim_rank': result.get('swim_rank'),
+        'bike_rank': result.get('bike_rank'),
+        'run_rank': result.get('run_rank'),
+        'openrank': points_openrank(result),
+        'pto_points': _as_float(pts.get('pto')),
+        't100_points': _as_float(pts.get('t100')),
+        'source': _clean(result.get('source')),
+        'updated_at': _clean(result.get('updated_at')),
+        'raw': result,
+    }
+
+
+def trinews_athlete_source_row(athlete: Dict[str, Any]) -> Dict[str, Any]:
+    aid = _clean(athlete.get('id'))
+    return {
+        'id': aid,
+        'full_name': athlete_name_from_api(athlete, aid),
+        'slug': _clean(athlete.get('slug')),
+        'gender': gender_from_api(athlete),
+        'country_name': _clean(athlete.get('country_name')),
+        'country_iso2': _clean(athlete.get('country_iso2')),
+        'country_iso3': _clean(athlete.get('country_iso3')),
+        'year_of_birth': athlete.get('year_of_birth'),
+        'photo_url': _clean(athlete.get('photo_url')),
+        'is_pro': bool(athlete.get('is_pro')),
+        'updated_at': _clean(athlete.get('updated_at')),
+        'raw': athlete,
+    }
+
+
+def build_full_clean_api_rebuild(
+    api_key: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    circuit: Optional[str] = None,
+    brand: Optional[str] = None,
+    max_races: int = 250,
+    race_result_limit: int = 1000,
+    sync_all_pro_athletes: bool = False,
+    max_athletes: int = 10000,
+) -> Dict[str, Any]:
+    """Build a full clean-source payload from TriNews API data.
+
+    This intentionally returns data only; the Streamlit app decides whether to
+    preview it or clear/insert tables.
+    """
+    if not _clean(api_key):
+        raise ValueError('TriNews API key is required.')
+
+    logs: List[Dict[str, Any]] = []
+    races = fetch_races(
+        api_key=api_key,
+        start_date=start_date,
+        end_date=end_date,
+        circuit=circuit,
+        brand=brand,
+        max_races=int(max_races),
+    )
+    logs.append({'stage': 'races', 'status': 'ok', 'rows': len(races)})
+
+    race_map: Dict[str, Dict[str, Any]] = {}
+    race_results_by_race: Dict[str, List[Dict[str, Any]]] = {}
+    all_results: List[Dict[str, Any]] = []
+    for race in races:
+        rid = _clean(race.get('id'))
+        if not rid:
+            continue
+        race_map[rid] = race
+        try:
+            results = fetch_results_for_race(api_key, rid, int(race_result_limit))
+            race_results_by_race[rid] = results
+            all_results.extend(results)
+            logs.append({'stage': 'results', 'race_id': rid, 'race_name': race.get('name'), 'rows': len(results), 'status': 'ok'})
+        except Exception as e:
+            logs.append({'stage': 'results', 'race_id': rid, 'race_name': race.get('name'), 'status': 'error', 'error': str(e)})
+
+    computed_sof: Dict[str, Optional[float]] = {rid: computed_race_sof_from_results(rows) for rid, rows in race_results_by_race.items()}
+
+    athlete_ids = [_clean(r.get('athlete_id')) for r in all_results if _clean(r.get('athlete_id'))]
+    athlete_map = fetch_by_ids(api_key, 'athletes', athlete_ids)
+    logs.append({'stage': 'athletes_from_results', 'status': 'ok', 'rows': len(athlete_map)})
+
+    if sync_all_pro_athletes:
+        try:
+            pro_rows = fetch_all_pro_athletes(api_key, max_athletes=int(max_athletes))
+            for a in pro_rows:
+                aid = _clean(a.get('id'))
+                if aid:
+                    athlete_map[aid] = a
+            logs.append({'stage': 'all_pro_athletes', 'status': 'ok', 'rows': len(pro_rows)})
+        except Exception as e:
+            logs.append({'stage': 'all_pro_athletes', 'status': 'error', 'error': str(e)})
+
+    # Build normalized app rows. Inject computed SOF when the API race row has none.
+    app_result_rows: List[Dict[str, Any]] = []
+    source_result_rows: List[Dict[str, Any]] = []
+    for r in all_results:
+        rid = _clean(r.get('race_id'))
+        aid = _clean(r.get('athlete_id'))
+        race = dict(race_map.get(rid) or {})
+        if _as_float(race.get('strength_of_field')) is None and computed_sof.get(rid) is not None:
+            race['strength_of_field'] = computed_sof.get(rid)
+        athlete = athlete_map.get(aid)
+        row = result_to_pick_rows(r, race, athlete)
+        if _clean(row.get('athlete_name')) and _clean(row.get('race_name')):
+            app_result_rows.append(row)
+        source_result_rows.append(trinews_result_source_row(r, race, athlete))
+
+    athlete_rows = [athlete_master_row_from_api(a) for a in athlete_map.values()]
+    athlete_rows_by_url: Dict[str, Dict[str, Any]] = {}
+    for row in athlete_rows:
+        url = _clean(row.get('athlete_url'))
+        if url:
+            athlete_rows_by_url[url] = row
+
+    source_athletes = [trinews_athlete_source_row(a) for a in athlete_map.values()]
+    source_races = [trinews_race_source_row(r, computed_sof.get(_clean(r.get('id')))) for r in races]
+
+    rows_with_swim = sum(1 for r in app_result_rows if seconds_from_api_time(((r.get('raw') or {}).get('swim_time'))) or r.get('swim_seconds'))
+    rows_with_bike = sum(1 for r in app_result_rows if r.get('bike_seconds'))
+    rows_with_run = sum(1 for r in app_result_rows if r.get('run_seconds'))
+    return {
+        'athletes': list(athlete_rows_by_url.values()),
+        'athlete_results': app_result_rows,
+        'race_field_results': app_result_rows,
+        'trinews_athletes': source_athletes,
+        'trinews_races': source_races,
+        'trinews_results': source_result_rows,
+        'logs': logs,
+        'summary': {
+            'races': len(races),
+            'results': len(all_results),
+            'app_result_rows': len(app_result_rows),
+            'athletes': len(athlete_rows_by_url),
+            'source_athletes': len(source_athletes),
+            'source_races': len(source_races),
+            'source_results': len(source_result_rows),
+            'rows_with_swim': rows_with_swim,
+            'rows_with_bike': rows_with_bike,
+            'rows_with_run': rows_with_run,
+            'computed_sof_races': sum(1 for v in computed_sof.values() if v is not None),
+        },
+    }
+
+# ============================================================
+# Fresh rebuild + start-list sync additions
+# ============================================================
+
+START_LIST_CANDIDATE_TABLES = [
+    "start_lists",
+    "startlists",
+    "race_start_lists",
+    "race_startlists",
+    "race_entries",
+    "entries",
+    "race_participants",
+    "participants",
+    "event_entries",
+    "event_participants",
+    "program_entries",
+]
+
+START_LIST_FILTER_CANDIDATES = [
+    ("race_id", "id"),
+    ("race", "id"),
+    ("race_uuid", "id"),
+    ("event_hub_id", "event_hub_id"),
+    ("event_id", "event_hub_id"),
+    ("race_slug", "slug"),
+    ("slug", "slug"),
+]
+
+
+def _get_optional(api_key: str, path: str, params: Dict[str, Any], timeout: int = 25) -> Tuple[int, Any]:
+    """GET a PostgREST path and return (status, json_or_text), never raise."""
+    try:
+        resp = requests.get(
+            f"{TRINEWS_REST_BASE}/{path.lstrip('/')}",
+            headers=_headers(api_key),
+            params=params,
+            timeout=timeout,
+        )
+        try:
+            data = resp.json()
+        except Exception:
+            data = resp.text
+        return resp.status_code, data
+    except Exception as e:
+        return 0, {"error": str(e)}
+
+
+def probe_start_list_sources_for_race(api_key: str, race: Dict[str, Any], limit: int = 25) -> List[Dict[str, Any]]:
+    """Try common public tables/views for start-list data for one race.
+
+    This is intentionally read-only and small. It helps discover whether the
+    public API exposes start lists and which table/key combination works.
+    """
+    out: List[Dict[str, Any]] = []
+    race_id = _clean(race.get("id"))
+    event_hub_id = _clean(race.get("event_hub_id"))
+    slug = _clean(race.get("slug"))
+    race_values = {"id": race_id, "event_hub_id": event_hub_id, "slug": slug}
+
+    for table in START_LIST_CANDIDATE_TABLES:
+        for col, race_key in START_LIST_FILTER_CANDIDATES:
+            val = race_values.get(race_key)
+            if not val:
+                continue
+            params = {"select": "*", col: f"eq.{val}", "limit": int(limit)}
+            status, data = _get_optional(api_key, table, params)
+            rows = data if isinstance(data, list) else []
+            out.append({
+                "table": table,
+                "filter_column": col,
+                "filter_value": val,
+                "status": status,
+                "row_count": len(rows),
+                "sample": rows[:3] if rows else data,
+            })
+            if status == 200 and rows:
+                # A non-empty exact-race match is enough. Avoid hammering every
+                # remaining candidate table in app flows.
+                return out
+    return out
+
+
+def discover_start_list_rows_for_race(api_key: str, race: Dict[str, Any], limit: int = 1000) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Return first non-empty start-list candidate rows plus discovery log."""
+    attempts = probe_start_list_sources_for_race(api_key, race, limit=min(25, int(limit)))
+    for a in attempts:
+        if a.get("status") == 200 and int(a.get("row_count") or 0) > 0:
+            table = a.get("table")
+            col = a.get("filter_column")
+            val = a.get("filter_value")
+            rows = _get(api_key, str(table), {"select": "*", str(col): f"eq.{val}", "limit": int(limit)}, timeout=45)
+            return rows, {"status": "ok", "table": table, "filter_column": col, "rows": len(rows), "race_id": race.get("id"), "race_slug": race.get("slug")}
+    return [], {"status": "not_found_or_empty", "attempts": attempts, "race_id": race.get("id"), "race_slug": race.get("slug")}
+
+
+def _extract_nested(row: Dict[str, Any], keys: List[str]) -> Any:
+    for key in keys:
+        cur: Any = row
+        ok = True
+        for part in key.split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur.get(part)
+            else:
+                ok = False
+                break
+        if ok and cur is not None:
+            return cur
+    return None
+
+
+def _start_list_athlete_id(row: Dict[str, Any]) -> Optional[str]:
+    return _clean(_extract_nested(row, [
+        "athlete_id", "athlete.id", "athletes.id", "participant.athlete_id", "entry.athlete_id", "profile_id"
+    ]))
+
+
+def _start_list_gender(row: Dict[str, Any], athlete: Optional[Dict[str, Any]]) -> Optional[str]:
+    return gender_from_api(athlete, {
+        "program_name": _extract_nested(row, ["program_name", "program", "division", "category", "gender"])
+    })
+
+
+def _start_list_openrank(row: Dict[str, Any]) -> Optional[float]:
+    for k in ["openrank", "open_rank", "open_rank_score", "ors", "score", "rank", "ranking"]:
+        v = _extract_nested(row, [k, f"points.{k}"])
+        try:
+            if v is not None and str(v).strip() != "":
+                return float(v)
+        except Exception:
+            pass
+    pts = row.get("points")
+    if isinstance(pts, str):
+        try:
+            pts = json.loads(pts)
+        except Exception:
+            pts = {}
+    if isinstance(pts, dict):
+        for k in ["openrank", "open_rank", "ors"]:
+            try:
+                if pts.get(k) is not None:
+                    return float(pts.get(k))
+            except Exception:
+                pass
+    return None
+
+
+def start_list_row_to_pick_row(row: Dict[str, Any], race: Dict[str, Any], athlete: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    aid = _start_list_athlete_id(row)
+    athlete_name = athlete_name_from_api(athlete, aid)
+    if not athlete_name:
+        athlete_name = _clean(_extract_nested(row, [
+            "athlete_name", "full_name", "name", "display_name", "athlete.full_name", "athlete.name", "athletes.full_name"
+        ]))
+    athlete_url = athlete_url_from_api(athlete, aid) if athlete or aid else None
+    if not athlete_url:
+        slug = _clean(_extract_nested(row, ["athlete_slug", "slug", "athlete.slug", "athletes.slug"]))
+        if slug:
+            athlete_url = f"{PROTRINEWS_BASE}/athletes/{slug}"
+    if not athlete_name and not athlete_url:
+        return None
+    return {
+        "race_name": display_race_name_from_api(race),
+        "race_date": date_from_api(race.get("date")),
+        "gender": _start_list_gender(row, athlete) or gender_from_api(athlete) or "Men",
+        "athlete_url": athlete_url,
+        "athlete_name": athlete_name,
+        "open_rank": _start_list_openrank(row),
+        "raw": {
+            "source": "trinews_api_start_list",
+            "trinews_race_id": race.get("id"),
+            "race_slug": race.get("slug"),
+            "trinews_athlete_id": aid,
+            "api_row": row,
+        },
+    }
+
+
+def trinews_start_list_source_row(row: Dict[str, Any], race: Dict[str, Any], athlete: Optional[Dict[str, Any]], source: Optional[str] = None) -> Dict[str, Any]:
+    aid = _start_list_athlete_id(row)
+    return {
+        "id": _clean(row.get("id")) or f"{_clean(race.get('id'))}:{aid or athlete_name_from_api(athlete, aid) or hash(json.dumps(row, sort_keys=True, default=str))}",
+        "race_id": _clean(race.get("id")),
+        "race_slug": _clean(race.get("slug")),
+        "race_name": _clean(race.get("name")),
+        "race_date": date_from_api(race.get("date")),
+        "event_hub_id": _clean(race.get("event_hub_id")),
+        "athlete_id": aid,
+        "athlete_name": athlete_name_from_api(athlete, aid),
+        "athlete_slug": _clean((athlete or {}).get("slug")),
+        "gender": _start_list_gender(row, athlete) or gender_from_api(athlete),
+        "openrank": _start_list_openrank(row),
+        "source_table": source,
+        "raw": row,
+    }
+
+
+def fetch_races_for_start_lists(
+    api_key: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    circuit: Optional[str] = None,
+    brand: Optional[str] = None,
+    max_races: int = 150,
+    page_size: int = 200,
+) -> List[Dict[str, Any]]:
+    """Fetch race metadata without requiring has_results=true, for start lists."""
+    if max_races <= 0:
+        return []
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+    page_size = max(1, min(int(page_size), 1000))
+    while len(rows) < max_races:
+        params: Dict[str, Any] = {
+            "select": "*",
+            "order": "date.asc",
+            "limit": min(page_size, max_races - len(rows)),
+            "offset": offset,
+        }
+        and_clauses = []
+        sd = _clean(start_date)
+        ed = _clean(end_date)
+        if sd:
+            and_clauses.append(f"date.gte.{sd}")
+        if ed:
+            and_clauses.append(f"date.lte.{ed}")
+        if and_clauses:
+            params["and"] = "(" + ",".join(and_clauses) + ")"
+        c = _clean(circuit)
+        if c and c.lower() not in {"all", "any"}:
+            params["circuit"] = f"eq.{c}"
+        b = _clean(brand)
+        if b and b.lower() not in {"all", "any"}:
+            params["brand"] = f"eq.{b}"
+        page = _get(api_key, "races", params, timeout=45)
+        rows.extend(page)
+        if len(page) < int(params["limit"]):
+            break
+        offset += int(params["limit"])
+    return rows[:max_races]
+
+
+def build_clean_start_list_sync(
+    api_key: str,
+    race_slugs: Optional[List[str]] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    circuit: Optional[str] = None,
+    brand: Optional[str] = None,
+    max_races: int = 100,
+    row_limit_per_race: int = 1000,
+) -> Dict[str, Any]:
+    """Build normalized start-list rows from any public TriNews start-list source discovered."""
+    if not _clean(api_key):
+        raise ValueError("TriNews API key is required.")
+    logs: List[Dict[str, Any]] = []
+    races: List[Dict[str, Any]] = []
+    if race_slugs:
+        for slug in race_slugs:
+            s = _clean(slug)
+            if not s:
+                continue
+            try:
+                got = _get(api_key, "races", {"select": "*", "slug": f"eq.{s}", "limit": 1}, timeout=30)
+                races.extend(got)
+                logs.append({"stage": "race_lookup", "slug": s, "rows": len(got), "status": "ok"})
+            except Exception as e:
+                logs.append({"stage": "race_lookup", "slug": s, "status": "error", "error": str(e)})
+    else:
+        races = fetch_races_for_start_lists(api_key, start_date, end_date, circuit, brand, int(max_races))
+        logs.append({"stage": "races_for_start_lists", "status": "ok", "rows": len(races)})
+
+    raw_start_rows: List[Tuple[Dict[str, Any], Dict[str, Any], str]] = []
+    athlete_ids: List[str] = []
+    for race in races[: int(max_races)]:
+        rows, log = discover_start_list_rows_for_race(api_key, race, int(row_limit_per_race))
+        logs.append({"stage": "start_list_discovery", **{k: v for k, v in log.items() if k != "attempts"}})
+        source = _clean(log.get("table"))
+        for row in rows:
+            raw_start_rows.append((row, race, source or "unknown"))
+            aid = _start_list_athlete_id(row)
+            if aid:
+                athlete_ids.append(aid)
+
+    athlete_map = fetch_by_ids(api_key, "athletes", athlete_ids) if athlete_ids else {}
+    app_rows: List[Dict[str, Any]] = []
+    source_rows: List[Dict[str, Any]] = []
+    athlete_rows_by_url: Dict[str, Dict[str, Any]] = {}
+    for raw_row, race, source in raw_start_rows:
+        aid = _start_list_athlete_id(raw_row)
+        athlete = athlete_map.get(aid)
+        app_row = start_list_row_to_pick_row(raw_row, race, athlete)
+        if app_row:
+            app_rows.append(app_row)
+            if athlete:
+                master = athlete_master_row_from_api(athlete)
+                url = _clean(master.get("athlete_url"))
+                if url:
+                    athlete_rows_by_url[url] = master
+        source_rows.append(trinews_start_list_source_row(raw_row, race, athlete, source))
+
+    return {
+        "start_lists": app_rows,
+        "athletes": list(athlete_rows_by_url.values()),
+        "trinews_start_lists": source_rows,
+        "logs": logs,
+        "summary": {
+            "races_checked": len(races),
+            "raw_start_rows": len(raw_start_rows),
+            "start_list_rows": len(app_rows),
+            "athletes": len(athlete_rows_by_url),
+        },
+    }
+
+
+# Override earlier build_full_clean_api_rebuild with start-list-aware version.
+def build_full_clean_api_rebuild(
+    api_key: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    circuit: Optional[str] = None,
+    brand: Optional[str] = None,
+    max_races: int = 250,
+    race_result_limit: int = 1000,
+    sync_all_pro_athletes: bool = False,
+    max_athletes: int = 10000,
+    sync_start_lists: bool = False,
+    start_list_start_date: Optional[str] = None,
+    start_list_end_date: Optional[str] = None,
+    max_start_list_races: int = 150,
+) -> Dict[str, Any]:
+    """Full fresh build: athletes, races, clean results, and optional start lists."""
+    if not _clean(api_key):
+        raise ValueError("TriNews API key is required.")
+
+    logs: List[Dict[str, Any]] = []
+    races = fetch_races(api_key, start_date, end_date, circuit, brand, int(max_races))
+    logs.append({"stage": "races", "status": "ok", "rows": len(races)})
+
+    race_map: Dict[str, Dict[str, Any]] = {}
+    race_results_by_race: Dict[str, List[Dict[str, Any]]] = {}
+    all_results: List[Dict[str, Any]] = []
+    for race in races:
+        rid = _clean(race.get("id"))
+        if not rid:
+            continue
+        race_map[rid] = race
+        try:
+            results = fetch_results_for_race(api_key, rid, int(race_result_limit))
+            race_results_by_race[rid] = results
+            all_results.extend(results)
+            logs.append({"stage": "results", "race_id": rid, "race_name": race.get("name"), "rows": len(results), "status": "ok"})
+        except Exception as e:
+            logs.append({"stage": "results", "race_id": rid, "race_name": race.get("name"), "status": "error", "error": str(e)})
+
+    computed_sof = {rid: computed_race_sof_from_results(rows) for rid, rows in race_results_by_race.items()}
+    athlete_ids = [_clean(r.get("athlete_id")) for r in all_results if _clean(r.get("athlete_id"))]
+    athlete_map = fetch_by_ids(api_key, "athletes", athlete_ids) if athlete_ids else {}
+    logs.append({"stage": "athletes_from_results", "status": "ok", "rows": len(athlete_map)})
+
+    if sync_all_pro_athletes:
+        try:
+            pro_rows = fetch_all_pro_athletes(api_key, max_athletes=int(max_athletes))
+            for a in pro_rows:
+                aid = _clean(a.get("id"))
+                if aid:
+                    athlete_map[aid] = a
+            logs.append({"stage": "all_pro_athletes", "status": "ok", "rows": len(pro_rows)})
+        except Exception as e:
+            logs.append({"stage": "all_pro_athletes", "status": "error", "error": str(e)})
+
+    app_result_rows: List[Dict[str, Any]] = []
+    source_result_rows: List[Dict[str, Any]] = []
+    for r in all_results:
+        rid = _clean(r.get("race_id"))
+        aid = _clean(r.get("athlete_id"))
+        race = dict(race_map.get(rid) or {})
+        if _as_float(race.get("strength_of_field")) is None and computed_sof.get(rid) is not None:
+            race["strength_of_field"] = computed_sof.get(rid)
+        athlete = athlete_map.get(aid)
+        row = result_to_pick_rows(r, race, athlete)
+        if _clean(row.get("athlete_name")) and _clean(row.get("race_name")):
+            app_result_rows.append(row)
+        source_result_rows.append(trinews_result_source_row(r, race, athlete))
+
+    start_list_payload: Dict[str, Any] = {"start_lists": [], "athletes": [], "trinews_start_lists": [], "logs": [], "summary": {}}
+    if sync_start_lists:
+        try:
+            start_list_payload = build_clean_start_list_sync(
+                api_key=api_key,
+                race_slugs=None,
+                start_date=start_list_start_date,
+                end_date=start_list_end_date,
+                circuit=circuit,
+                brand=brand,
+                max_races=int(max_start_list_races),
+            )
+            logs.extend(start_list_payload.get("logs", []))
+            for a in start_list_payload.get("athletes", []) or []:
+                # Convert back from app athlete row only if possible; for local
+                # app output this is enough, source athlete table uses API map.
+                pass
+        except Exception as e:
+            logs.append({"stage": "start_lists", "status": "error", "error": str(e)})
+
+    athlete_rows = [athlete_master_row_from_api(a) for a in athlete_map.values()]
+    for a in start_list_payload.get("athletes", []) or []:
+        athlete_rows.append(a)
+    athlete_rows_by_url: Dict[str, Dict[str, Any]] = {}
+    for row in athlete_rows:
+        url = _clean(row.get("athlete_url"))
+        if url:
+            athlete_rows_by_url[url] = row
+
+    source_athletes = [trinews_athlete_source_row(a) for a in athlete_map.values()]
+    source_races = [trinews_race_source_row(r, computed_sof.get(_clean(r.get("id")))) for r in races]
+
+    rows_with_swim = sum(1 for r in app_result_rows if r.get("swim_seconds"))
+    rows_with_bike = sum(1 for r in app_result_rows if r.get("bike_seconds"))
+    rows_with_run = sum(1 for r in app_result_rows if r.get("run_seconds"))
+    return {
+        "athletes": list(athlete_rows_by_url.values()),
+        "athlete_results": app_result_rows,
+        "race_field_results": app_result_rows,
+        "start_lists": start_list_payload.get("start_lists", []) or [],
+        "trinews_athletes": source_athletes,
+        "trinews_races": source_races,
+        "trinews_results": source_result_rows,
+        "trinews_start_lists": start_list_payload.get("trinews_start_lists", []) or [],
+        "logs": logs,
+        "summary": {
+            "races": len(races),
+            "results": len(all_results),
+            "app_result_rows": len(app_result_rows),
+            "athletes": len(athlete_rows_by_url),
+            "source_athletes": len(source_athletes),
+            "source_races": len(source_races),
+            "source_results": len(source_result_rows),
+            "rows_with_swim": rows_with_swim,
+            "rows_with_bike": rows_with_bike,
+            "rows_with_run": rows_with_run,
+            "computed_sof_races": sum(1 for v in computed_sof.values() if v is not None),
+            "start_list_rows": len(start_list_payload.get("start_lists", []) or []),
+            "trinews_start_list_rows": len(start_list_payload.get("trinews_start_lists", []) or []),
+        },
+    }
