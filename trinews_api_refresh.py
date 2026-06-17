@@ -1143,3 +1143,122 @@ def build_full_clean_api_rebuild(
             "trinews_start_list_rows": len(start_list_payload.get("trinews_start_lists", []) or []),
         },
     }
+
+
+# ============================================================
+# Fast sample/API test helpers for the simplified rebuild UI
+# ============================================================
+# Keep start-list discovery intentionally small so preview/test runs do not sit
+# for minutes trying every possible table signature.
+START_LIST_CANDIDATE_TABLES = [
+    "start_lists",
+    "race_start_lists",
+    "race_entries",
+    "entries",
+    "race_participants",
+    "participants",
+]
+START_LIST_FILTER_CANDIDATES = [
+    ("race_id", "id"),
+    ("event_hub_id", "event_hub_id"),
+    ("race_slug", "slug"),
+]
+
+
+def _sample_summary_row(name: str, status: str, rows: int = 0, note: Optional[str] = None) -> Dict[str, Any]:
+    return {"Pull": name, "Status": status, "Rows": int(rows or 0), "Note": note or ""}
+
+
+def test_api_pulls(
+    api_key: str,
+    athlete_query: str = "Hanne De Vet",
+    race_slug: str = "t100-triathlon-world-tour-spain-2026",
+    limit: int = 10,
+) -> Dict[str, Any]:
+    """Small read-only API test used by the Streamlit UI.
+
+    It intentionally limits each pull to a handful of rows and never writes to
+    Supabase. This is the safe first step before a fresh rebuild.
+    """
+    if not _clean(api_key):
+        raise ValueError("TriNews API key is required.")
+    limit = max(1, min(int(limit or 10), 25))
+    samples: Dict[str, Any] = {}
+    summary: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    # 1) Athletes sample
+    status, data = _get_optional(api_key, "athletes", {"select": "*", "is_pro": "eq.true", "limit": limit, "order": "full_name.asc"})
+    rows = data if isinstance(data, list) else []
+    samples["athletes_sample"] = rows[:limit] if rows else data
+    summary.append(_sample_summary_row("/athletes?is_pro=true", "ok" if status == 200 else f"error {status}", len(rows), "Pro athlete sample"))
+    if status != 200:
+        errors.append({"pull": "athletes_sample", "status": status, "error": str(data)[:500]})
+
+    # 2) Search athlete + direct athlete profile + athlete results.
+    athlete_row = None
+    athlete_id = None
+    if _clean(athlete_query):
+        try:
+            athlete_row, resolve_log = resolve_athlete(api_key, athlete_query)
+            samples["athlete_resolve"] = [{"resolve_log": resolve_log, "athlete": athlete_row}]
+            athlete_id = _clean((athlete_row or {}).get("id") or (athlete_row or {}).get("athlete_id"))
+            summary.append(_sample_summary_row("search_athletes + /athletes?id", "ok" if athlete_id else "no_match", 1 if athlete_id else 0, athlete_id or "No athlete id found"))
+        except Exception as e:
+            errors.append({"pull": "athlete_resolve", "status": "exception", "error": str(e)[:500]})
+            summary.append(_sample_summary_row("search_athletes + /athletes?id", "error", 0, str(e)[:180]))
+
+    if athlete_id:
+        status, data = _get_optional(api_key, "results", {"select": "*", "athlete_id": f"eq.{athlete_id}", "limit": limit, "order": "created_at.desc"})
+        rows = data if isinstance(data, list) else []
+        samples["athlete_results"] = rows[:limit] if rows else data
+        summary.append(_sample_summary_row("/results?athlete_id=...", "ok" if status == 200 else f"error {status}", len(rows), "Recent results for test athlete"))
+        if status != 200:
+            errors.append({"pull": "athlete_results", "status": status, "error": str(data)[:500]})
+
+    # 3) Races sample / exact race.
+    race_row = None
+    race_id = None
+    if _clean(race_slug):
+        status, data = _get_optional(api_key, "races", {"select": "*", "slug": f"eq.{race_slug}", "limit": 1})
+        rows = data if isinstance(data, list) else []
+        if rows:
+            race_row = rows[0]
+            race_id = _clean(race_row.get("id"))
+        samples["race_lookup"] = rows if rows else data
+        summary.append(_sample_summary_row("/races?slug=...", "ok" if status == 200 and rows else f"error {status}" if status != 200 else "no_match", len(rows), race_id or "No race id"))
+        if status != 200:
+            errors.append({"pull": "race_lookup", "status": status, "error": str(data)[:500]})
+
+    if not race_id:
+        status, data = _get_optional(api_key, "races", {"select": "*", "has_results": "eq.true", "limit": limit, "order": "date.desc"})
+        rows = data if isinstance(data, list) else []
+        samples["races_sample"] = rows[:limit] if rows else data
+        if rows:
+            race_row = rows[0]
+            race_id = _clean(race_row.get("id"))
+        summary.append(_sample_summary_row("/races?has_results=true", "ok" if status == 200 else f"error {status}", len(rows), race_id or "No race id"))
+        if status != 200:
+            errors.append({"pull": "races_sample", "status": status, "error": str(data)[:500]})
+
+    # 4) Race results sample.
+    if race_id:
+        status, data = _get_optional(api_key, "results", {"select": "*", "race_id": f"eq.{race_id}", "limit": limit, "order": "placement.asc"})
+        rows = data if isinstance(data, list) else []
+        samples["race_results"] = rows[:limit] if rows else data
+        summary.append(_sample_summary_row("/results?race_id=...", "ok" if status == 200 else f"error {status}", len(rows), "Clean leg times should be here"))
+        if status != 200:
+            errors.append({"pull": "race_results", "status": status, "error": str(data)[:500]})
+
+    # 5) Start-list discovery sample.
+    if race_row:
+        try:
+            attempts = probe_start_list_sources_for_race(api_key, race_row, limit=limit)
+            samples["start_list_probe"] = attempts[:20]
+            found = [a for a in attempts if a.get("status") == 200 and int(a.get("row_count") or 0) > 0]
+            summary.append(_sample_summary_row("start-list source probe", "ok" if found else "not_found", found[0].get("row_count", 0) if found else 0, (f"{found[0].get('table')}.{found[0].get('filter_column')}" if found else "No non-empty public start-list source found in quick probe")))
+        except Exception as e:
+            errors.append({"pull": "start_list_probe", "status": "exception", "error": str(e)[:500]})
+            summary.append(_sample_summary_row("start-list source probe", "error", 0, str(e)[:180]))
+
+    return {"summary": summary, "samples": samples, "errors": errors}
