@@ -5222,6 +5222,42 @@ def missing_scorecards_for_startlist(scorecard: pd.DataFrame, start_athletes: pd
     return pd.DataFrame(missing)
 
 
+def race_pick_score_from_scorecard_row(row: pd.Series, section: str) -> float:
+    """Race-analysis score: ceiling-weighted, but still sample-aware.
+
+    Athlete Rankings use the strict OpenRank-style best-4 denominator. Race
+    analysis is a start-line prediction, so proven high-ceiling athletes with
+    three elite races should not sit behind lower-ceiling athletes only because
+    they are missing a fourth result.
+    """
+    ranking_score = safe_float(row.get("Score")) or 0.0
+    perf_col = "Performance Score" if section == "overall" else "Performance Split Score"
+    performance_score = safe_float(row.get(perf_col))
+    if performance_score is None:
+        performance_score = ranking_score
+
+    evidence_count = parse_int(row.get("Evidence Count")) or 0
+    premium_count = parse_int(row.get("Premium Evidence Count")) or 0
+    strong_count = parse_int(row.get("Strong Evidence Count")) or 0
+
+    if evidence_count >= 4:
+        perf_weight = 0.82
+    elif evidence_count == 3:
+        perf_weight = 0.74
+    elif evidence_count == 2:
+        perf_weight = 0.58
+    else:
+        perf_weight = 0.34
+
+    if premium_count >= 1 or strong_count >= 2:
+        perf_weight = min(0.86, perf_weight + 0.08)
+
+    score = (float(performance_score) * perf_weight) + (float(ranking_score) * (1.0 - perf_weight))
+    if evidence_count <= 1:
+        score = min(score, 72.0)
+    return round(float(max(0.0, min(score, 100.0))), 1)
+
+
 def filter_scorecard_to_startlist(scorecard: pd.DataFrame, start_athletes: pd.DataFrame, section: str) -> pd.DataFrame:
     """Join a global scorecard to the selected start list.
 
@@ -5244,7 +5280,8 @@ def filter_scorecard_to_startlist(scorecard: pd.DataFrame, start_athletes: pd.Da
     out = out[out["Score"] > 0].copy()
     if out.empty:
         return out
-    out = out.sort_values("Score", ascending=False).reset_index(drop=True)
+    out["Race Pick Score"] = out.apply(lambda r: race_pick_score_from_scorecard_row(r, section), axis=1)
+    out = out.sort_values(["Race Pick Score", "Score"], ascending=[False, False]).reset_index(drop=True)
     if "Rank" in out.columns:
         out = out.drop(columns=["Rank"])
     out.insert(0, "Rank", range(1, len(out) + 1))
@@ -5779,7 +5816,7 @@ def _display_scorecards_from_tables(cards: pd.DataFrame, evidence: pd.DataFrame,
             "OpenRank Score", "OpenRank Split Score", "Best Recent ORS", "Strong Field ORS", "Recent Races Used",
             "Premium Evidence Count", "Strong Evidence Count", "Last Rank", "Best Recent Split",
             "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %",
-            "Best Scores Padded", "Best Split Scores Padded", "Distance Transfer Weight",
+            "Performance Score", "Performance Split Score", "Best Scores Padded", "Best Split Scores Padded", "Distance Transfer Weight",
         ]:
             if extra in raw and extra not in row:
                 row[extra] = raw.get(extra)
@@ -5888,7 +5925,7 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
 
     section_title("🏆", "Overall Picks")
     overall = _positive_score_rows(cached_section(cached_df, "overall"))
-    display_table(overall.head(20), ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Best Scores Padded", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date"])
+    display_table(overall.head(20), ["Rank", "Athlete", "Race Pick Score", "Score", "Performance Score", "OpenRank Score", "Best Scores Used", "Best Scores Padded", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date"])
     render_score_evidence(overall, "Overall score evidence", limit=8)
     _render_missing_scorecards(params, "overall")
 
@@ -5900,7 +5937,7 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
             scored = _positive_score_rows(cached_section(cached_df, disc))
             display_table(
                 scored.head(20),
-                ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Best Split Scores Padded", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
+                ["Rank", "Athlete", "Race Pick Score", "Score", "Performance Split Score", "OpenRank Split Score", "Best Split Scores Used", "Best Split Scores Padded", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
                 height=360,
             )
             render_score_evidence(scored, f"{title} evidence", limit=8)
