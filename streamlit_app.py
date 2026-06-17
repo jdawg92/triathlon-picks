@@ -6260,7 +6260,7 @@ def _render_keep_an_eye_cards_legacy(watch: pd.DataFrame) -> None:
                 """,
                 unsafe_allow_html=True,
             )
-def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
+def _render_keep_an_eye_cards_table_legacy(watch: pd.DataFrame) -> None:
     if watch is None or watch.empty:
         return
     sections = ["Overall", "Swim", "Bike", "Run"]
@@ -6310,6 +6310,59 @@ def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
                 <div class="reason">{signal_race}</div>
             </div>
             """
+        )
+    card_html.append("</div>")
+    st.markdown("\n".join(card_html), unsafe_allow_html=True)
+
+
+def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
+    if watch is None or watch.empty:
+        return
+    sections = ["Overall", "Swim", "Bike", "Run"]
+    picks = []
+    for section in sections:
+        w = watch[watch["Signal"] == section].copy()
+        if w.empty:
+            continue
+        outside = w[pd.to_numeric(w.get("Rank"), errors="coerce").fillna(999) > 5].copy()
+        pick = (outside if not outside.empty else w).sort_values(["Watch Score", "Performance"], ascending=[False, False]).head(1)
+        if not pick.empty:
+            picks.append(pick.iloc[0].to_dict())
+    if not picks:
+        return
+
+    section_title("&#128064;", "Keep An Eye On")
+    st.caption("High-ceiling or unusual signals for PTN podium picks, including athletes with a standout recent split or a race score running hotter than their base ranking.")
+    card_html = ['<div class="tri-watch-grid">']
+    for row in picks:
+        profile = canonical_athlete_url(row.get("PTN"))
+        profile_link = (
+            f'<a class="profile-link" href="{html.escape(profile)}" target="_blank" rel="noopener noreferrer">Profile</a>'
+            if profile else '<span class="profile-link">Profile</span>'
+        )
+        athlete = html.escape(clean_str(row.get("Athlete")) or "Athlete")
+        signal = html.escape(clean_str(row.get("Signal")) or "Signal")
+        reason = html.escape(clean_str(row.get("Reason")) or "")
+        rank = parse_int(row.get("Rank")) or 0
+        watch_score = safe_float(row.get("Watch Score")) or 0.0
+        performance = safe_float(row.get("Performance")) or 0.0
+        best_split = safe_float(row.get("Best Split"))
+        evidence = parse_int(row.get("Evidence")) or 0
+        third_label = "Split" if best_split is not None else "Evidence"
+        third_value = f"{best_split:.1f}" if best_split is not None else str(evidence)
+        signal_race = html.escape(clean_str(row.get("Signal Race")) or clean_str(row.get("Last Race")) or "")
+        card_html.append(
+            f'<div class="tri-watch-card">'
+            f'<div class="topline">{profile_link}<span class="tag">{signal} &middot; Rank {rank or "-"}</span></div>'
+            f'<div class="athlete">{athlete}</div>'
+            f'<div class="scores">'
+            f'<div class="scorebox"><div class="label">Watch</div><div class="value">{watch_score:.1f}</div></div>'
+            f'<div class="scorebox"><div class="label">Perf</div><div class="value">{performance:.1f}</div></div>'
+            f'<div class="scorebox"><div class="label">{third_label}</div><div class="value">{third_value}</div></div>'
+            f'</div>'
+            f'<div class="reason">{reason}</div>'
+            f'<div class="reason">{signal_race}</div>'
+            f'</div>'
         )
     card_html.append("</div>")
     st.markdown("\n".join(card_html), unsafe_allow_html=True)
