@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import math
 import re
@@ -1887,6 +1888,120 @@ def dedupe_start_list_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if (row.get("athlete_url") and not current.get("athlete_url")) or row_rank < current_rank:
             best[key] = row
     return list(best.values())
+
+
+def parse_manual_start_list_paste(
+    text: str,
+    race_name: Any,
+    race_date: Any,
+    gender: Any,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Parse a pasted start list into app-ready start_lists rows.
+
+    Accepts either a simple one-athlete-per-line list or CSV/tabular text with
+    columns such as athlete_name, athlete_url, open_rank, and gender. This is
+    intentionally independent of the TriNews start-list endpoint because some
+    cached API rows are list headers only and contain no athletes to migrate.
+    """
+    stats = {"input_lines": 0, "parsed_rows": 0, "skipped_blank": 0, "skipped_missing_athlete": 0}
+    rows: List[Dict[str, Any]] = []
+    athletes_by_url: Dict[str, Dict[str, Any]] = {}
+    text = str(text or "").strip()
+    if not text:
+        return rows, [], stats
+
+    base_race = clean_str(race_name) or "Unknown Race"
+    base_date = parse_date_value(race_date) or clean_str(race_date)
+    base_gender = normalize_gender(gender) or clean_str(gender) or "Men"
+
+    non_empty_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    stats["input_lines"] = len(non_empty_lines)
+    if not non_empty_lines:
+        return rows, [], stats
+
+    first_line = non_empty_lines[0].lower()
+    looks_tabular = ("," in non_empty_lines[0] or "	" in non_empty_lines[0]) and any(
+        token in first_line for token in ["athlete", "name", "url", "rank", "open"]
+    )
+
+    if looks_tabular:
+        try:
+            df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+        except Exception:
+            df = pd.DataFrame()
+        if not df.empty:
+            for _, r in df.iterrows():
+                athlete_name = clean_str(first_col(r, ["athlete_name", "Athlete Name", "Athlete", "Name", "full_name", "Full Name"]))
+                athlete_url = canonical_athlete_url(first_col(r, ["athlete_url", "Athlete URL", "Profile URL", "url", "URL"]))
+                open_rank = parse_int(first_col(r, ["open_rank", "OpenRank", "Open Rank", "Rank", "ORS"]))
+                row_gender = normalize_gender(first_col(r, ["gender", "Gender"])) or base_gender
+                if not athlete_name and not athlete_url:
+                    stats["skipped_missing_athlete"] += 1
+                    continue
+                rec = {
+                    "race_name": base_race,
+                    "race_date": base_date,
+                    "gender": row_gender,
+                    "athlete_url": athlete_url,
+                    "athlete_name": athlete_name,
+                    "open_rank": open_rank,
+                }
+                rows.append(rec)
+                if athlete_url and athlete_name:
+                    athletes_by_url[athlete_url] = {"athlete_url": athlete_url, "athlete_name": athlete_name, "gender": row_gender}
+            rows = dedupe_start_list_rows(rows)
+            stats["parsed_rows"] = len(rows)
+            return rows, list(athletes_by_url.values()), stats
+
+    # Fallback: one athlete per line, or name,url,open_rank per line.
+    for line in non_empty_lines:
+        raw_line = line.strip().strip(",")
+        if not raw_line:
+            stats["skipped_blank"] += 1
+            continue
+        parts = [p.strip() for p in re.split(r"	|,", raw_line) if p.strip()]
+        athlete_name = ""
+        athlete_url = ""
+        open_rank = None
+
+        if len(parts) == 1:
+            athlete_name = re.sub(r"^\s*\d+[\.)\-\s]+", "", parts[0]).strip()
+        else:
+            # Support either name,url,rank or rank,name,url.
+            for part in parts:
+                if "protrinews.com" in part or part.startswith("http"):
+                    athlete_url = canonical_athlete_url(part)
+                    break
+            numeric_parts = [parse_int(p) for p in parts]
+            numeric_parts = [n for n in numeric_parts if n is not None]
+            open_rank = numeric_parts[0] if numeric_parts else None
+            name_candidates = []
+            for part in parts:
+                if part == athlete_url or "protrinews.com" in part or part.startswith("http"):
+                    continue
+                if parse_int(part) is not None and len(parts) > 1:
+                    continue
+                name_candidates.append(part)
+            athlete_name = re.sub(r"^\s*\d+[\.)\-\s]+", "", (name_candidates[0] if name_candidates else parts[0])).strip()
+
+        if not athlete_name and not athlete_url:
+            stats["skipped_missing_athlete"] += 1
+            continue
+        rec = {
+            "race_name": base_race,
+            "race_date": base_date,
+            "gender": base_gender,
+            "athlete_url": athlete_url,
+            "athlete_name": athlete_name,
+            "open_rank": open_rank,
+        }
+        rows.append(rec)
+        if athlete_url and athlete_name:
+            athletes_by_url[athlete_url] = {"athlete_url": athlete_url, "athlete_name": athlete_name, "gender": base_gender}
+
+    rows = dedupe_start_list_rows(rows)
+    stats["parsed_rows"] = len(rows)
+    return rows, list(athletes_by_url.values()), stats
 
 
 def merge_start_list_rows(rows: List[Dict[str, Any]]) -> Tuple[int, int]:
@@ -6674,6 +6789,112 @@ elif page == "Import CSVs":
             finally:
                 loader.empty()
 
+        st.markdown("#### Paste start list manually")
+        st.caption(
+            "Fast fallback: choose a cached race header, paste athlete names/URLs, and write directly to the app start_lists table. "
+            "This is the correct path when TriNews only cached race headers and no athlete rows."
+        )
+        try:
+            cached_header_rows = fetch_all(
+                "trinews_start_lists",
+                select="race_name,race_date,race_slug,gender,athlete_id,athlete_name,athlete_slug",
+                page_size=1000,
+            )
+        except Exception:
+            cached_header_rows = []
+        header_options = []
+        seen_header_keys = set()
+        for row in cached_header_rows or []:
+            race_name_h = clean_str(row.get("race_name"))
+            race_date_h = clean_str(row.get("race_date"))
+            gender_h = normalize_gender(row.get("gender")) or clean_str(row.get("gender")) or "Men"
+            has_athlete_h = bool(clean_str(row.get("athlete_id")) or clean_str(row.get("athlete_name")) or clean_str(row.get("athlete_slug")))
+            if not race_name_h or has_athlete_h:
+                continue
+            key_h = (race_name_h, race_date_h or "", gender_h)
+            if key_h in seen_header_keys:
+                continue
+            seen_header_keys.add(key_h)
+            header_options.append({"label": f"{race_date_h or 'No date'} · {gender_h} · {race_name_h}", "race_name": race_name_h, "race_date": race_date_h, "gender": gender_h})
+
+        if header_options:
+            selected_header_label = st.selectbox(
+                "Cached race header",
+                [x["label"] for x in header_options],
+                key="manual_startlist_cached_header_select",
+            )
+            selected_header = next((x for x in header_options if x["label"] == selected_header_label), header_options[0])
+            man_race_name_default = selected_header.get("race_name")
+            man_race_date_default = parse_date_value(selected_header.get("race_date")) or selected_header.get("race_date")
+            man_gender_default = selected_header.get("gender") or "Men"
+        else:
+            st.info("No header-only cached rows found. You can still enter race info manually below.")
+            man_race_name_default = ""
+            man_race_date_default = date.today().isoformat()
+            man_gender_default = "Men"
+
+        mcol1, mcol2, mcol3 = st.columns([3, 1.3, 1])
+        manual_race_name = mcol1.text_input("Race name", value=man_race_name_default or "", key="manual_startlist_race_name")
+        manual_race_date = mcol2.text_input("Race date", value=str(man_race_date_default or ""), key="manual_startlist_race_date")
+        manual_gender = mcol3.selectbox("Gender", ["Men", "Women"], index=0 if (man_gender_default or "Men") == "Men" else 1, key="manual_startlist_gender")
+        manual_replace = st.checkbox("Replace existing app rows for this race/date/gender", value=True, key="manual_startlist_replace_existing")
+        manual_text = st.text_area(
+            "Paste athletes",
+            height=210,
+            placeholder="One athlete per line:\nHanne De Vet\nTaylor Knibb\n\nOr CSV:\nathlete_name,athlete_url,open_rank\nHanne De Vet,https://protrinews.com/athletes/hanne-de-vet,12",
+            key="manual_startlist_paste_text",
+        )
+        if st.button("Save pasted start list", type="primary", key="manual_startlist_save_button"):
+            rows, athlete_rows, paste_stats = parse_manual_start_list_paste(
+                manual_text,
+                race_name=manual_race_name,
+                race_date=manual_race_date,
+                gender=manual_gender,
+            )
+            if not rows:
+                st.warning("No athletes found in pasted text.")
+                st.json(paste_stats)
+            else:
+                # If the user pasted names only, fill URLs from the local athlete master when possible.
+                try:
+                    app_athletes = load_table("athletes")
+                except Exception:
+                    app_athletes = pd.DataFrame()
+                if app_athletes is not None and not app_athletes.empty:
+                    name_lookup = {}
+                    for _, ar in app_athletes.iterrows():
+                        nm = (clean_str(ar.get("athlete_name")) or "").strip().lower()
+                        if nm and nm not in name_lookup:
+                            name_lookup[nm] = ar
+                    for row in rows:
+                        if not row.get("athlete_url") and row.get("athlete_name"):
+                            hit = name_lookup.get(str(row.get("athlete_name")).strip().lower())
+                            if hit is not None:
+                                row["athlete_url"] = canonical_athlete_url(hit.get("athlete_url"))
+                        if not row.get("gender"):
+                            row["gender"] = manual_gender
+
+                rows = dedupe_start_list_rows(rows)
+                if manual_replace:
+                    deleted = delete_matching_start_lists([{ "race_name": manual_race_name, "race_date": parse_date_value(manual_race_date) or manual_race_date, "gender": manual_gender }])
+                    inserted = 0
+                    skipped = 0
+                    if athlete_rows:
+                        upsert_athletes_preserve_gender(athlete_rows)
+                    rows, sl_ath_ins, sl_ath_upd, sl_prop = sync_athlete_master_import(rows, athlete_rows)
+                    insert_chunks("start_lists", rows)
+                    inserted = len(rows)
+                else:
+                    deleted = 0
+                    if athlete_rows:
+                        upsert_athletes_preserve_gender(athlete_rows)
+                    rows, sl_ath_ins, sl_ath_upd, sl_prop = sync_athlete_master_import(rows, athlete_rows)
+                    inserted, skipped = merge_start_list_rows(rows)
+                clear_cache()
+                st.success(f"Saved {inserted:,} pasted start-list athletes. Skipped existing: {skipped:,}. Deleted old rows: {deleted:,}.")
+                st.json(paste_stats)
+                st.dataframe(pd.DataFrame(rows).head(50), width="stretch", hide_index=True)
+
         st.markdown("#### Refetch athlete entries for cached race headers")
         st.caption(
             "Use this only when trinews_start_lists contains header rows with no athletes. "
@@ -7492,12 +7713,107 @@ elif page in {"Race Dashboard", "Split Audit"}:
         st.warning("No usable start list races found.")
         st.stop()
 
-    with st.sidebar:
-        selected_label = st.selectbox("Race / Gender", labels, index=max(0, len(labels) - 1))
-        top_n = TOP_SCORES_USED
-        min_field_size = LOW_SAMPLE_WARNING_THRESHOLD
-        strong_sof_threshold = STRONG_SOF_THRESHOLD
-        st.caption(f"Model settings: top {TOP_SCORES_USED} scores · strong SOF {int(STRONG_SOF_THRESHOLD)}")
+    top_n = TOP_SCORES_USED
+    min_field_size = LOW_SAMPLE_WARNING_THRESHOLD
+    strong_sof_threshold = STRONG_SOF_THRESHOLD
+
+    if page == "Race Dashboard":
+        # Dashboard home: show system coverage first, then let the user choose
+        # which start-list race to analyze. Race selection belongs in the main
+        # workspace instead of being buried at the bottom of the sidebar.
+        race_options_df["profile"] = race_options_df["race_name"].map(lambda x: prediction_scope_from_race(x, None, None))
+        race_options_df["race_date_sort"] = pd.to_datetime(race_options_df["race_date"], errors="coerce")
+
+        pending_count = 0
+        try:
+            scorecard_total = count_rows("athlete_scorecards") or 0
+        except Exception:
+            scorecard_total = 0
+        try:
+            evidence_total = count_rows("athlete_scorecard_evidence") or 0
+        except Exception:
+            evidence_total = 0
+        try:
+            athlete_total = count_rows("athletes") or 0
+        except Exception:
+            athlete_total = 0
+        try:
+            scoring_pool_total = count_rows("scoring_result_pool") or 0
+        except Exception:
+            scoring_pool_total = 0
+
+        unique_start_athletes = 0
+        if "athlete_url" in starts.columns:
+            unique_start_athletes = int(starts["athlete_url"].dropna().astype(str).str.lower().nunique())
+        if unique_start_athletes == 0 and "athlete_name" in starts.columns:
+            unique_start_athletes = int(starts["athlete_name"].dropna().astype(str).str.lower().nunique())
+
+        # Estimate pending races without doing a heavy join: a race is pending if
+        # it has zero saved overall matches after the user opens it. This top-line
+        # metric is the number of selectable start lists; selected-race coverage
+        # appears below once a race is chosen.
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Start-list races", f"{len(race_options_df):,}")
+        m2.metric("Start-list athletes", f"{unique_start_athletes:,}")
+        m3.metric("Athletes in system", f"{athlete_total:,}")
+        m4.metric("Scorecards", f"{scorecard_total:,}")
+        m5, m6, m7, m8 = st.columns(4)
+        m5.metric("Scoring-pool rows", f"{scoring_pool_total:,}")
+        m6.metric("Evidence rows", f"{evidence_total:,}")
+        m7.metric("Race profiles", f"{race_options_df['profile'].nunique():,}")
+        m8.metric("Rows in start_lists", f"{len(starts):,}")
+
+        st.markdown("### Select a race to analyze")
+        f1, f2, f3 = st.columns([1.2, 1.2, 2.4])
+        gender_choices = ["All"] + [g for g in ["Men", "Women"] if g in set(race_options_df["gender"].dropna().astype(str))]
+        dash_gender_filter = f1.selectbox("Gender", gender_choices, index=0, key="dashboard_race_gender_filter")
+        profile_choices = ["All"] + sorted([p for p in race_options_df["profile"].dropna().unique().tolist() if p])
+        dash_profile_filter = f2.selectbox("Profile", profile_choices, index=0, key="dashboard_race_profile_filter")
+        dash_search = f3.text_input("Search race", value="", placeholder="Search by race name, date, or series...", key="dashboard_race_search")
+
+        filtered_races = race_options_df.copy()
+        if dash_gender_filter != "All":
+            filtered_races = filtered_races[filtered_races["gender"] == dash_gender_filter]
+        if dash_profile_filter != "All":
+            filtered_races = filtered_races[filtered_races["profile"] == dash_profile_filter]
+        if dash_search.strip():
+            needle = dash_search.strip().lower()
+            haystack = (
+                filtered_races["race_name"].fillna("").astype(str) + " "
+                + filtered_races["race_date_label"].fillna("").astype(str) + " "
+                + filtered_races["gender"].fillna("").astype(str) + " "
+                + filtered_races["profile"].fillna("").astype(str)
+            ).str.lower()
+            filtered_races = filtered_races[haystack.str.contains(re.escape(needle), na=False)]
+
+        filtered_races = filtered_races.sort_values(["race_date_sort", "race_name", "gender"], ascending=[True, True, True], na_position="last")
+        filtered_labels = filtered_races["label"].tolist()
+        if not filtered_labels:
+            st.warning("No start-list races match those filters.")
+            st.stop()
+
+        previous_label = st.session_state.get("dashboard_selected_race_label")
+        default_index = 0
+        if previous_label in filtered_labels:
+            default_index = filtered_labels.index(previous_label)
+        else:
+            today_ts = pd.Timestamp.today().normalize()
+            future = filtered_races[filtered_races["race_date_sort"].notna() & (filtered_races["race_date_sort"] >= today_ts)]
+            if not future.empty:
+                first_future_label = future.iloc[0]["label"]
+                if first_future_label in filtered_labels:
+                    default_index = filtered_labels.index(first_future_label)
+            else:
+                default_index = max(0, len(filtered_labels) - 1)
+
+        selected_label = st.selectbox("Race / gender to analyze", filtered_labels, index=default_index, key="dashboard_selected_race_picker")
+        st.session_state["dashboard_selected_race_label"] = selected_label
+        st.caption(f"Model settings: top {TOP_SCORES_USED} scores · strong SOF {int(STRONG_SOF_THRESHOLD)} · sorted by race date")
+
+    else:
+        with st.sidebar:
+            selected_label = st.selectbox("Race / Gender", labels, index=max(0, len(labels) - 1))
+            st.caption(f"Model settings: top {TOP_SCORES_USED} scores · strong SOF {int(STRONG_SOF_THRESHOLD)}")
 
     selected_meta = race_options_df[race_options_df["label"] == selected_label].iloc[0]
     selected_race = selected_meta["race_name"]
