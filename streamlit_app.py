@@ -26,6 +26,15 @@ def get_supabase():
 supabase = get_supabase()
 
 # ============================================================
+# Fixed model settings
+# ============================================================
+MODEL_CACHE_VERSION = "openrank_fixed_settings_v3"
+TOP_SCORES_USED = 5
+LOW_SAMPLE_WARNING_THRESHOLD = 5
+STRONG_SOF_THRESHOLD = 65.0
+
+
+# ============================================================
 # Visual styling
 # ============================================================
 def apply_dashboard_theme() -> None:
