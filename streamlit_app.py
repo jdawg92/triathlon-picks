@@ -12,6 +12,14 @@ import requests
 import streamlit as st
 from supabase import create_client
 
+try:
+    from score_engine import build_all_scorecards as build_all_scorecards_fast
+except Exception as _score_engine_import_error:
+    build_all_scorecards_fast = None
+    SCORE_ENGINE_IMPORT_ERROR = _score_engine_import_error
+else:
+    SCORE_ENGINE_IMPORT_ERROR = None
+
 st.set_page_config(page_title="Triathlon Picks", page_icon="🏁", layout="wide")
 
 # ============================================================
@@ -28,7 +36,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "scorecard_tables_v8_full_im_lookback"
+MODEL_CACHE_VERSION = "score_engine_v1_fullim730"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -3707,11 +3715,11 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "scorecard_tables_v8_full_im_lookback"
+MODEL_CACHE_VERSION = "score_engine_v1_fullim730"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
-RANKING_FAMILIES = ["All", "IRONMAN 70.3 / Middle", "T100 / PTO", "Full IRONMAN", "Short Course / WTCS"]
+RANKING_FAMILIES = ["Long Course / 70.3 + T100", "Short Course / WTCS", "Full IRONMAN", "All"]
 RANKING_VIEW_LABELS = ["🏆 Overall", "🏊 Swim", "🚴 Bike", "🏃 Run"]
 
 
@@ -4249,7 +4257,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "scorecard_tables_v8_full_im_lookback"
+MODEL_CACHE_VERSION = "score_engine_v1_fullim730"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4810,32 +4818,55 @@ def save_athlete_scorecard_combo(
 
 
 def rebuild_all_athlete_scorecards(results: pd.DataFrame, overrides: pd.DataFrame, as_of_ts: pd.Timestamp) -> pd.DataFrame:
-    """Rebuild every gender/profile/discipline scorecard into relational tables."""
-    logs = []
-    total = len(["Men", "Women"]) * len(RANKING_FAMILIES) * len(SCORECARD_DISCIPLINES)
-    progress = st.progress(0, text="Starting scorecard rebuild...")
-    done = 0
-    for gender in ["Men", "Women"]:
-        for profile in RANKING_FAMILIES:
-            for discipline in SCORECARD_DISCIPLINES:
-                try:
-                    rows, ev_rows, metrics = save_athlete_scorecard_combo(results, overrides, gender, profile, as_of_ts, discipline, TOP_SCORES_USED)
-                    status = "saved"
-                except Exception as e:
-                    rows, ev_rows, metrics, status = 0, 0, {}, f"error: {e}"
-                logs.append({
-                    "Gender": gender,
-                    "Profile": profile,
-                    "Discipline": discipline,
-                    "Scorecard Rows": rows,
-                    "Evidence Rows": ev_rows,
-                    "Status": status,
-                    **metrics,
-                })
-                done += 1
-                progress.progress(done / max(total, 1), text=f"Built {done}/{total}: {gender} · {profile} · {discipline}")
+    """Fast one-pass rebuild using score_engine.py.
+
+    The older version rebuilt every gender/profile/discipline combination by
+    repeatedly filtering/scanning the full results table. This version hands the
+    normalized results to a dedicated engine once, then bulk-saves the returned
+    scorecard and evidence rows.
+    """
+    if build_all_scorecards_fast is None:
+        raise RuntimeError(f"score_engine.py could not be imported: {SCORE_ENGINE_IMPORT_ERROR}")
+
+    ensure_scorecard_tables()
+    progress = st.progress(0, text="Preparing fast scorecard engine...")
+    as_of_ts = pd.to_datetime(as_of_ts, errors="coerce")
+    if pd.isna(as_of_ts):
+        as_of_ts = pd.Timestamp.today().normalize()
+
+    progress.progress(0.15, text="Building all scorecards in one engine pass...")
+    scorecards_df, evidence_df, logs_df = build_all_scorecards_fast(
+        results=results,
+        as_of_date=as_of_ts,
+        model_version=MODEL_CACHE_VERSION,
+        top_n=TOP_SCORES_USED,
+    )
+
+    progress.progress(0.65, text="Replacing saved scorecard tables...")
+    # Rebuild-all should be deterministic: clear old scorecards/evidence first,
+    # then save the fresh model version. This also removes old bad cached rows.
+    delete_all("athlete_scorecard_evidence")
+    delete_all("athlete_scorecards")
+
+    progress.progress(0.78, text="Saving athlete scorecards...")
+    scorecard_rows = cache_safe_rows(scorecards_df) if scorecards_df is not None and not scorecards_df.empty else []
+    evidence_rows = cache_safe_rows(evidence_df) if evidence_df is not None and not evidence_df.empty else []
+    if scorecard_rows:
+        insert_chunks("athlete_scorecards", scorecard_rows, chunk_size=750)
+    progress.progress(0.90, text="Saving scorecard evidence...")
+    if evidence_rows:
+        insert_chunks("athlete_scorecard_evidence", evidence_rows, chunk_size=750)
+
+    clear_cache()
+    progress.progress(1.0, text="Scorecard rebuild complete.")
     progress.empty()
-    return pd.DataFrame(logs)
+
+    logs_df = pd.DataFrame() if logs_df is None else logs_df.copy()
+    if not logs_df.empty:
+        logs_df["Model Version"] = MODEL_CACHE_VERSION
+        logs_df["Saved Scorecards"] = len(scorecard_rows)
+        logs_df["Saved Evidence Rows"] = len(evidence_rows)
+    return logs_df
 
 
 def _latest_scorecard_date(df: pd.DataFrame) -> Optional[str]:
