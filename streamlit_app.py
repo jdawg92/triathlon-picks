@@ -1303,6 +1303,44 @@ def load_table(table_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def fetch_all_filtered(table_name: str, filters: Tuple[Tuple[str, Any], ...], select: str = "*", page_size: int = 1000) -> List[Dict[str, Any]]:
+    """Fetch rows with simple equality filters using pagination.
+
+    This keeps fast pages from loading huge raw result tables when they only
+    need one saved scorecard slice.
+    """
+    all_rows: List[Dict[str, Any]] = []
+    start = 0
+    while True:
+        end = start + page_size - 1
+        q = supabase.table(table_name).select(select)
+        for col, val in filters:
+            q = q.eq(col, val)
+        res = q.range(start, end).execute()
+        rows = res.data or []
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        start += page_size
+    return all_rows
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_start_lists_light() -> pd.DataFrame:
+    """Load only start lists for fast Race Dashboard navigation.
+
+    The dashboard now reads saved athlete_scorecards, so it should not load
+    38k+ raw result rows just to open a race.
+    """
+    starts = load_table("start_lists")
+    starts = canonicalize_athlete_url_column(starts)
+    if not starts.empty:
+        starts.columns = [str(c) for c in starts.columns]
+        starts["gender"] = starts["gender"].map(normalize_gender)
+        starts["race_date"] = pd.to_datetime(starts.get("race_date"), errors="coerce")
+    return starts
+
+
 def clear_cache():
     st.cache_data.clear()
 
@@ -4574,61 +4612,77 @@ def _latest_scorecard_date(df: pd.DataFrame) -> Optional[str]:
     return vals.max().strftime("%Y-%m-%d")
 
 
-def load_athlete_scorecard_view(gender: str, profile: str, discipline: str, as_of_ts: Optional[pd.Timestamp] = None) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
-    """Load the latest relational scorecard for a gender/profile/discipline."""
+def _latest_scorecard_as_of_date(gender: str, profile: str, discipline: str) -> str:
+    """Return latest saved as_of_date for this scorecard slice without loading all rows."""
+    gender_norm = normalize_gender(gender) or gender
     try:
-        cards = load_table("athlete_scorecards")
-        ev = load_table("athlete_scorecard_evidence")
+        res = (
+            supabase.table("athlete_scorecards")
+            .select("as_of_date")
+            .eq("model_version", MODEL_CACHE_VERSION)
+            .eq("gender", gender_norm)
+            .eq("profile", profile)
+            .eq("discipline", discipline)
+            .order("as_of_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows:
+            return iso_date(rows[0].get("as_of_date"))
     except Exception:
+        pass
+    return ""
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_athlete_scorecard_view_cached(gender: str, profile: str, discipline: str, as_of_label: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    gender_norm = normalize_gender(gender) or gender
+    if not as_of_label:
         return pd.DataFrame(), pd.DataFrame(), {}
-    if cards.empty:
+    filters = (
+        ("model_version", MODEL_CACHE_VERSION),
+        ("gender", gender_norm),
+        ("profile", profile),
+        ("discipline", discipline),
+        ("as_of_date", as_of_label),
+    )
+    cards = pd.DataFrame(fetch_all_filtered("athlete_scorecards", filters))
+    ev = pd.DataFrame(fetch_all_filtered("athlete_scorecard_evidence", filters))
+    return cards, ev, {"as_of_date": as_of_label, "rows": len(cards), "evidence_rows": len(ev)}
+
+
+def load_athlete_scorecard_view(gender: str, profile: str, discipline: str, as_of_ts: Optional[pd.Timestamp] = None) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """Load one saved scorecard slice using Supabase filters instead of full-table scans."""
+    if not scorecard_tables_ready():
         return pd.DataFrame(), pd.DataFrame(), {}
     gender_norm = normalize_gender(gender) or gender
-    cards = cards[
-        (cards.get("model_version", "") == MODEL_CACHE_VERSION)
-        & (cards.get("gender", "") == gender_norm)
-        & (cards.get("profile", "") == profile)
-        & (cards.get("discipline", "") == discipline)
-    ].copy()
-    if cards.empty:
+    target = iso_date(as_of_ts) if as_of_ts is not None else ""
+    as_of_label = ""
+
+    # Prefer exact date if it exists. Otherwise use latest saved date.
+    if target:
+        try:
+            res = (
+                supabase.table("athlete_scorecards")
+                .select("id")
+                .eq("model_version", MODEL_CACHE_VERSION)
+                .eq("gender", gender_norm)
+                .eq("profile", profile)
+                .eq("discipline", discipline)
+                .eq("as_of_date", target)
+                .limit(1)
+                .execute()
+            )
+            if res.data:
+                as_of_label = target
+        except Exception:
+            as_of_label = ""
+    if not as_of_label:
+        as_of_label = _latest_scorecard_as_of_date(gender_norm, profile, discipline)
+    if not as_of_label:
         return pd.DataFrame(), pd.DataFrame(), {}
-    if "as_of_date" in cards.columns:
-        cards["_asof_key"] = cards["as_of_date"].map(iso_date)
-    else:
-        cards["_asof_key"] = ""
-
-    if as_of_ts is not None:
-        target = iso_date(as_of_ts)
-        exact = cards[cards["_asof_key"] == target].copy()
-        if not exact.empty:
-            cards = exact
-        else:
-            latest_date = _latest_scorecard_date(cards)
-            if latest_date:
-                cards = cards[cards["_asof_key"] == latest_date].copy()
-    else:
-        latest_date = _latest_scorecard_date(cards)
-        if latest_date:
-            cards = cards[cards["_asof_key"] == latest_date].copy()
-    as_of_label = cards["_asof_key"].iloc[0] if "_asof_key" in cards.columns and not cards.empty else ""
-    cards = cards.drop(columns=["_asof_key"], errors="ignore")
-
-    if ev is None or ev.empty:
-        ev_filtered = pd.DataFrame()
-    else:
-        ev_work = ev.copy()
-        if "as_of_date" in ev_work.columns:
-            ev_work["_asof_key"] = ev_work["as_of_date"].map(iso_date)
-        else:
-            ev_work["_asof_key"] = ""
-        ev_filtered = ev_work[
-            (ev_work.get("model_version", "") == MODEL_CACHE_VERSION)
-            & (ev_work.get("gender", "") == gender_norm)
-            & (ev_work.get("profile", "") == profile)
-            & (ev_work.get("discipline", "") == discipline)
-            & (ev_work.get("_asof_key", "") == as_of_label)
-        ].drop(columns=["_asof_key"], errors="ignore").copy()
-    return cards, ev_filtered, {"as_of_date": as_of_label, "rows": len(cards), "evidence_rows": len(ev_filtered)}
+    return load_athlete_scorecard_view_cached(gender_norm, profile, discipline, as_of_label)
 
 
 def _display_scorecards_from_tables(cards: pd.DataFrame, evidence: pd.DataFrame, discipline: str) -> pd.DataFrame:
@@ -5615,8 +5669,7 @@ elif page == "Model Cache":
 
 elif page == "Athlete Rankings":
     st.header("🥇 Athlete Rankings")
-    st.caption("Rankings now read from the relational athlete_scorecards table. Rebuild scorecards after importing new results or fixing athlete genders.")
-    results, starts, athletes, overrides = prepare_dataframes()
+    st.caption("Rankings read from the relational athlete_scorecards table. This page no longer loads raw result rows unless you click rebuild.")
 
     c1, c2, c3, c4 = st.columns([1.1, 1.4, 1.2, 1.0])
     ranking_gender = c1.selectbox("Gender", ["Men", "Women"], index=0)
@@ -5638,6 +5691,7 @@ elif page == "Athlete Rankings":
 
     b1, b2 = st.columns([1, 2])
     if b1.button("Rebuild this scorecard", type="primary", width="stretch"):
+        results, _starts_unused, _athletes_unused, overrides = prepare_dataframes()
         if results.empty:
             st.warning("No athlete results found. Import Athlete Results first.")
         else:
@@ -5694,11 +5748,19 @@ elif page == "Database Viewer":
         st.exception(e)
 
 elif page in {"Race Dashboard", "Split Audit"}:
-    results, starts, athletes, overrides = prepare_dataframes()
+    if page == "Race Dashboard":
+        # Fast path: the dashboard reads saved athlete_scorecards and the selected start list.
+        # Do not load/normalize the full athlete_results + race_field_results tables here.
+        starts = load_start_lists_light()
+        results = pd.DataFrame()
+        athletes = pd.DataFrame()
+        overrides = pd.DataFrame()
+    else:
+        results, starts, athletes, overrides = prepare_dataframes()
     if starts.empty:
         st.warning("No start lists found. Import Start Lists first.")
         st.stop()
-    if results.empty:
+    if page != "Race Dashboard" and results.empty:
         st.warning("No athlete results found. Import Athlete Results first.")
         st.stop()
 
@@ -5738,10 +5800,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
     start_athletes = dedupe_start_athletes(start_athletes)
     duplicate_start_rows = imported_start_rows - len(start_athletes)
 
-    # Use two full calendar years back through race day.
-    results_window_all = results[(results["race_date"].notna()) & (results["race_date"] >= window_start) & (results["race_date"] <= selected_date)].copy()
     prediction_scope = prediction_scope_from_race(selected_race, None, None)
-    results_window = apply_prediction_scope(results_window_all, prediction_scope)
 
     render_race_card(selected_race, selected_gender, selected_date, window_start)
 
@@ -5749,11 +5808,15 @@ elif page in {"Race Dashboard", "Split Audit"}:
     if page == "Race Dashboard":
         table_prediction, table_meta = build_race_prediction_from_scorecard_tables(starts, selected_race, selected_date, selected_gender)
         if table_prediction is not None and not table_prediction.empty:
-            st.success("Loaded prediction from athlete_scorecards.")
+            st.success("Loaded prediction from athlete_scorecards without scanning raw result tables.")
             display_cached_race_prediction(table_prediction, {"params": table_meta, "computed_at": max([v for k, v in table_meta.items() if k.endswith("_as_of_date")], default="")})
         else:
             st.warning("No saved scorecard prediction found for this race/profile. Rebuild athlete scorecards in ⚡ Model Cache after importing results or fixing athlete genders.")
         st.stop()
+
+    # Use two full calendar years back through race day for Split Audit only.
+    results_window_all = results[(results["race_date"].notna()) & (results["race_date"] >= window_start) & (results["race_date"] <= selected_date)].copy()
+    results_window = apply_prediction_scope(results_window_all, prediction_scope)
 
     # Performance: build each split audit only from races relevant to the
     # selected start-list athletes, not from every result row in the 2-year
