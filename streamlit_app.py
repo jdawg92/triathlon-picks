@@ -28,7 +28,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "scorecard_tables_v4"
+MODEL_CACHE_VERSION = "scorecard_tables_v5"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -371,6 +371,62 @@ def apply_dashboard_theme() -> None:
         h3 {
             color: var(--tri-text);
             letter-spacing: -0.035em;
+        }
+
+
+        .tri-import-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.85rem;
+            margin: 0.75rem 0 1.1rem 0;
+        }
+
+        .tri-import-card {
+            min-height: 7.2rem;
+            padding: 1rem 1.05rem;
+            border-radius: 1.05rem;
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            background:
+                radial-gradient(circle at 100% 0%, rgba(0, 212, 255, 0.09), transparent 46%),
+                rgba(15, 23, 42, 0.72);
+            box-shadow: 0 14px 34px rgba(0, 0, 0, 0.20);
+        }
+
+        .tri-import-card .kicker {
+            color: var(--tri-cyan);
+            font-size: 0.68rem;
+            font-weight: 900;
+            letter-spacing: 0.13em;
+            text-transform: uppercase;
+            margin-bottom: 0.34rem;
+        }
+
+        .tri-import-card .title {
+            color: var(--tri-text);
+            font-size: 1.05rem;
+            font-weight: 850;
+            letter-spacing: -0.025em;
+            margin-bottom: 0.25rem;
+        }
+
+        .tri-import-card .body {
+            color: var(--tri-muted);
+            font-size: 0.84rem;
+            line-height: 1.35;
+        }
+
+        .tri-help-strip {
+            padding: 0.85rem 0.95rem;
+            border-radius: 0.95rem;
+            border: 1px solid rgba(0, 212, 255, 0.18);
+            background: rgba(0, 212, 255, 0.06);
+            color: #BEEBFF;
+            margin: 0.65rem 0 1rem 0;
+            font-size: 0.9rem;
+        }
+
+        @media (max-width: 1100px) {
+            .tri-import-grid { grid-template-columns: 1fr; }
         }
 
         .tri-loader-card {
@@ -3293,7 +3349,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "scorecard_tables_v4"
+MODEL_CACHE_VERSION = "scorecard_tables_v5"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -3599,6 +3655,7 @@ def add_start_list_athlete(race_name: str, race_date: Any, gender: str, athlete_
     return False, "That athlete already appears on this start list."
 
 
+
 def normalize_start_list_upload_for_group(upload_df: pd.DataFrame, race_name: str, race_date: Any, gender: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Normalize an uploaded start-list CSV and fill blank race/date/gender from selected group."""
     rows, athlete_rows = normalize_start_lists(upload_df)
@@ -3627,26 +3684,174 @@ def normalize_start_list_upload_for_group(upload_df: pd.DataFrame, race_name: st
         })
     return fixed, fixed_athletes
 
+
+def render_import_overview() -> None:
+    st.markdown(
+        """
+        <div class="tri-import-grid">
+          <div class="tri-import-card"><div class="kicker">Results</div><div class="title">Race history</div><div class="body">Import athlete result rows or full race-field result rows. These feed scorecards and evidence.</div></div>
+          <div class="tri-import-card"><div class="kicker">Start lists</div><div class="title">Changing race rosters</div><div class="body">Replace a selected start list, merge new athletes only, or import start lists with race/date/gender columns.</div></div>
+          <div class="tri-import-card"><div class="kicker">Cleanup</div><div class="title">Gender overrides</div><div class="body">Fix Men/Women from one CSV by athlete name or athlete URL, then propagate to linked rows.</div></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_csv_preview(df: pd.DataFrame, title: str = "CSV preview", limit: int = 20) -> None:
+    st.subheader(title)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Rows detected", f"{len(df):,}")
+    c2.metric("Columns", f"{len(df.columns):,}")
+    c3.metric("Blank cells", f"{int(df.isna().sum().sum()):,}")
+    st.dataframe(df.head(limit), width="stretch")
+
+
+def import_results_csv(df: pd.DataFrame, table_choice: str, replace: bool) -> None:
+    if table_choice == "Athlete Results":
+        rows, athlete_rows = normalize_athlete_results(df)
+        rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows)
+        before_count = count_rows("athlete_results")
+        if replace:
+            delete_all("athlete_results")
+        insert_chunks("athlete_results", rows)
+        clear_cache()
+        after_count = count_rows("athlete_results")
+        st.success(f"Imported {len(rows):,} athlete result rows. Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
+        st.info(f"Supabase athlete_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
+    elif table_choice == "Race Field Results":
+        rows, athlete_rows = normalize_race_field_results(df)
+        rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows)
+        before_count = count_rows("race_field_results")
+        if replace:
+            delete_all("race_field_results")
+        insert_chunks("race_field_results", rows)
+        clear_cache()
+        after_count = count_rows("race_field_results")
+        st.success(f"Imported {len(rows):,} race-field result rows. Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
+        st.info(f"Supabase race_field_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
+
+
+def import_general_start_list_csv(df: pd.DataFrame, replace_matching_groups: bool) -> None:
+    rows, athlete_rows = normalize_start_lists(df)
+    rows = dedupe_start_list_rows(rows)
+    default_gender = None
+    start_genders = {normalize_gender(r.get("gender")) for r in rows if normalize_gender(r.get("gender")) in ["Men", "Women"]}
+    if len(start_genders) == 1:
+        default_gender = next(iter(start_genders))
+    rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows, default_gender=default_gender)
+    rows = dedupe_start_list_rows(rows)
+    inserted = len(rows)
+    skipped = 0
+    replaced_groups = 0
+    if replace_matching_groups:
+        replaced_groups = delete_matching_start_lists(rows)
+        insert_chunks("start_lists", rows)
+    else:
+        inserted, skipped = merge_start_list_rows(rows)
+    clear_cache()
+    st.success(f"Imported {inserted:,} new start-list rows and skipped {skipped:,} duplicate rows.")
+    if replace_matching_groups:
+        st.info(f"Replace mode deleted existing rows for {replaced_groups:,} matching race/date/gender group(s), not the entire start_lists table.")
+    st.info(f"Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Auto-propagated gender for {propagated:,} athletes from this start list import.")
+
+
+def render_manual_gender_override_import(raw_athletes: pd.DataFrame, key_prefix: str = "manual_gender") -> None:
+    st.caption("Upload athlete_url + gender, or just athlete_name + gender. Name-only rows are applied only when the name matches exactly one athlete in the master athletes table.")
+    st.code("athlete_name,gender\nTaylor Knibb,Women\nHayden Wilde,Men", language="csv")
+    override_file = st.file_uploader("Manual gender CSV", type=["csv"], key=f"{key_prefix}_csv")
+    if override_file is None:
+        return
+
+    manual = read_uploaded_csv(override_file)
+    render_csv_preview(manual, "Manual gender CSV preview", limit=12)
+
+    athlete_name_buckets: Dict[str, List[Dict[str, Any]]] = {}
+    if raw_athletes is not None and not raw_athletes.empty:
+        for _, ar in raw_athletes.iterrows():
+            nm = clean_str(ar.get("athlete_name"))
+            au = canonical_athlete_url(ar.get("athlete_url"))
+            if nm:
+                athlete_name_buckets.setdefault(nm.lower(), []).append({
+                    "athlete_name": nm,
+                    "athlete_url": au,
+                    "current_gender": normalize_gender(ar.get("gender")),
+                })
+
+    manual_rows = []
+    skipped_rows = []
+    for _, r in manual.iterrows():
+        g = normalize_gender(first_col(r, ["gender", "Gender", "sex", "Sex", "category", "Category"]))
+        url = canonical_athlete_url(first_col(r, ["athlete_url", "Athlete URL", "url", "URL", "profile", "Profile"]))
+        name = clean_str(first_col(r, ["athlete_name", "Athlete Name", "Athlete", "Name", "athlete", "name"]))
+
+        if g not in ["Men", "Women"]:
+            skipped_rows.append({"Athlete": name, "Athlete URL": url, "Gender": first_col(r, ["gender", "Gender"]), "Reason": "Invalid/missing gender"})
+            continue
+
+        if not url and name:
+            matches = athlete_name_buckets.get(name.lower(), [])
+            unique_urls = sorted({canonical_athlete_url(m.get("athlete_url")) for m in matches if canonical_athlete_url(m.get("athlete_url"))})
+            if len(unique_urls) == 1:
+                url = unique_urls[0]
+                name = matches[0].get("athlete_name") or name
+            elif len(unique_urls) > 1:
+                skipped_rows.append({"Athlete": name, "Athlete URL": ", ".join(unique_urls[:3]), "Gender": g, "Reason": "Name matches multiple athlete URLs — use athlete_url"})
+                continue
+            else:
+                skipped_rows.append({"Athlete": name, "Athlete URL": "", "Gender": g, "Reason": "Name not found in athletes table — use athlete_url"})
+                continue
+
+        if url or name:
+            manual_rows.append({
+                "Athlete URL": url,
+                "Athlete": name,
+                "Suggested Gender": g,
+                "Confidence": "High",
+                "Conflict": "No",
+                "Sources": "Manual override CSV",
+                "Signal Count": 1,
+            })
+        else:
+            skipped_rows.append({"Athlete": name, "Athlete URL": url, "Gender": g, "Reason": "Missing athlete_url and athlete_name"})
+
+    manual_df = pd.DataFrame(manual_rows)
+    skipped_df = pd.DataFrame(skipped_rows)
+    c1, c2 = st.columns(2)
+    c1.metric("Valid override rows", f"{len(manual_df):,}")
+    c2.metric("Skipped rows", f"{len(skipped_df):,}")
+    if not manual_df.empty:
+        display_table(manual_df.head(250), ["Athlete", "Athlete URL", "Suggested Gender", "Sources"], height=300)
+        if st.button("Apply manual gender overrides", type="primary", key=f"{key_prefix}_apply"):
+            applied = apply_gender_updates(manual_df, include_medium=False)
+            st.success(f"Applied manual gender overrides for {applied:,} athletes.")
+            st.rerun()
+    if not skipped_df.empty:
+        st.warning(f"Skipped {len(skipped_df):,} manual rows that were ambiguous or incomplete.")
+        display_table(skipped_df.head(250), ["Athlete", "Athlete URL", "Gender", "Reason"], height=260)
+
 # ============================================================
 # UI
 # ============================================================
 apply_dashboard_theme()
 
 NAV_GROUPS = [
-    ("Predictions", [
+    ("Main", [
+        ("📊 Command Center", "Command Center"),
         ("🏆 Race Dashboard", "Race Dashboard"),
         ("🥇 Athlete Rankings", "Athlete Rankings"),
     ]),
-    ("Athlete Data", [
+    ("Explore", [
         ("🏁 Race Lookup", "Race Lookup"),
         ("📋 Start Lists", "Start Lists"),
         ("👤 Athletes", "Athletes"),
         ("🔎 Split Audit", "Split Audit"),
     ]),
-    ("Tools & Admin", [
+    ("Data", [
         ("⚡ Model Cache", "Model Cache"),
         ("🧬 Gender Tools", "Gender Tools"),
         ("📥 Import CSVs", "Import CSVs"),
+        ("🧹 Data Quality", "Data Quality"),
         ("🗄️ Database Viewer", "Database Viewer"),
         ("🔌 Connection", "Connection"),
     ]),
@@ -3654,7 +3859,7 @@ NAV_GROUPS = [
 PAGE_OPTIONS = {label: page_name for _, items in NAV_GROUPS for label, page_name in items}
 
 if "page_label" not in st.session_state or st.session_state["page_label"] not in PAGE_OPTIONS:
-    st.session_state["page_label"] = "🏆 Race Dashboard"
+    st.session_state["page_label"] = "📊 Command Center"
 
 # ============================================================
 # Simplified scorecard predictor overrides
@@ -3662,7 +3867,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "scorecard_tables_v4"
+MODEL_CACHE_VERSION = "scorecard_tables_v5"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -3921,27 +4126,21 @@ def _startlist_identity_sets(start_athletes: pd.DataFrame) -> Tuple[set, set, Di
     return urls, names, name_by_url
 
 
-def filter_scorecard_to_startlist(scorecard: pd.DataFrame, start_athletes: pd.DataFrame, section: str) -> pd.DataFrame:
-    """Join a global scorecard to the selected start list."""
+def missing_scorecards_for_startlist(scorecard: pd.DataFrame, start_athletes: pd.DataFrame, section: str) -> pd.DataFrame:
+    """Return start-list athletes that do not have a saved positive scorecard row."""
     if start_athletes is None or start_athletes.empty:
         return pd.DataFrame()
-    urls, names, name_by_url = _startlist_identity_sets(start_athletes)
-    if scorecard is None or scorecard.empty:
-        # Do not create zero-score placeholders when the whole profile has no saved scorecards.
-        # That was hiding cache/build problems by making every athlete look like a real 0.0.
-        return pd.DataFrame()
-    df = scorecard.copy()
-    if "Athlete URL" not in df.columns:
-        df["Athlete URL"] = None
-    if "Athlete" not in df.columns:
-        df["Athlete"] = None
-    mask = df["Athlete URL"].astype(str).isin(urls) | df["Athlete"].fillna("").astype(str).str.lower().isin(names)
-    out = df[mask].copy()
-
-    # Add start-list athletes with no eligible evidence so the missing data is visible.
-    scored_urls = set(out.get("Athlete URL", pd.Series(dtype=str)).dropna().astype(str).tolist())
-    scored_names = set(out.get("Athlete", pd.Series(dtype=str)).dropna().astype(str).str.lower().tolist())
+    urls, names, _ = _startlist_identity_sets(start_athletes)
+    scored_urls, scored_names = set(), set()
+    if scorecard is not None and not scorecard.empty:
+        work = scorecard.copy()
+        if "Score" in work.columns:
+            work["_score_num"] = pd.to_numeric(work["Score"], errors="coerce").fillna(0.0)
+            work = work[work["_score_num"] > 0].copy()
+        scored_urls = set(work.get("Athlete URL", pd.Series(dtype=str)).dropna().astype(str).tolist())
+        scored_names = set(work.get("Athlete", pd.Series(dtype=str)).dropna().astype(str).str.lower().tolist())
     missing = []
+    reason = "No saved scorecard row" if scorecard is not None and not scorecard.empty else "No scorecards saved for this profile/discipline"
     for _, r in start_athletes.iterrows():
         u = clean_str(r.get("athlete_url"))
         n = clean_str(r.get("athlete_name"))
@@ -3950,19 +4149,34 @@ def filter_scorecard_to_startlist(scorecard: pd.DataFrame, start_athletes: pd.Da
         missing.append({
             "Athlete": n or u,
             "Athlete URL": u,
-            "Score": 0.0,
-            "OpenRank Score": 0.0 if section == "overall" else None,
-            "OpenRank Split Score": 0.0 if section != "overall" else None,
-            "Best Scores Used": "0.0, 0.0, 0.0, 0.0, 0.0" if section == "overall" else None,
-            "Best Split Scores Used": "0.0, 0.0, 0.0, 0.0, 0.0" if section != "overall" else None,
-            "Confidence": "No eligible scorecard evidence",
-            "Score Evidence": [],
+            "Discipline": section,
+            "Reason": reason,
         })
-    if missing:
-        out = pd.concat([out, pd.DataFrame(missing)], ignore_index=True)
+    return pd.DataFrame(missing)
+
+
+def filter_scorecard_to_startlist(scorecard: pd.DataFrame, start_athletes: pd.DataFrame, section: str) -> pd.DataFrame:
+    """Join a global scorecard to the selected start list.
+
+    Only scored athletes are returned here. Missing athletes are handled in a separate
+    coverage table so pick tables do not get filled with fake 0.0 rows.
+    """
+    if start_athletes is None or start_athletes.empty or scorecard is None or scorecard.empty:
+        return pd.DataFrame()
+    urls, names, name_by_url = _startlist_identity_sets(start_athletes)
+    df = scorecard.copy()
+    if "Athlete URL" not in df.columns:
+        df["Athlete URL"] = None
+    if "Athlete" not in df.columns:
+        df["Athlete"] = None
+    mask = df["Athlete URL"].astype(str).isin(urls) | df["Athlete"].fillna("").astype(str).str.lower().isin(names)
+    out = df[mask].copy()
     if out.empty:
         return out
     out["Score"] = pd.to_numeric(out.get("Score"), errors="coerce").fillna(0.0)
+    out = out[out["Score"] > 0].copy()
+    if out.empty:
+        return out
     out = out.sort_values("Score", ascending=False).reset_index(drop=True)
     if "Rank" in out.columns:
         out = out.drop(columns=["Rank"])
@@ -4384,13 +4598,23 @@ def build_race_prediction_from_scorecard_tables(starts: pd.DataFrame, selected_r
         return pd.DataFrame(), {"prediction_scope": profile, "start_list_athletes": 0}
 
     combined = []
-    meta = {"prediction_scope": profile, "start_list_athletes": int(len(start_athletes)), "duplicate_start_rows": int(imported_start_rows - len(start_athletes)), "source": "athlete_scorecards"}
+    meta = {
+        "prediction_scope": profile,
+        "start_list_athletes": int(len(start_athletes)),
+        "duplicate_start_rows": int(imported_start_rows - len(start_athletes)),
+        "source": "athlete_scorecards",
+        "missing_scorecards": {},
+    }
     for discipline in SCORECARD_DISCIPLINES:
         scorecard, smeta = load_athlete_scorecard_display(selected_gender, profile, discipline, None)
         meta[f"{discipline}_scorecard_rows"] = int(len(scorecard)) if scorecard is not None else 0
         if smeta.get("as_of_date"):
             meta[f"{discipline}_as_of_date"] = smeta.get("as_of_date")
         selected = filter_scorecard_to_startlist(scorecard, start_athletes, discipline)
+        missing_df = missing_scorecards_for_startlist(scorecard, start_athletes, discipline)
+        meta[f"{discipline}_matched"] = int(len(selected))
+        meta[f"{discipline}_missing_count"] = int(len(missing_df))
+        meta["missing_scorecards"][discipline] = cache_safe_rows(missing_df.head(250)) if not missing_df.empty else []
         for row in cache_safe_rows(selected.head(120)):
             row["_section"] = discipline
             combined.append(row)
@@ -4418,36 +4642,205 @@ def render_score_evidence(scored: pd.DataFrame, title: str, limit: int = 5) -> N
                 st.info("No eligible evidence rows for this scorecard profile.")
 
 
+def _positive_score_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out["Score"] = pd.to_numeric(out.get("Score"), errors="coerce").fillna(0.0)
+    return out[out["Score"] > 0].copy()
+
+
+def _render_missing_scorecards(params: Dict[str, Any], discipline: str) -> None:
+    missing = []
+    if isinstance(params, dict):
+        missing = (params.get("missing_scorecards") or {}).get(discipline, []) or []
+    if missing:
+        with st.expander(f"Missing {discipline.title()} scorecards / no eligible evidence ({len(missing)})", expanded=False):
+            st.caption("These athletes are on the start list, but they do not have an eligible positive scorecard for this profile/discipline. They are separated from the picks table so they do not appear as fake 0.0 picks.")
+            display_table(pd.DataFrame(missing), ["Athlete", "Discipline", "Reason", "Athlete URL"], height=280)
+
+
 def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional[Dict[str, Any]] = None) -> None:
-    if cached_df is None or cached_df.empty:
-        st.info("No cached prediction rows found.")
-        return
     params = (cache_meta or {}).get("params", {}) if isinstance(cache_meta, dict) else {}
     computed_at = (cache_meta or {}).get("computed_at") if isinstance(cache_meta, dict) else None
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Cached rows", f"{len(cached_df):,}")
+    c1.metric("Scored rows", f"{len(cached_df) if cached_df is not None else 0:,}")
     c2.metric("Start athletes", params.get("start_list_athletes", "—"))
     c3.metric("Profile", params.get("prediction_scope", "—"))
-    c4.metric("Cached at", clean_str(computed_at)[:19] if computed_at else "—")
-    st.info("Fast mode: showing saved athlete scorecards joined to this start list. Rebuild the selected race after editing the start list or importing new results.")
+    c4.metric("Scorecards as of", clean_str(computed_at)[:19] if computed_at else "—")
+    st.info("Fast mode: showing saved athlete scorecards joined to this start list. Missing/no-evidence athletes are shown in separate expanders instead of polluting the pick tables with 0.0 rows.")
 
     section_title("🏆", "Overall Picks")
-    overall = cached_section(cached_df, "overall")
+    overall = _positive_score_rows(cached_section(cached_df, "overall"))
     display_table(overall.head(20), ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date"])
     render_score_evidence(overall, "Overall score evidence", limit=8)
+    _render_missing_scorecards(params, "overall")
 
     st.divider()
     tabs = st.tabs(["🏊 Fastest Swim", "🚴 Fastest Bike", "🏃 Fastest Run"])
     for tab, disc, title in zip(tabs, ["swim", "bike", "run"], ["Fastest Swim", "Fastest Bike", "Fastest Run"]):
         with tab:
             section_title("🏊" if disc == "swim" else "🚴" if disc == "bike" else "🏃", title)
-            scored = cached_section(cached_df, disc)
+            scored = _positive_score_rows(cached_section(cached_df, disc))
             display_table(
                 scored.head(20),
                 ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
                 height=360,
             )
             render_score_evidence(scored, f"{title} evidence", limit=8)
+            _render_missing_scorecards(params, disc)
+
+
+
+# ============================================================
+# Command center and data-quality views
+# ============================================================
+def scorecard_latest_summary() -> Dict[str, Any]:
+    try:
+        cards = load_table("athlete_scorecards")
+        ev = load_table("athlete_scorecard_evidence")
+    except Exception:
+        cards, ev = pd.DataFrame(), pd.DataFrame()
+    if not cards.empty and "model_version" in cards.columns:
+        cards = cards[cards["model_version"] == MODEL_CACHE_VERSION].copy()
+    if not ev.empty and "model_version" in ev.columns:
+        ev = ev[ev["model_version"] == MODEL_CACHE_VERSION].copy()
+    latest = _latest_scorecard_date(cards) if not cards.empty else None
+    return {"cards": cards, "evidence": ev, "scorecard_rows": len(cards), "evidence_rows": len(ev), "latest_date": latest or "—"}
+
+
+def start_list_scorecard_coverage(starts: pd.DataFrame, cards: pd.DataFrame) -> pd.DataFrame:
+    if starts is None or starts.empty:
+        return pd.DataFrame()
+    work = starts.dropna(subset=["race_name"]).copy()
+    if work.empty:
+        return pd.DataFrame()
+    rows = []
+    card_work = cards.copy() if cards is not None else pd.DataFrame()
+    if not card_work.empty:
+        card_work["athlete_url"] = card_work.get("athlete_url", pd.Series(dtype=str)).map(canonical_athlete_url)
+        card_work = card_work[card_work.get("model_version", "") == MODEL_CACHE_VERSION].copy() if "model_version" in card_work.columns else card_work
+        card_work = card_work[card_work.get("discipline", "") == "overall"].copy() if "discipline" in card_work.columns else card_work
+    group_cols = ["race_name", "race_date", "gender"]
+    for keys, g in work.groupby(group_cols, dropna=False):
+        race_name, race_date, gender = keys
+        sg = dedupe_start_athletes(g)
+        profile = prediction_scope_from_race(race_name, None, None)
+        urls = set(sg.get("athlete_url", pd.Series(dtype=str)).dropna().astype(str).map(canonical_athlete_url).tolist())
+        matched = 0
+        latest = "—"
+        if not card_work.empty:
+            cw = card_work[(card_work.get("gender", "") == (normalize_gender(gender) or gender)) & (card_work.get("profile", "") == profile)].copy()
+            if not cw.empty:
+                latest = _latest_scorecard_date(cw) or "—"
+                if latest != "—" and "as_of_date" in cw.columns:
+                    cw = cw[cw["as_of_date"].map(iso_date) == latest].copy()
+                scored_urls = set(cw.get("athlete_url", pd.Series(dtype=str)).dropna().astype(str).map(canonical_athlete_url).tolist())
+                matched = len(urls & scored_urls)
+        rows.append({
+            "Race": race_name,
+            "Date": format_date(race_date),
+            "Gender": normalize_gender(gender) or gender or "Unknown",
+            "Profile": profile,
+            "Start Athletes": int(len(sg)),
+            "Scorecards Matched": int(matched),
+            "Missing Scorecards": int(max(len(sg) - matched, 0)),
+            "Coverage %": round((matched / len(sg) * 100), 1) if len(sg) else 0,
+            "Scorecards As Of": latest,
+        })
+    return pd.DataFrame(rows).sort_values(["Date", "Race", "Gender"], ascending=[False, True, True], na_position="last")
+
+
+def render_command_center() -> None:
+    st.header("📊 Command Center")
+    st.caption("A quick operating view: data coverage, scorecard status, and start lists that need attention.")
+    results, starts, athletes, overrides = prepare_dataframes()
+    score_summary = scorecard_latest_summary()
+    cards = score_summary["cards"]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Athletes", f"{len(athletes):,}")
+    c2.metric("Result rows", f"{len(results):,}")
+    c3.metric("Start-list rows", f"{len(starts):,}")
+    c4.metric("Scorecard rows", f"{score_summary['scorecard_rows']:,}")
+
+    missing_gender = int(athletes.get("gender", pd.Series(dtype=object)).map(normalize_gender).isna().sum()) if not athletes.empty and "gender" in athletes.columns else 0
+    missing_result_gender = int(results.get("gender", pd.Series(dtype=object)).map(normalize_gender).isna().sum()) if not results.empty and "gender" in results.columns else 0
+    missing_ors = int(pd.to_numeric(results.get("ors", pd.Series(dtype=float)), errors="coerce").isna().sum()) if not results.empty else 0
+    stale_msg = "Ready" if score_summary["scorecard_rows"] else "Needs scorecard rebuild"
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Missing athlete gender", f"{missing_gender:,}")
+    c2.metric("Missing result gender", f"{missing_result_gender:,}")
+    c3.metric("Rows missing ORS", f"{missing_ors:,}")
+    c4.metric("Scorecards as of", score_summary["latest_date"], delta=stale_msg)
+
+    st.divider()
+    section_title("📋", "Start-list readiness")
+    coverage = start_list_scorecard_coverage(starts, cards)
+    if coverage.empty:
+        st.info("No start lists imported yet.")
+    else:
+        needs = coverage[coverage["Missing Scorecards"] > 0].copy()
+        st.caption("Scorecard coverage checks the selected race profile against saved Overall scorecards. Missing athletes may still need gender fixes, result imports, or eligible recent races.")
+        display_table(coverage.head(20), ["Race", "Date", "Gender", "Profile", "Start Athletes", "Scorecards Matched", "Missing Scorecards", "Coverage %", "Scorecards As Of"], height=420)
+        if not needs.empty:
+            with st.expander(f"Start lists needing attention ({len(needs)})", expanded=False):
+                display_table(needs, ["Race", "Date", "Gender", "Profile", "Start Athletes", "Scorecards Matched", "Missing Scorecards", "Coverage %", "Scorecards As Of"], height=360)
+
+
+def render_data_quality() -> None:
+    st.header("🧹 Data Quality")
+    st.caption("Find the data problems that create missing scorecards, unknown race groups, and weird rankings.")
+    results, starts, athletes, overrides = prepare_dataframes()
+    score_summary = scorecard_latest_summary()
+
+    athlete_gender = athletes.get("gender", pd.Series(dtype=object)).map(normalize_gender) if not athletes.empty and "gender" in athletes.columns else pd.Series(dtype=object)
+    result_gender = results.get("gender", pd.Series(dtype=object)).map(normalize_gender) if not results.empty and "gender" in results.columns else pd.Series(dtype=object)
+    start_gender = starts.get("gender", pd.Series(dtype=object)).map(normalize_gender) if not starts.empty and "gender" in starts.columns else pd.Series(dtype=object)
+    ors_missing = pd.to_numeric(results.get("ors", pd.Series(dtype=float)), errors="coerce").isna() if not results.empty else pd.Series(dtype=bool)
+    sof_missing = pd.to_numeric(results.get("sof", pd.Series(dtype=float)), errors="coerce").isna() if not results.empty else pd.Series(dtype=bool)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Athletes missing gender", f"{int(athlete_gender.isna().sum()) if len(athlete_gender) else 0:,}")
+    c2.metric("Result rows missing gender", f"{int(result_gender.isna().sum()) if len(result_gender) else 0:,}")
+    c3.metric("Result rows missing ORS", f"{int(ors_missing.sum()) if len(ors_missing) else 0:,}")
+    c4.metric("Result rows missing SOF", f"{int(sof_missing.sum()) if len(sof_missing) else 0:,}")
+
+    st.divider()
+    tabs = st.tabs(["Missing gender", "Missing ORS/SOF", "Duplicates", "Scorecard coverage"])
+    with tabs[0]:
+        if not athletes.empty and "gender" in athletes.columns:
+            missing_ath = athletes[athletes["gender"].map(normalize_gender).isna()].copy()
+            if not missing_ath.empty:
+                display_table(missing_ath.head(300), ["athlete_name", "athlete_url", "gender"], height=420)
+                st.download_button("Download missing athlete gender CSV", missing_ath.to_csv(index=False).encode("utf-8"), "missing_athlete_gender.csv", "text/csv")
+            else:
+                st.success("No athletes missing gender.")
+    with tabs[1]:
+        if not results.empty:
+            show = results[ors_missing | sof_missing].copy()
+            display_table(show.head(300), ["athlete_name", "gender", "race_date", "race_name", "race_type", "ors", "sof", "athlete_url"], height=460)
+            if not show.empty:
+                st.download_button("Download rows missing ORS/SOF", show.to_csv(index=False).encode("utf-8"), "missing_ors_sof_rows.csv", "text/csv")
+    with tabs[2]:
+        dup_cards = []
+        if not athletes.empty and "athlete_url" in athletes.columns:
+            d = athletes[athletes["athlete_url"].notna()].groupby("athlete_url").size().reset_index(name="Rows")
+            dup_cards.append(("Duplicate athlete master URLs", d[d["Rows"] > 1]))
+        if not results.empty:
+            keys = [c for c in ["athlete_url", "race_date", "race_name", "race_type"] if c in results.columns]
+            if keys:
+                d = results.groupby(keys, dropna=False).size().reset_index(name="Rows")
+                dup_cards.append(("Duplicate result rows", d[d["Rows"] > 1]))
+        for title, dup in dup_cards:
+            with st.expander(f"{title}: {len(dup):,} groups", expanded=False):
+                display_table(dup.head(300), list(dup.columns), height=320)
+    with tabs[3]:
+        coverage = start_list_scorecard_coverage(starts, score_summary["cards"])
+        if coverage.empty:
+            st.info("No start lists to check.")
+        else:
+            display_table(coverage, ["Race", "Date", "Gender", "Profile", "Start Athletes", "Scorecards Matched", "Missing Scorecards", "Coverage %", "Scorecards As Of"], height=520)
 
 
 with st.sidebar:
@@ -4478,7 +4871,13 @@ with st.sidebar:
 
 render_app_hero(page)
 
-if page == "Connection":
+if page == "Command Center":
+    render_command_center()
+
+elif page == "Data Quality":
+    render_data_quality()
+
+elif page == "Connection":
     st.header("🔌 Connection")
     try:
         result = supabase.table("athletes").select("id", count="exact").limit(1).execute()
@@ -4495,86 +4894,157 @@ if page == "Connection":
         st.exception(e)
 
 elif page == "Import CSVs":
-    st.header("📥 Import Google Sheet CSV exports")
-    st.write("Export each Google Sheet tab as CSV, then upload it here. Use replace mode for the first import.")
-    replace = st.checkbox("Replace existing rows in selected table before importing", value=True)
+    st.header("📥 Import Center")
+    st.caption("All CSV uploads live here now: results, start-list updates, manual gender fixes, overrides, and settings.")
+    render_import_overview()
+    st.markdown(
+        """
+        <div class="tri-help-strip">
+            After importing new results or changing start lists, rebuild athlete scorecards in <b>Model Cache</b> so rankings and dashboards use the latest data.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    table_choice = st.selectbox("CSV type", ["Athlete Results", "Race Field Results", "Start Lists", "Race Overrides", "Scoring Settings"])
-    uploaded = st.file_uploader(f"Upload {table_choice} CSV", type=["csv"])
+    import_tabs = st.tabs(["🏁 Results", "📋 Start Lists", "🧬 Gender Fixes", "⚙️ Settings / Overrides"])
 
-    if uploaded:
-        df = read_uploaded_csv(uploaded)
-        st.subheader("Preview")
-        st.dataframe(df.head(20), width="stretch")
-        st.write(f"Rows detected: {len(df):,}")
+    with import_tabs[0]:
+        section_title("🏁", "Result imports")
+        st.write("Use this for athlete race history and race-field result CSVs.")
+        table_choice = st.radio("Result CSV type", ["Athlete Results", "Race Field Results"], horizontal=True)
+        replace_results = st.checkbox(
+            f"Replace entire {table_choice} table before import",
+            value=False,
+            help="Usually leave this off for normal updates. Turn it on only when doing a full reload of that table.",
+        )
+        uploaded = st.file_uploader(f"Upload {table_choice} CSV", type=["csv"], key="results_import_csv")
+        if uploaded is not None:
+            df = read_uploaded_csv(uploaded)
+            render_csv_preview(df)
+            if st.button(f"Import {table_choice}", type="primary", key="import_results_btn"):
+                try:
+                    with st.spinner(f"Importing {table_choice}..."):
+                        import_results_csv(df, table_choice, replace_results)
+                    st.info("Next step: Model Cache → Rebuild athlete scorecards.")
+                except Exception as e:
+                    st.error("Import failed.")
+                    st.exception(e)
 
-        if st.button(f"Import {table_choice}", type="primary"):
+    with import_tabs[1]:
+        section_title("📋", "Start-list imports and updates")
+        st.write("Use this when a start list changes. Replace a selected race/gender group, merge only new athletes, or import a CSV that already includes race/date/gender columns.")
+        start_mode = st.radio(
+            "Start-list workflow",
+            ["Update selected start list", "Import start-list CSV with race/date/gender columns"],
+            horizontal=True,
+        )
+        if start_mode == "Update selected start list":
             try:
-                if table_choice == "Athlete Results":
-                    rows, athlete_rows = normalize_athlete_results(df)
-                    rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows)
-                    before_count = count_rows("athlete_results")
-                    if replace:
-                        delete_all("athlete_results")
-                    insert_chunks("athlete_results", rows)
-                    clear_cache()
-                    after_count = count_rows("athlete_results")
-                    st.success(f"Imported {len(rows):,} athlete result rows. Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
-                    st.info(f"Supabase athlete_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
+                _, starts, _, _ = prepare_dataframes()
+            except Exception:
+                starts = pd.DataFrame()
+            if starts is None or starts.empty:
+                st.warning("No existing start lists found. Use the general start-list import workflow first.")
+            else:
+                groups = start_list_group_summary(starts)
+                if groups.empty:
+                    st.warning("No start-list groups found.")
+                else:
+                    default_index = 0
+                    preset = st.session_state.get("selected_start_list_for_import")
+                    if isinstance(preset, dict):
+                        preset_key = f"{preset.get('race_date')} | {preset.get('gender')} | {preset.get('race_name')}"
+                        matches = groups.index[groups["_select_key"].eq(preset_key)].tolist()
+                        if matches:
+                            default_index = int(matches[0])
+                    selected_key = st.selectbox("Start list to update", groups["_select_key"].tolist(), index=default_index, key="import_selected_start_group")
+                    selected = groups[groups["_select_key"] == selected_key].iloc[0]
+                    race_name = selected.get("_race_name")
+                    race_date = selected.get("_race_date")
+                    gender = selected.get("_gender")
+                    current_rows = start_list_rows_for_group(starts, race_name, race_date, gender)
+                    current_rows = dedupe_start_athletes(current_rows) if not current_rows.empty else current_rows
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Race", clean_str(race_name) or "—")
+                    c2.metric("Gender", clean_str(gender) or "—")
+                    c3.metric("Current athletes", f"{len(current_rows):,}")
+                    display_table(current_rows.head(25), ["OpenRank", "Athlete", "Gender", "Race Date", "Race", "Athlete URL"], height=260)
 
-                elif table_choice == "Race Field Results":
-                    rows, athlete_rows = normalize_race_field_results(df)
-                    rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows)
-                    before_count = count_rows("race_field_results")
-                    if replace:
-                        delete_all("race_field_results")
-                    insert_chunks("race_field_results", rows)
-                    clear_cache()
-                    after_count = count_rows("race_field_results")
-                    st.success(f"Imported {len(rows):,} race-field result rows. Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
-                    st.info(f"Supabase race_field_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
+                    upload_mode = st.radio("Upload mode", ["Replace selected start list", "Merge new athletes only"], horizontal=True, key="import_start_mode")
+                    start_upload = st.file_uploader("Upload updated start-list CSV", type=["csv"], key="import_selected_start_csv")
+                    if start_upload is not None:
+                        up_df = read_uploaded_csv(start_upload)
+                        render_csv_preview(up_df, "Updated start-list CSV preview")
+                        if st.button("Apply start-list update", type="primary", key="import_selected_start_apply"):
+                            try:
+                                rows, athlete_rows = normalize_start_list_upload_for_group(up_df, race_name, race_date, gender)
+                                rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows, default_gender=gender)
+                                rows = dedupe_start_list_rows(rows)
+                                if upload_mode == "Replace selected start list":
+                                    delete_matching_start_lists([{"race_name": race_name, "race_date": format_date(race_date), "gender": gender}])
+                                    insert_chunks("start_lists", rows)
+                                    inserted = len(rows)
+                                    skipped = 0
+                                else:
+                                    inserted, skipped = merge_start_list_rows(rows)
+                                clear_cache()
+                                st.success(f"Start list updated. Inserted {inserted:,}; skipped {skipped:,}. Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
+                                st.info("Next step: Model Cache → Rebuild athlete scorecards.")
+                            except Exception as e:
+                                st.error("Start-list upload failed.")
+                                st.exception(e)
+        else:
+            replace_start_groups = st.checkbox(
+                "Replace matching race/date/gender groups before import",
+                value=True,
+                help="This deletes only the matching start-list groups included in the CSV, not the whole start_lists table.",
+            )
+            start_upload = st.file_uploader("Upload Start Lists CSV", type=["csv"], key="general_start_import_csv")
+            if start_upload is not None:
+                df = read_uploaded_csv(start_upload)
+                render_csv_preview(df)
+                if st.button("Import start lists", type="primary", key="general_start_import_btn"):
+                    try:
+                        with st.spinner("Importing start lists..."):
+                            import_general_start_list_csv(df, replace_start_groups)
+                        st.info("Next step: Model Cache → Rebuild athlete scorecards.")
+                    except Exception as e:
+                        st.error("Start-list import failed.")
+                        st.exception(e)
 
-                elif table_choice == "Start Lists":
-                    rows, athlete_rows = normalize_start_lists(df)
-                    rows = dedupe_start_list_rows(rows)
-                    default_gender = None
-                    start_genders = {normalize_gender(r.get("gender")) for r in rows if normalize_gender(r.get("gender")) in ["Men", "Women"]}
-                    if len(start_genders) == 1:
-                        default_gender = next(iter(start_genders))
-                    rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows, default_gender=default_gender)
-                    rows = dedupe_start_list_rows(rows)
-                    inserted = len(rows)
-                    skipped = 0
-                    replaced_groups = 0
-                    if replace:
-                        replaced_groups = delete_matching_start_lists(rows)
-                        insert_chunks("start_lists", rows)
+    with import_tabs[2]:
+        section_title("🧬", "Manual gender fixes")
+        st.write("Fix athlete gender from a small CSV. This writes to the athlete master and propagates the gender to linked result/start-list rows.")
+        raw_athletes = load_table("athletes")
+        render_manual_gender_override_import(raw_athletes, key_prefix="import_center_gender")
+
+    with import_tabs[3]:
+        section_title("⚙️", "Overrides and settings")
+        admin_choice = st.radio("Admin CSV type", ["Race Overrides", "Scoring Settings"], horizontal=True)
+        replace_admin = st.checkbox("Replace existing rows before importing", value=False, key="admin_replace_csv")
+        admin_upload = st.file_uploader(f"Upload {admin_choice} CSV", type=["csv"], key="admin_import_csv")
+        if admin_upload is not None:
+            df = read_uploaded_csv(admin_upload)
+            render_csv_preview(df)
+            if st.button(f"Import {admin_choice}", type="primary", key="admin_import_btn"):
+                try:
+                    if admin_choice == "Race Overrides":
+                        rows = normalize_race_overrides(df)
+                        if replace_admin:
+                            delete_all("race_overrides")
+                        insert_chunks("race_overrides", rows)
+                        clear_cache()
+                        st.success(f"Imported {len(rows):,} override rows.")
                     else:
-                        inserted, skipped = merge_start_list_rows(rows)
-                    clear_cache()
-                    st.success(f"Imported {inserted:,} new start-list rows and skipped {skipped:,} duplicate rows.")
-                    if replace:
-                        st.info(f"Replace mode deleted existing rows for {replaced_groups:,} matching race/date/gender group(s), not the entire start_lists table.")
-                    st.info(f"Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Auto-propagated gender for {propagated:,} athletes from this start list import.")
-
-                elif table_choice == "Race Overrides":
-                    rows = normalize_race_overrides(df)
-                    if replace:
-                        delete_all("race_overrides")
-                    insert_chunks("race_overrides", rows)
-                    clear_cache()
-                    st.success(f"Imported {len(rows):,} override rows.")
-
-                elif table_choice == "Scoring Settings":
-                    rows = normalize_scoring_settings(df)
-                    if replace:
-                        delete_all("scoring_settings")
-                    upsert_chunks("scoring_settings", rows, on_conflict="setting_group,setting_key")
-                    clear_cache()
-                    st.success(f"Imported/upserted {len(rows):,} scoring settings.")
-            except Exception as e:
-                st.error("Import failed.")
-                st.exception(e)
+                        rows = normalize_scoring_settings(df)
+                        if replace_admin:
+                            delete_all("scoring_settings")
+                        upsert_chunks("scoring_settings", rows, on_conflict="setting_group,setting_key")
+                        clear_cache()
+                        st.success(f"Imported/upserted {len(rows):,} scoring settings.")
+                except Exception as e:
+                    st.error("Import failed.")
+                    st.exception(e)
 
 
 elif page == "Race Lookup":
@@ -4633,7 +5103,7 @@ elif page == "Race Lookup":
 
 elif page == "Start Lists":
     st.header("📋 Start Lists")
-    st.write("Manage changing race start lists: search, remove athletes, add athletes, or replace/merge a fresh upload.")
+    st.write("Manage changing race start lists: search, remove athletes, or add athletes. CSV reuploads now live in Import CSVs.")
     results, starts, athletes, overrides = prepare_dataframes()
     if starts.empty:
         st.warning("No start lists found. Import a Start Lists CSV first.")
@@ -4678,7 +5148,7 @@ elif page == "Start Lists":
     section_title("👥", "Current Athletes")
     display_table(current_rows, ["OpenRank", "Athlete", "Gender", "Race Date", "Race", "Athlete URL"], height=420)
 
-    tab_remove, tab_add, tab_upload = st.tabs(["Remove", "Add", "Reupload / Merge"])
+    tab_remove, tab_add, tab_import = st.tabs(["Remove", "Add", "Import / Reupload"])
 
     with tab_remove:
         st.subheader("Remove athletes from this start list")
@@ -4725,34 +5195,18 @@ elif page == "Start Lists":
             else:
                 st.warning(msg)
 
-    with tab_upload:
-        st.subheader("Reupload or merge a fresh start list")
-        st.write("Upload the new start-list CSV. If race/date/gender columns are blank, the selected start list values will be used.")
-        upload_mode = st.radio("Upload mode", ["Replace selected start list", "Merge new athletes only"], horizontal=True)
-        start_upload = st.file_uploader("Upload updated start list CSV", type=["csv"], key="start_list_reupload")
-        if start_upload is not None:
-            up_df = read_uploaded_csv(start_upload)
-            st.write(f"Rows detected: {len(up_df):,}")
-            st.dataframe(up_df.head(20), width="stretch")
-            if st.button("Apply start-list upload", type="primary"):
-                try:
-                    rows, athlete_rows = normalize_start_list_upload_for_group(up_df, race_name, race_date, gender)
-                    rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows, default_gender=gender)
-                    rows = dedupe_start_list_rows(rows)
-                    if upload_mode == "Replace selected start list":
-                        delete_matching_start_lists([{"race_name": race_name, "race_date": format_date(race_date), "gender": gender}])
-                        insert_chunks("start_lists", rows)
-                        inserted = len(rows)
-                        skipped = 0
-                    else:
-                        inserted, skipped = merge_start_list_rows(rows)
-                    clear_cache()
-                    st.success(f"Start list updated. Inserted {inserted:,}; skipped {skipped:,}. Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
-                    st.info("Rebuild the model cache for this race after start-list edits.")
-                    st.rerun()
-                except Exception as e:
-                    st.error("Start-list upload failed.")
-                    st.exception(e)
+    with tab_import:
+        st.subheader("Update this start list from CSV")
+        st.write("All CSV uploads now live in the Import Center so imports are easier to audit and maintain.")
+        st.info("Click below to open Import CSVs with this race/date/gender preselected.")
+        if st.button("Open Import CSVs for this start list", type="primary"):
+            st.session_state["selected_start_list_for_import"] = {
+                "race_name": race_name,
+                "race_date": format_date(race_date),
+                "gender": gender,
+            }
+            st.session_state["page_label"] = "📥 Import CSVs"
+            st.rerun()
 
         with st.expander("Danger zone: delete this entire selected start list"):
             st.warning("This deletes only the selected race/date/gender start list rows.")
@@ -4762,6 +5216,7 @@ elif page == "Start Lists":
                 clear_cache()
                 st.success(f"Deleted {deleted_groups:,} start-list group(s).")
                 st.rerun()
+
 
 elif page == "Athletes":
     st.header("👤 Athletes")
@@ -4967,87 +5422,11 @@ elif page == "Gender Tools":
                 )
 
     st.markdown("---")
-    st.subheader("Manual gender override upload")
-    st.caption("Upload athlete_url + gender, or just athlete_name + gender. Name-only rows are applied only when the name matches exactly one athlete in the master athletes table.")
-    override_file = st.file_uploader("Manual gender CSV", type=["csv"], key="manual_gender_csv")
-    if override_file is not None:
-        manual = pd.read_csv(override_file)
-
-        # Build a safe name lookup from the athletes master table. Name-only
-        # overrides are allowed only when there is exactly one matching athlete,
-        # so we do not accidentally change the wrong person.
-        athlete_name_buckets: Dict[str, List[Dict[str, Any]]] = {}
-        if raw_athletes is not None and not raw_athletes.empty:
-            for _, ar in raw_athletes.iterrows():
-                nm = clean_str(ar.get("athlete_name"))
-                au = canonical_athlete_url(ar.get("athlete_url"))
-                if nm:
-                    athlete_name_buckets.setdefault(nm.lower(), []).append({
-                        "athlete_name": nm,
-                        "athlete_url": au,
-                        "current_gender": normalize_gender(ar.get("gender")),
-                    })
-
-        manual_rows = []
-        skipped_rows = []
-        for _, r in manual.iterrows():
-            g = normalize_gender(first_col(r, ["gender", "Gender", "sex", "Sex", "category", "Category"]))
-            url = canonical_athlete_url(first_col(r, ["athlete_url", "Athlete URL", "url", "URL", "profile", "Profile"]))
-            name = clean_str(first_col(r, ["athlete_name", "Athlete Name", "Athlete", "Name", "athlete", "name"]))
-
-            if g not in ["Men", "Women"]:
-                skipped_rows.append({"Athlete": name, "Athlete URL": url, "Gender": first_col(r, ["gender", "Gender"]), "Reason": "Invalid/missing gender"})
-                continue
-
-            if not url and name:
-                matches = athlete_name_buckets.get(name.lower(), [])
-                unique_urls = sorted({canonical_athlete_url(m.get("athlete_url")) for m in matches if canonical_athlete_url(m.get("athlete_url"))})
-                if len(unique_urls) == 1:
-                    url = unique_urls[0]
-                    # Preserve master-cased name when available.
-                    name = matches[0].get("athlete_name") or name
-                elif len(unique_urls) > 1:
-                    skipped_rows.append({
-                        "Athlete": name,
-                        "Athlete URL": ", ".join(unique_urls[:3]),
-                        "Gender": g,
-                        "Reason": "Name matches multiple athlete URLs — use athlete_url",
-                    })
-                    continue
-                else:
-                    skipped_rows.append({
-                        "Athlete": name,
-                        "Athlete URL": "",
-                        "Gender": g,
-                        "Reason": "Name not found in athletes table — use athlete_url",
-                    })
-                    continue
-
-            if url or name:
-                manual_rows.append({
-                    "Athlete URL": url,
-                    "Athlete": name,
-                    "Suggested Gender": g,
-                    "Confidence": "High",
-                    "Conflict": "No",
-                    "Sources": "Manual override CSV",
-                    "Signal Count": 1,
-                })
-            else:
-                skipped_rows.append({"Athlete": name, "Athlete URL": url, "Gender": g, "Reason": "Missing athlete_url and athlete_name"})
-
-        manual_df = pd.DataFrame(manual_rows)
-        skipped_df = pd.DataFrame(skipped_rows)
-        st.write(f"Valid manual override rows: {len(manual_df):,}")
-        if not manual_df.empty:
-            display_table(manual_df.head(250), ["Athlete", "Athlete URL", "Suggested Gender", "Sources"], height=300)
-            if st.button("Apply manual gender overrides", type="primary"):
-                applied = apply_gender_updates(manual_df, include_medium=False)
-                st.success(f"Applied manual gender overrides for {applied:,} athletes.")
-                st.rerun()
-        if not skipped_df.empty:
-            st.warning(f"Skipped {len(skipped_df):,} manual rows that were ambiguous or incomplete.")
-            display_table(skipped_df.head(250), ["Athlete", "Athlete URL", "Gender", "Reason"], height=260)
+    st.subheader("Manual gender overrides")
+    st.info("Manual gender CSV uploads now live in Import CSVs → Gender Fixes so every CSV import is in one place.")
+    if st.button("Open Import CSVs → Gender Fixes", type="primary"):
+        st.session_state["page_label"] = "📥 Import CSVs"
+        st.rerun()
 
 
 elif page == "Model Cache":
