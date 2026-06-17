@@ -5375,16 +5375,62 @@ elif page == "Gender Tools":
 
     st.markdown("---")
     st.subheader("Manual gender override upload")
-    st.caption("Upload a CSV with columns: athlete_url, athlete_name, gender. Use this for athletes that have no reliable start-list/race-name source.")
+    st.caption("Upload athlete_url + gender, or just athlete_name + gender. Name-only rows are applied only when the name matches exactly one athlete in the master athletes table.")
     override_file = st.file_uploader("Manual gender CSV", type=["csv"], key="manual_gender_csv")
     if override_file is not None:
         manual = pd.read_csv(override_file)
+
+        # Build a safe name lookup from the athletes master table. Name-only
+        # overrides are allowed only when there is exactly one matching athlete,
+        # so we do not accidentally change the wrong person.
+        athlete_name_buckets: Dict[str, List[Dict[str, Any]]] = {}
+        if raw_athletes is not None and not raw_athletes.empty:
+            for _, ar in raw_athletes.iterrows():
+                nm = clean_str(ar.get("athlete_name"))
+                au = canonical_athlete_url(ar.get("athlete_url"))
+                if nm:
+                    athlete_name_buckets.setdefault(nm.lower(), []).append({
+                        "athlete_name": nm,
+                        "athlete_url": au,
+                        "current_gender": normalize_gender(ar.get("gender")),
+                    })
+
         manual_rows = []
+        skipped_rows = []
         for _, r in manual.iterrows():
-            g = normalize_gender(first_col(r, ["gender", "Gender", "sex", "Sex"]))
-            url = canonical_athlete_url(first_col(r, ["athlete_url", "Athlete URL", "url", "URL"]))
-            name = clean_str(first_col(r, ["athlete_name", "Athlete", "Name", "athlete"]))
-            if g in ["Men", "Women"] and (url or name):
+            g = normalize_gender(first_col(r, ["gender", "Gender", "sex", "Sex", "category", "Category"]))
+            url = canonical_athlete_url(first_col(r, ["athlete_url", "Athlete URL", "url", "URL", "profile", "Profile"]))
+            name = clean_str(first_col(r, ["athlete_name", "Athlete Name", "Athlete", "Name", "athlete", "name"]))
+
+            if g not in ["Men", "Women"]:
+                skipped_rows.append({"Athlete": name, "Athlete URL": url, "Gender": first_col(r, ["gender", "Gender"]), "Reason": "Invalid/missing gender"})
+                continue
+
+            if not url and name:
+                matches = athlete_name_buckets.get(name.lower(), [])
+                unique_urls = sorted({canonical_athlete_url(m.get("athlete_url")) for m in matches if canonical_athlete_url(m.get("athlete_url"))})
+                if len(unique_urls) == 1:
+                    url = unique_urls[0]
+                    # Preserve master-cased name when available.
+                    name = matches[0].get("athlete_name") or name
+                elif len(unique_urls) > 1:
+                    skipped_rows.append({
+                        "Athlete": name,
+                        "Athlete URL": ", ".join(unique_urls[:3]),
+                        "Gender": g,
+                        "Reason": "Name matches multiple athlete URLs — use athlete_url",
+                    })
+                    continue
+                else:
+                    skipped_rows.append({
+                        "Athlete": name,
+                        "Athlete URL": "",
+                        "Gender": g,
+                        "Reason": "Name not found in athletes table — use athlete_url",
+                    })
+                    continue
+
+            if url or name:
                 manual_rows.append({
                     "Athlete URL": url,
                     "Athlete": name,
@@ -5394,7 +5440,11 @@ elif page == "Gender Tools":
                     "Sources": "Manual override CSV",
                     "Signal Count": 1,
                 })
+            else:
+                skipped_rows.append({"Athlete": name, "Athlete URL": url, "Gender": g, "Reason": "Missing athlete_url and athlete_name"})
+
         manual_df = pd.DataFrame(manual_rows)
+        skipped_df = pd.DataFrame(skipped_rows)
         st.write(f"Valid manual override rows: {len(manual_df):,}")
         if not manual_df.empty:
             display_table(manual_df.head(250), ["Athlete", "Athlete URL", "Suggested Gender", "Sources"], height=300)
@@ -5402,6 +5452,9 @@ elif page == "Gender Tools":
                 applied = apply_gender_updates(manual_df, include_medium=False)
                 st.success(f"Applied manual gender overrides for {applied:,} athletes.")
                 st.rerun()
+        if not skipped_df.empty:
+            st.warning(f"Skipped {len(skipped_df):,} manual rows that were ambiguous or incomplete.")
+            display_table(skipped_df.head(250), ["Athlete", "Athlete URL", "Gender", "Reason"], height=260)
 
 
 elif page == "Model Cache":
