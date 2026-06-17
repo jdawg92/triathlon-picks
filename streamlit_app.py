@@ -5696,44 +5696,232 @@ elif page == "Import CSVs":
             deleted += delete_rows_in_batches("start_lists", [("race_name", race_name), ("race_date", race_date)])
         return deleted
 
-    def _trinews_athlete_url_from_source(row: Dict[str, Any]) -> Optional[str]:
+    def _source_raw_dict(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _source_raw_list(value: Any) -> List[Dict[str, Any]]:
+        """Return a list of row-like dicts from a cached start-list raw payload."""
+        if isinstance(value, list):
+            return [x for x in value if isinstance(x, dict)]
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    return [x for x in parsed if isinstance(x, dict)]
+            except Exception:
+                return []
+        return []
+
+    def _nested_value(mapping: Dict[str, Any], aliases: Iterable[str]) -> Any:
+        """Read flat or nested aliases from a source row/raw API payload."""
+        if not isinstance(mapping, dict):
+            return None
+        lower_keys = {str(k).strip().lower(): k for k in mapping.keys()}
+        for alias in aliases:
+            cur: Any = mapping
+            ok = True
+            for part in str(alias).split('.'):
+                if isinstance(cur, dict):
+                    # exact key first, case-insensitive second
+                    if part in cur:
+                        cur = cur.get(part)
+                    else:
+                        lk = str(part).strip().lower()
+                        if lk in {str(k).strip().lower(): k for k in cur.keys()}:
+                            real_key = {str(k).strip().lower(): k for k in cur.keys()}[lk]
+                            cur = cur.get(real_key)
+                        else:
+                            ok = False
+                            break
+                else:
+                    ok = False
+                    break
+            if ok and cur is not None and str(cur).strip() != "":
+                return cur
+        for alias in aliases:
+            key = str(alias).strip().lower()
+            if key in lower_keys:
+                val = mapping.get(lower_keys[key])
+                if val is not None and str(val).strip() != "":
+                    return val
+        return None
+
+    def _cached_lookup_by_id(table_name: str, ids: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
+        """Fetch small source-cache lookup maps from Supabase."""
+        keys = sorted({str(x).strip() for x in ids if x is not None and str(x).strip()})
+        out: Dict[str, Dict[str, Any]] = {}
+        if not keys:
+            return out
+        for i in range(0, len(keys), 200):
+            chunk = keys[i:i + 200]
+            try:
+                rows = supabase.table(table_name).select("*").in_("id", chunk).execute().data or []
+                for r in rows:
+                    rid = clean_str(r.get("id"))
+                    if rid:
+                        out[rid] = r
+            except Exception:
+                # Fallback for environments where the client does not support in_ cleanly.
+                for key in chunk:
+                    try:
+                        rows = supabase.table(table_name).select("*").eq("id", key).limit(1).execute().data or []
+                        if rows:
+                            out[key] = rows[0]
+                    except Exception:
+                        pass
+        return out
+
+    def _expand_trinews_start_source_rows(source_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Expand cached rows that store an entire start list inside raw JSON.
+
+        Some cache rows are one-athlete-per-row. Others can be one-race rows
+        with nested entries/participants. This normalizes both shapes into
+        row-like records so migration does not silently skip them.
+        """
+        expanded: List[Dict[str, Any]] = []
+        list_keys = [
+            "athletes", "entries", "participants", "start_list", "startList",
+            "startlist", "startListEntries", "rows", "data", "items", "results",
+        ]
+        for src in source_rows or []:
+            raw = _source_raw_dict(src.get("raw"))
+            raw_list = _source_raw_list(src.get("raw"))
+            nested_rows: List[Dict[str, Any]] = []
+            if raw_list:
+                nested_rows = raw_list
+            elif isinstance(raw, dict):
+                for key in list_keys:
+                    val = raw.get(key)
+                    if isinstance(val, list):
+                        nested_rows = [x for x in val if isinstance(x, dict)]
+                        if nested_rows:
+                            break
+                    if isinstance(val, dict):
+                        nested_inner = _source_raw_list(val.get("data")) or _source_raw_list(val.get("items")) or _source_raw_list(val.get("rows"))
+                        if nested_inner:
+                            nested_rows = nested_inner
+                            break
+            if nested_rows:
+                for idx, item in enumerate(nested_rows):
+                    merged = dict(src)
+                    merged_raw = dict(item)
+                    # Preserve parent race/source fields while letting athlete row fields win.
+                    for k, v in item.items():
+                        merged[k] = v
+                    merged["raw"] = merged_raw
+                    merged["source_parent_id"] = clean_str(src.get("id"))
+                    if not clean_str(merged.get("id")):
+                        merged["id"] = f"{clean_str(src.get('id'))}:{idx}"
+                    expanded.append(merged)
+            else:
+                expanded.append(src)
+        return expanded
+
+    def _source_athlete_id(row: Dict[str, Any]) -> Optional[str]:
         raw = _source_raw_dict(row.get("raw"))
-        slug = clean_str(row.get("athlete_slug"))
-        if not slug:
-            athlete_obj = raw.get("athlete") if isinstance(raw.get("athlete"), dict) else {}
-            slug = clean_str(athlete_obj.get("slug"))
+        return clean_str(row.get("athlete_id")) or clean_str(_nested_value(row, ["athlete_id", "athlete.id", "athletes.id", "participant.athlete_id", "entry.athlete_id", "profile_id"])) or clean_str(_nested_value(raw, ["athlete_id", "athlete.id", "athletes.id", "participant.athlete_id", "entry.athlete_id", "profile_id"]))
+
+    def _source_race_id(row: Dict[str, Any]) -> Optional[str]:
+        raw = _source_raw_dict(row.get("raw"))
+        return clean_str(row.get("race_id")) or clean_str(_nested_value(row, ["race_id", "race.id", "event.race_id"])) or clean_str(_nested_value(raw, ["race_id", "race.id", "event.race_id"]))
+
+    def _trinews_athlete_url_from_source(row: Dict[str, Any], athlete_lookup: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        raw = _source_raw_dict(row.get("raw"))
+        athlete_lookup = athlete_lookup or {}
+        slug = (
+            clean_str(row.get("athlete_slug"))
+            or clean_str(_nested_value(row, ["athlete_slug", "slug", "athlete.slug", "athletes.slug"]))
+            or clean_str(_nested_value(raw, ["athlete_slug", "slug", "athlete.slug", "athletes.slug"]))
+            or clean_str(athlete_lookup.get("slug"))
+        )
         if slug:
             return canonical_athlete_url(f"https://protrinews.com/athletes/{slug}")
-        url = clean_str(row.get("athlete_url"))
+        url = clean_str(row.get("athlete_url")) or clean_str(_nested_value(raw, ["athlete_url", "url", "athlete.url", "profile_url"]))
         return canonical_athlete_url(url) if url else None
 
-    def start_rows_from_trinews_source_rows(source_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    def start_rows_from_trinews_source_rows(source_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
         """Convert cached trinews_start_lists rows into app start_lists rows.
 
-        This is needed when the API sync wrote the source cache but the app
-        start_lists table was not populated or was cleared later.
+        Handles both one-athlete source rows and race-level cached rows with a
+        nested raw JSON start list. Missing flat fields are backfilled from
+        trinews_races and trinews_athletes using race_id/athlete_id.
         """
+        expanded_rows = _expand_trinews_start_source_rows(source_rows)
+        race_ids = [_source_race_id(r) for r in expanded_rows]
+        athlete_ids = [_source_athlete_id(r) for r in expanded_rows]
+        race_map = _cached_lookup_by_id("trinews_races", race_ids)
+        athlete_map = _cached_lookup_by_id("trinews_athletes", athlete_ids)
+
         app_rows: List[Dict[str, Any]] = []
         athlete_rows_by_url: Dict[str, Dict[str, Any]] = {}
-        for row in source_rows or []:
-            race_name = clean_str(row.get("race_name"))
-            race_date = parse_date_value(row.get("race_date")) or clean_str(row.get("race_date"))
-            athlete_name = clean_str(row.get("athlete_name"))
-            athlete_url = _trinews_athlete_url_from_source(row)
-            if not race_name or not race_date or (not athlete_url and not athlete_name):
+        skipped: Dict[str, int] = {}
+
+        for row in expanded_rows or []:
+            raw = _source_raw_dict(row.get("raw"))
+            race_id = _source_race_id(row)
+            athlete_id = _source_athlete_id(row)
+            race_lookup = race_map.get(str(race_id or ""), {})
+            athlete_lookup = athlete_map.get(str(athlete_id or ""), {})
+
+            race_name = (
+                clean_str(row.get("race_name"))
+                or clean_str(_nested_value(raw, ["race_name", "race.name", "event.name"]))
+                or clean_str(race_lookup.get("name"))
+            )
+            race_date = (
+                parse_date_value(row.get("race_date"))
+                or parse_date_value(_nested_value(raw, ["race_date", "race.date", "event.date", "date"]))
+                or parse_date_value(race_lookup.get("race_date"))
+                or parse_date_value(race_lookup.get("date"))
+            )
+            athlete_name = (
+                clean_str(row.get("athlete_name"))
+                or clean_str(_nested_value(row, ["athlete_name", "full_name", "name", "display_name", "athlete.full_name", "athlete.name", "athletes.full_name"]))
+                or clean_str(_nested_value(raw, ["athlete_name", "full_name", "name", "display_name", "athlete.full_name", "athlete.name", "athletes.full_name"]))
+                or clean_str(athlete_lookup.get("full_name"))
+                or clean_str(athlete_lookup.get("name"))
+            )
+            athlete_url = _trinews_athlete_url_from_source(row, athlete_lookup)
+
+            if not race_name:
+                skipped["missing race name"] = skipped.get("missing race name", 0) + 1
                 continue
-            gender = normalize_gender(row.get("gender"))
+            if not race_date:
+                skipped["missing race date"] = skipped.get("missing race date", 0) + 1
+                continue
+            if not athlete_url and not athlete_name:
+                skipped["missing athlete"] = skipped.get("missing athlete", 0) + 1
+                continue
+
+            gender = (
+                normalize_gender(row.get("gender"))
+                or normalize_gender(_nested_value(raw, ["gender", "program_name", "program", "division", "category"]))
+                or normalize_gender(athlete_lookup.get("gender"))
+                or ""
+            )
             open_rank = parse_number(row.get("openrank"))
             if open_rank is None:
                 open_rank = parse_number(row.get("open_rank"))
+            if open_rank is None:
+                open_rank = parse_number(_nested_value(raw, ["openrank", "open_rank", "ors", "points.openrank", "points.ors", "rank", "ranking"]))
+
             raw_payload = {
                 "source": "trinews_start_lists_cache",
                 "trinews_start_list_id": clean_str(row.get("id")),
-                "trinews_race_id": clean_str(row.get("race_id")),
-                "race_slug": clean_str(row.get("race_slug")),
-                "trinews_athlete_id": clean_str(row.get("athlete_id")),
+                "source_parent_id": clean_str(row.get("source_parent_id")),
+                "trinews_race_id": race_id,
+                "race_slug": clean_str(row.get("race_slug")) or clean_str(race_lookup.get("slug")),
+                "trinews_athlete_id": athlete_id,
                 "source_table": clean_str(row.get("source_table")),
-                "raw": row.get("raw"),
+                "raw": raw,
             }
             app_row = {
                 "race_name": race_name,
@@ -5752,13 +5940,21 @@ elif page == "Import CSVs":
                     "gender": gender,
                     "raw": {
                         "source": "trinews_start_lists_cache",
-                        "trinews_athlete_id": clean_str(row.get("athlete_id")),
-                        "athlete_slug": clean_str(row.get("athlete_slug")),
+                        "trinews_athlete_id": athlete_id,
+                        "athlete_slug": clean_str(row.get("athlete_slug")) or clean_str(athlete_lookup.get("slug")),
                     },
                 }
-        return dedupe_start_list_rows(app_rows), list(athlete_rows_by_url.values())
 
-    def _source_raw_dict(value: Any) -> Dict[str, Any]:
+        stats = {
+            "source_rows": len(source_rows or []),
+            "expanded_rows": len(expanded_rows),
+            "app_rows_ready": len(app_rows),
+            "athletes_ready": len(athlete_rows_by_url),
+            "skipped": skipped,
+        }
+        return dedupe_start_list_rows(app_rows), list(athlete_rows_by_url.values()), stats
+
+
         if isinstance(value, dict):
             return value
         if isinstance(value, str) and value.strip():
@@ -6426,9 +6622,13 @@ elif page == "Import CSVs":
             try:
                 source_rows_all = fetch_all("trinews_start_lists", select="*", page_size=1000)
                 source_rows = source_rows_all[: int(migrate_limit)]
-                start_rows, athlete_rows = start_rows_from_trinews_source_rows(source_rows)
+                start_rows, athlete_rows, mig_stats = start_rows_from_trinews_source_rows(source_rows)
                 if not start_rows:
                     st.warning("No migratable cached start-list rows found in trinews_start_lists.")
+                    st.json(mig_stats)
+                    if source_rows:
+                        st.caption("Sample cached row shape")
+                        st.json({k: source_rows[0].get(k) for k in list(source_rows[0].keys())[:12]})
                 else:
                     if athlete_rows:
                         upsert_athletes_preserve_gender(athlete_rows)
@@ -6445,10 +6645,13 @@ elif page == "Import CSVs":
                         inserted, skipped = merge_start_list_rows(start_rows)
                     clear_cache()
                     st.success(
-                        f"Migrated {inserted:,} start-list rows from {len(source_rows):,} cached source rows. "
+                        f"Migrated {inserted:,} start-list rows from {len(source_rows):,} cached source rows "
+                        f"({int(mig_stats.get('expanded_rows') or 0):,} expanded rows). "
                         f"Skipped existing rows: {skipped:,}. Deleted app rows for migrated races: {deleted:,}. "
                         f"Athlete updates: {sl_ath_ins + sl_ath_upd:,}."
                     )
+                    with st.expander("Migration details", expanded=False):
+                        st.json(mig_stats)
                     st.dataframe(pd.DataFrame(start_rows).head(25), width="stretch", hide_index=True)
             except Exception as e:
                 st.error("Cached start-list migration failed.")
@@ -6986,6 +7189,10 @@ elif page == "Model Cache":
     c2.metric("Scorecard rows", f"{card_count:,}")
     c3.metric("Evidence rows", f"{evidence_count:,}")
     c4.metric("Top scores used", TOP_SCORES_USED)
+    st.caption(
+        "Scorecard rows are athlete × profile × discipline rankings. They are not expected to equal scoring-pool rows. "
+        "Evidence rows are only the top reference results saved for each generated scorecard."
+    )
 
     if pool_count <= 0:
         st.warning("No scoring pool rows found. Build it first from API Sync → Build scoring pool.")
