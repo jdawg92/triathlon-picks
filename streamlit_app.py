@@ -1,4 +1,5 @@
 import hashlib
+import html
 import io
 import json
 import math
@@ -291,6 +292,97 @@ def apply_dashboard_theme() -> None:
             color: #DDE7FF;
             background: rgba(124, 92, 255, 0.18);
             border: 1px solid rgba(124, 92, 255, 0.34);
+        }
+
+        .tri-watch-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+            gap: 0.85rem;
+            margin: 0.2rem 0 0.95rem 0;
+        }
+
+        .tri-watch-card {
+            position: relative;
+            overflow: hidden;
+            min-height: 10.3rem;
+            padding: 1rem;
+            border-radius: 1rem;
+            border: 1px solid rgba(124, 92, 255, 0.28);
+            background:
+                linear-gradient(145deg, rgba(124, 92, 255, 0.14), rgba(0, 212, 255, 0.07)),
+                rgba(15, 23, 42, 0.86);
+            box-shadow: 0 16px 42px rgba(0, 0, 0, 0.24);
+        }
+
+        .tri-watch-card .topline {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.6rem;
+            margin-bottom: 0.65rem;
+        }
+
+        .tri-watch-card .tag {
+            color: var(--tri-cyan);
+            font-size: 0.68rem;
+            font-weight: 900;
+            letter-spacing: 0.13em;
+            text-transform: uppercase;
+        }
+
+        .tri-watch-card .profile-link {
+            color: #FFFFFF;
+            text-decoration: none;
+            font-size: 0.74rem;
+            font-weight: 850;
+            padding: 0.22rem 0.52rem;
+            border-radius: 999px;
+            border: 1px solid rgba(0, 212, 255, 0.34);
+            background: rgba(0, 212, 255, 0.12);
+            white-space: nowrap;
+        }
+
+        .tri-watch-card .athlete {
+            color: var(--tri-text);
+            font-size: 1.08rem;
+            font-weight: 900;
+            line-height: 1.15;
+            margin-bottom: 0.7rem;
+        }
+
+        .tri-watch-card .scores {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.45rem;
+            margin-bottom: 0.72rem;
+        }
+
+        .tri-watch-card .scorebox {
+            padding: 0.48rem 0.5rem;
+            border-radius: 0.72rem;
+            background: rgba(255, 255, 255, 0.055);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .tri-watch-card .scorebox .label {
+            color: var(--tri-muted);
+            font-size: 0.62rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .tri-watch-card .scorebox .value {
+            color: var(--tri-text);
+            font-size: 0.98rem;
+            font-weight: 900;
+            margin-top: 0.12rem;
+        }
+
+        .tri-watch-card .reason {
+            color: var(--tri-muted);
+            font-size: 0.82rem;
+            line-height: 1.35;
         }
 
         [data-testid="stMetric"] {
@@ -4001,6 +4093,8 @@ def best4_openrank_average(values: Iterable[Any], divisor: int = 4) -> Tuple[flo
 DISPLAY_LABELS = {
     "athlete_name": "Athlete",
     "athlete_url": "Athlete URL",
+    "PTN": "Athlete Profile",
+    "PTN URL": "Athlete Profile",
     "race_date": "Date",
     "race_name": "Race",
     "race_type": "Race Type",
@@ -4134,10 +4228,10 @@ def display_table(df: pd.DataFrame, columns: List[str], height: Optional[int] = 
     compact_height = dynamic_table_height(show, height)
     if isinstance(compact_height, int) and compact_height > 0:
         kwargs["height"] = compact_height
-    link_cols = [c for c in show.columns if c in {"Athlete URL", "PTN", "PTN URL"}]
+    link_cols = [c for c in show.columns if c in {"Athlete URL", "PTN", "PTN URL", "Athlete Profile"}]
     if link_cols and hasattr(st, "column_config"):
         kwargs["column_config"] = {
-            c: st.column_config.LinkColumn(c, display_text="Open PTN")
+            c: st.column_config.LinkColumn(c, display_text="Profile")
             for c in link_cols
         }
 
@@ -6184,21 +6278,53 @@ def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
 
     section_title("Watch", "Keep An Eye On")
     st.caption("High-ceiling or unusual signals for PTN podium picks, including athletes with a standout recent split or a race score running hotter than their base ranking.")
-    display_table(
-        pd.DataFrame(picks),
-        ["Signal", "Athlete", "Rank", "Watch Score", "Performance", "Best Split", "Gap %", "Evidence", "Reason", "Signal Race", "PTN"],
-        height=190,
-    )
+    card_html = ['<div class="tri-watch-grid">']
+    for row in picks:
+        profile = canonical_athlete_url(row.get("PTN"))
+        profile_link = (
+            f'<a class="profile-link" href="{html.escape(profile)}" target="_blank" rel="noopener noreferrer">Profile</a>'
+            if profile else '<span class="profile-link">Profile</span>'
+        )
+        athlete = html.escape(clean_str(row.get("Athlete")) or "Athlete")
+        signal = html.escape(clean_str(row.get("Signal")) or "Signal")
+        reason = html.escape(clean_str(row.get("Reason")) or "")
+        rank = parse_int(row.get("Rank")) or 0
+        watch_score = safe_float(row.get("Watch Score")) or 0.0
+        performance = safe_float(row.get("Performance")) or 0.0
+        best_split = safe_float(row.get("Best Split"))
+        evidence = parse_int(row.get("Evidence")) or 0
+        third_label = "Split" if best_split is not None else "Evidence"
+        third_value = f"{best_split:.1f}" if best_split is not None else str(evidence)
+        signal_race = html.escape(clean_str(row.get("Signal Race")) or clean_str(row.get("Last Race")) or "")
+        card_html.append(
+            f"""
+            <div class="tri-watch-card">
+                <div class="topline">{profile_link}<span class="tag">{signal} · Rank {rank or "-"}</span></div>
+                <div class="athlete">{athlete}</div>
+                <div class="scores">
+                    <div class="scorebox"><div class="label">Watch</div><div class="value">{watch_score:.1f}</div></div>
+                    <div class="scorebox"><div class="label">Perf</div><div class="value">{performance:.1f}</div></div>
+                    <div class="scorebox"><div class="label">{third_label}</div><div class="value">{third_value}</div></div>
+                </div>
+                <div class="reason">{reason}</div>
+                <div class="reason">{signal_race}</div>
+            </div>
+            """
+        )
+    card_html.append("</div>")
+    st.markdown("\n".join(card_html), unsafe_allow_html=True)
 
 
 def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional[Dict[str, Any]] = None) -> None:
     params = (cache_meta or {}).get("params", {}) if isinstance(cache_meta, dict) else {}
     computed_at = (cache_meta or {}).get("computed_at") if isinstance(cache_meta, dict) else None
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 0.8])
     c1.metric("Scored rows", f"{len(cached_df) if cached_df is not None else 0:,}")
     c2.metric("Start athletes", params.get("start_list_athletes", "—"))
     c3.metric("Profile", params.get("prediction_scope", "—"))
     c4.metric("Scorecards as of", clean_str(computed_at)[:19] if computed_at else "—")
+    with c5:
+        pro_mode = st.toggle("Pro Mode", value=False, key="race_analysis_pro_mode", help="Show scoring diagnostics, evidence counts, and padded score columns.")
     st.info("Fast mode: showing saved athlete scorecards joined to this start list. Missing/no-evidence athletes are shown in separate expanders instead of polluting the pick tables with 0.0 rows.")
     cached_df = prepare_cached_race_prediction_display(cached_df)
 
@@ -6209,12 +6335,19 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
         with st.expander(f"Keep an eye on details ({len(watch)})", expanded=False):
             display_table(
                 watch.head(30),
-                ["Athlete", "Signal", "Rank", "Watch Score", "Performance", "Ranking", "Best Split", "Gap %", "Evidence", "Reason", "Signal Race", "Last Race", "Last Race Date", "PTN"],
+                (["PTN", "Athlete", "Signal", "Rank", "Watch Score", "Best Split", "Gap %", "Reason", "Signal Race"]
+                 if not pro_mode else
+                 ["PTN", "Athlete", "Signal", "Rank", "Watch Score", "Performance", "Ranking", "Best Split", "Gap %", "Evidence", "Reason", "Signal Race", "Last Race", "Last Race Date"]),
                 height=360,
             )
 
     overall = _positive_score_rows(cached_section(cached_df, "overall"))
-    display_table(overall.head(20), ["Rank", "Athlete", "Race Pick Score", "Race Evidence Score", "Race Performance Score", "Race Evidence Scores", "Score", "Performance Score", "OpenRank Score", "Best Scores Used", "Best Scores Padded", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "PTN"])
+    overall_cols = (
+        ["PTN", "Rank", "Athlete", "Race Pick Score", "Race Evidence Scores", "Score", "Last Race", "Last Race Date"]
+        if not pro_mode else
+        ["PTN", "Rank", "Athlete", "Race Pick Score", "Race Evidence Score", "Race Performance Score", "Race Evidence Scores", "Score", "Performance Score", "OpenRank Score", "Best Scores Used", "Best Scores Padded", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date"]
+    )
+    display_table(overall.head(20), overall_cols)
     render_score_evidence(overall, "Overall score evidence", limit=8)
     _render_missing_scorecards(params, "overall")
 
@@ -6229,9 +6362,14 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
                 if "Rank" in scored.columns:
                     scored = scored.drop(columns=["Rank"])
                 scored.insert(0, "Rank", range(1, len(scored) + 1))
+            split_cols = (
+                ["PTN", "Rank", "Athlete", "Race Pick Score", "Race Split Top 3", "Best Race Split Score", "Best Race Split Gap %", "Best Race Split Race", "Last Race", "Last Race Date"]
+                if not pro_mode else
+                ["PTN", "Rank", "Athlete", "Race Pick Score", "Race Split Top 3 Avg", "Race Split Top 3", "Best Race Split Score", "Best Race Split Gap %", "Best Race Split Race", "Score", "Performance Split Score", "OpenRank Split Score", "Best Split Scores Used", "Best Split Scores Padded", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"]
+            )
             display_table(
                 scored.head(20),
-                ["Rank", "Athlete", "Race Pick Score", "Race Split Top 3 Avg", "Race Split Top 3", "Best Race Split Score", "Best Race Split Gap %", "Best Race Split Race", "Score", "Performance Split Score", "OpenRank Split Score", "Best Split Scores Used", "Best Split Scores Padded", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "PTN"],
+                split_cols,
                 height=360,
             )
             render_score_evidence(scored, f"{title} evidence", limit=8)
