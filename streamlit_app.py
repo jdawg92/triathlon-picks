@@ -5640,7 +5640,50 @@ elif page == "Import CSVs":
         return out
 
     def load_trinews_results_batch(offset: int, limit: int) -> List[Dict[str, Any]]:
-        return supabase.table("trinews_results").select("*").order("race_date", desc=True).range(int(offset), int(offset) + int(limit) - 1).execute().data or []
+        """Load cached TriNews results in multiple Supabase pages.
+
+        Supabase/PostgREST commonly caps a single select response at 1,000 rows,
+        even when the requested range is larger. The publish UI can request 10k+
+        rows, so fetch the requested batch in stable 1,000-row pages.
+        """
+        start = max(0, int(offset or 0))
+        target = max(0, int(limit or 0))
+        page_size = 1000
+        rows: List[Dict[str, Any]] = []
+        cursor = start
+
+        while len(rows) < target:
+            take = min(page_size, target - len(rows))
+            if take <= 0:
+                break
+            try:
+                data = (
+                    supabase.table("trinews_results")
+                    .select("*")
+                    .order("race_date", desc=True)
+                    .order("id")
+                    .range(cursor, cursor + take - 1)
+                    .execute()
+                    .data
+                    or []
+                )
+            except Exception:
+                # Some existing Supabase clients/table versions may not support a second order call.
+                data = (
+                    supabase.table("trinews_results")
+                    .select("*")
+                    .order("race_date", desc=True)
+                    .range(cursor, cursor + take - 1)
+                    .execute()
+                    .data
+                    or []
+                )
+            rows.extend(data)
+            if len(data) < take:
+                break
+            cursor += len(data)
+
+        return rows
 
     def build_app_rows_from_cached_trinews_results(source_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
         if result_to_pick_rows is None:
@@ -5955,7 +5998,7 @@ elif page == "Import CSVs":
         st.caption("Copies rows from the cached TriNews results table into the app result tables used by rankings and scorecards.")
         pc1, pc2, pc3 = st.columns(3)
         publish_offset = pc1.number_input("Cached result offset", min_value=0, value=0, step=500, key="publish_cached_results_offset")
-        publish_limit = pc2.number_input("Rows this run", min_value=10, max_value=50000, value=10000, step=5000, key="publish_cached_results_limit_v2")
+        publish_limit = pc2.number_input("Rows this run", min_value=10, max_value=50000, value=10000, step=5000, key="publish_cached_results_limit_v3")
         publish_mode = pc3.radio("Mode", ["Preview", "Write"], horizontal=True, key="publish_cached_results_mode")
         fast_publish = st.checkbox(
             "Fast publish for fresh tables",
@@ -5969,7 +6012,7 @@ elif page == "Import CSVs":
             help="Leave off if you already synced athletes. Turning this on can make large batches slower.",
             key="update_athletes_during_publish",
         )
-        st.caption("For large imports, publish in batches. Default is 10,000 rows per run. You can go higher if your Supabase project handles it, then continue using the next offset shown after each successful write.")
+        st.caption("For large imports, publish in batches. This fetches large batches in 1,000-row API pages behind the scenes, so 10,000 rows should now load as 10 pages and publish as one run.")
 
         if st.button("Publish cached results to app tables", type="primary", key="publish_cached_results_to_app_tables"):
             try:
