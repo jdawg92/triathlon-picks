@@ -77,7 +77,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v5_recency_relevance"
+MODEL_CACHE_VERSION = "score_engine_v6_reliability_prior"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -1367,13 +1367,10 @@ def fetch_scoring_pool_for_scorecards(
     lookback_days: int = MAX_SCORECARD_POOL_LOOKBACK_DAYS,
     page_size: int = 1000,
 ) -> pd.DataFrame:
-    """Load all scoring-pool rows needed for scorecard rebuilds.
+    """Load only the scoring-pool rows needed for scorecard rebuilds.
 
-    Supabase/PostgREST commonly caps one response at 1,000 rows even when a
-    larger range is requested. If this function asks for 2,000 rows and receives
-    1,000, the old logic thinks the pool is finished and only the first page gets
-    scored. Keep the page size at 1,000 and continue paging until a short page is
-    returned.
+    This avoids pulling the full historical pool through Streamlit and keeps each
+    Supabase request small enough to avoid statement timeouts.
     """
     as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
     if pd.isna(as_of_ts):
@@ -1383,7 +1380,10 @@ def fetch_scoring_pool_for_scorecards(
 
     all_rows: List[Dict[str, Any]] = []
     start = 0
-    page_size = max(100, min(int(page_size or 1000), 1000))
+    # Supabase/PostgREST commonly caps each response at 1,000 rows even when
+    # a larger range is requested. Use 1,000-row pages and stop only when a
+    # short page is returned so the full scoring_result_pool is loaded.
+    page_size = max(100, min(int(page_size), 1000))
     while True:
         end = start + page_size - 1
         try:
@@ -3922,7 +3922,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v5_recency_relevance"
+MODEL_CACHE_VERSION = "score_engine_v6_reliability_prior"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4459,7 +4459,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "score_engine_v5_recency_relevance"
+MODEL_CACHE_VERSION = "score_engine_v6_reliability_prior"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -5615,7 +5615,7 @@ with st.sidebar:
         st.markdown(f'<div class="tri-sidebar-section">{section}</div>', unsafe_allow_html=True)
         for label, page_name in items:
             active = st.session_state["page_label"] == label
-            if st.button(label, key=f"nav_{page_name}", type="primary" if active else "secondary", width="stretch"):
+            if st.button(label, key=f"nav_{section}_{label}_{page_name}", type="primary" if active else "secondary", width="stretch"):
                 st.session_state["page_label"] = label
                 st.rerun()
 
@@ -5695,6 +5695,68 @@ elif page == "Import CSVs":
         for race_name, race_date in keys:
             deleted += delete_rows_in_batches("start_lists", [("race_name", race_name), ("race_date", race_date)])
         return deleted
+
+    def _trinews_athlete_url_from_source(row: Dict[str, Any]) -> Optional[str]:
+        raw = _source_raw_dict(row.get("raw"))
+        slug = clean_str(row.get("athlete_slug"))
+        if not slug:
+            athlete_obj = raw.get("athlete") if isinstance(raw.get("athlete"), dict) else {}
+            slug = clean_str(athlete_obj.get("slug"))
+        if slug:
+            return canonical_athlete_url(f"https://protrinews.com/athletes/{slug}")
+        url = clean_str(row.get("athlete_url"))
+        return canonical_athlete_url(url) if url else None
+
+    def start_rows_from_trinews_source_rows(source_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Convert cached trinews_start_lists rows into app start_lists rows.
+
+        This is needed when the API sync wrote the source cache but the app
+        start_lists table was not populated or was cleared later.
+        """
+        app_rows: List[Dict[str, Any]] = []
+        athlete_rows_by_url: Dict[str, Dict[str, Any]] = {}
+        for row in source_rows or []:
+            race_name = clean_str(row.get("race_name"))
+            race_date = parse_date_value(row.get("race_date")) or clean_str(row.get("race_date"))
+            athlete_name = clean_str(row.get("athlete_name"))
+            athlete_url = _trinews_athlete_url_from_source(row)
+            if not race_name or not race_date or (not athlete_url and not athlete_name):
+                continue
+            gender = normalize_gender(row.get("gender"))
+            open_rank = parse_number(row.get("openrank"))
+            if open_rank is None:
+                open_rank = parse_number(row.get("open_rank"))
+            raw_payload = {
+                "source": "trinews_start_lists_cache",
+                "trinews_start_list_id": clean_str(row.get("id")),
+                "trinews_race_id": clean_str(row.get("race_id")),
+                "race_slug": clean_str(row.get("race_slug")),
+                "trinews_athlete_id": clean_str(row.get("athlete_id")),
+                "source_table": clean_str(row.get("source_table")),
+                "raw": row.get("raw"),
+            }
+            app_row = {
+                "race_name": race_name,
+                "race_date": race_date,
+                "gender": gender or "",
+                "athlete_url": athlete_url,
+                "athlete_name": athlete_name,
+                "open_rank": open_rank,
+                "raw": raw_payload,
+            }
+            app_rows.append(app_row)
+            if athlete_url:
+                athlete_rows_by_url[athlete_url] = {
+                    "athlete_url": athlete_url,
+                    "athlete_name": athlete_name,
+                    "gender": gender,
+                    "raw": {
+                        "source": "trinews_start_lists_cache",
+                        "trinews_athlete_id": clean_str(row.get("athlete_id")),
+                        "athlete_slug": clean_str(row.get("athlete_slug")),
+                    },
+                }
+        return dedupe_start_list_rows(app_rows), list(athlete_rows_by_url.values())
 
     def _source_raw_dict(value: Any) -> Dict[str, Any]:
         if isinstance(value, dict):
@@ -6354,6 +6416,47 @@ elif page == "Import CSVs":
         s1, s2 = st.columns(2)
         s1.metric("App start-list rows", f"{start_count:,}")
         s2.metric("Source start-list rows", f"{source_start_count:,}")
+        st.markdown("#### Migrate cached source start lists")
+        st.caption("Use this when trinews_start_lists has rows but the app start_lists table has not been populated.")
+        mig1, mig2 = st.columns(2)
+        migrate_clear = mig1.checkbox("Replace app rows for migrated races", value=True, key="migrate_trinews_start_replace")
+        migrate_limit = mig2.number_input("Max cached source rows to migrate", min_value=100, max_value=50000, value=10000, step=1000, key="migrate_trinews_start_limit")
+        if st.button("Migrate cached start lists to app table", type="secondary", key="migrate_trinews_start_lists_to_app"):
+            loader = loading_card("Migrating cached start lists", "Reading trinews_start_lists and writing app start_lists.")
+            try:
+                source_rows_all = fetch_all("trinews_start_lists", select="*", page_size=1000)
+                source_rows = source_rows_all[: int(migrate_limit)]
+                start_rows, athlete_rows = start_rows_from_trinews_source_rows(source_rows)
+                if not start_rows:
+                    st.warning("No migratable cached start-list rows found in trinews_start_lists.")
+                else:
+                    if athlete_rows:
+                        upsert_athletes_preserve_gender(athlete_rows)
+                    if migrate_clear:
+                        deleted = delete_start_rows_for_races(start_rows)
+                    else:
+                        deleted = 0
+                    start_rows, sl_ath_ins, sl_ath_upd, sl_prop = sync_athlete_master_import(start_rows, athlete_rows)
+                    if migrate_clear:
+                        insert_chunks("start_lists", start_rows)
+                        inserted = len(start_rows)
+                        skipped = 0
+                    else:
+                        inserted, skipped = merge_start_list_rows(start_rows)
+                    clear_cache()
+                    st.success(
+                        f"Migrated {inserted:,} start-list rows from {len(source_rows):,} cached source rows. "
+                        f"Skipped existing rows: {skipped:,}. Deleted app rows for migrated races: {deleted:,}. "
+                        f"Athlete updates: {sl_ath_ins + sl_ath_upd:,}."
+                    )
+                    st.dataframe(pd.DataFrame(start_rows).head(25), width="stretch", hide_index=True)
+            except Exception as e:
+                st.error("Cached start-list migration failed.")
+                st.exception(e)
+            finally:
+                loader.empty()
+
+        st.divider()
         sl1, sl2, sl3 = st.columns(3)
         sl_start = sl1.date_input("Start date", value=date.today(), key="trinews_sl_start")
         sl_end = sl2.date_input("End date", value=date.today() + timedelta(days=180), key="trinews_sl_end")
@@ -6917,11 +7020,6 @@ elif page == "Model Cache":
                 st.warning("No scoring pool rows found in the selected date window.")
                 st.stop()
             st.info(f"Loaded {len(results):,} scoring-pool rows for rebuild.")
-            if pool_count and len(results) < int(pool_count * 0.90):
-                st.warning(
-                    f"Only loaded {len(results):,} of {pool_count:,} scoring-pool rows. "
-                    "Check the selected as-of date/lookback window before rebuilding."
-                )
             loader = loading_card("Building athlete scorecards", "Computing and saving scorecards in small batches...")
             try:
                 logs = rebuild_athlete_scorecards_batched(

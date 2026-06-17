@@ -44,6 +44,8 @@ PROFILES = [
 ]
 DISCIPLINES = ["overall", "swim", "bike", "run"]
 
+MODEL_ENGINE_VERSION = "score_engine_v6_reliability_prior"
+
 DEFAULT_LOOKBACK_DAYS = 365
 FULL_IM_LOOKBACK_DAYS = 730
 ALL_LOOKBACK_DAYS = 730
@@ -467,6 +469,10 @@ def _prep_results(results: pd.DataFrame) -> pd.DataFrame:
 def _confidence(evidence_count: int, premium_count: int, strong_count: int) -> str:
     if evidence_count <= 0:
         return "No eligible scorecard evidence"
+    if evidence_count == 1 and (premium_count >= 1 or strong_count >= 1):
+        return "High ceiling - low sample"
+    if evidence_count == 1:
+        return "Low sample - 1 race"
     if premium_count >= 1 and evidence_count >= 3:
         return "Good - premium proof"
     if strong_count >= 2:
@@ -475,7 +481,53 @@ def _confidence(evidence_count: int, premium_count: int, strong_count: int) -> s
         return "Medium - 1 strong race"
     if evidence_count >= 3:
         return "Low - volume but weak evidence"
-    return f"Low - {evidence_count} race" if evidence_count == 1 else f"Medium - {evidence_count} races"
+    return f"Medium - {evidence_count} races"
+
+
+def _reliability_weight(evidence_count: int, premium_count: int, strong_count: int, prior_available: bool = False) -> float:
+    """How much the ranking should trust the recent/profile-specific score.
+
+    A single great race should keep a high performance ceiling, but the ranking
+    score should be blended with a prior unless the athlete has repeated proof.
+    Strong/premium evidence earns a small bump; a usable prior lets elite
+    short-course or historical evidence support a thin recent long-course sample.
+    """
+    n = max(0, int(evidence_count or 0))
+    if n <= 0:
+        return 0.0
+    base = {1: 0.55, 2: 0.72, 3: 0.88, 4: 0.96}.get(n, 1.00)
+    if strong_count >= 1:
+        base += 0.04
+    if premium_count >= 1:
+        base += 0.03
+    if prior_available and n <= 2:
+        # A real prior gives us confidence that a small sample is not random.
+        base += 0.04
+    return float(max(0.0, min(base, 1.0)))
+
+
+def _baseline_prior_score(discipline: str, profile: str) -> float:
+    """Conservative prior used when no cross-profile or historical proof exists."""
+    if discipline == "run":
+        return 60.0
+    if discipline == "swim":
+        return 58.0
+    if discipline == "bike":
+        return 56.0
+    return 58.0
+
+
+def _prior_score_map(work: pd.DataFrame, top_n: int) -> Dict[str, Tuple[float, int]]:
+    """Return athlete_key -> (prior score, evidence count) from backup evidence rows."""
+    if work is None or work.empty or "score_value" not in work.columns:
+        return {}
+    out: Dict[str, Tuple[float, int]] = {}
+    for key, g in work.groupby("athlete_key", sort=False):
+        vals = pd.to_numeric(g.sort_values(["score_value", "race_date"], ascending=[False, False])["score_value"], errors="coerce")
+        vals = [float(x) for x in vals.dropna().head(int(top_n)) if float(x) > 0]
+        if vals:
+            out[str(key)] = (float(np.mean(vals)), int(len(vals)))
+    return out
 
 
 def _quality_flags(rows: pd.DataFrame, profile: str, discipline: str) -> Tuple[pd.Series, pd.Series]:
@@ -495,20 +547,13 @@ def _quality_flags(rows: pd.DataFrame, profile: str, discipline: str) -> Tuple[p
 # Scorecard builders
 # ---------------------------------------------------------------------------
 
-def _build_overall_cards(
-    df: pd.DataFrame,
-    gender: str,
-    profile: str,
-    as_of: pd.Timestamp,
-    model_version: str,
-    top_n: int,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Overall scorecard: ORS adjusted by recency and race relevance."""
+def _overall_score_rows(df: pd.DataFrame, profile: str, as_of: pd.Timestamp) -> pd.DataFrame:
+    """Return scored overall rows before athlete grouping."""
     if df.empty or "ors" not in df.columns:
-        return [], []
+        return pd.DataFrame()
     work = df[df["ors"].notna() & (df["ors"] > 0) & (~df["bad_status"])].copy()
     if work.empty:
-        return [], []
+        return pd.DataFrame()
 
     race_txt = _race_text(work)
     recency_vals = work["race_date"].map(lambda rd: _recency_factor(rd, as_of))
@@ -519,14 +564,30 @@ def _build_overall_cards(
 
     adjusted = (work["ors"].astype(float) * recency_vals * relevance_vals).clip(upper=100)
 
-    work["score_value"]     = adjusted.round(4)
-    work["recency_factor"]  = recency_vals.round(3)
+    work["score_value"]      = adjusted.round(4)
+    work["recency_factor"]   = recency_vals.round(3)
     work["relevance_factor"] = relevance_vals.round(3)
 
     premium, strong = _quality_flags(work, profile, "overall")
     work["premium_evidence"] = premium
     work["strong_evidence"]  = strong
-    return _group_top_scores(work, gender, profile, "overall", as_of, model_version, top_n)
+    return work[work["score_value"] > 0].copy()
+
+
+def _build_overall_cards(
+    df: pd.DataFrame,
+    gender: str,
+    profile: str,
+    as_of: pd.Timestamp,
+    model_version: str,
+    top_n: int,
+    prior_scores: Optional[Dict[str, Tuple[float, int]]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Overall scorecard: ORS adjusted by recency and race relevance."""
+    work = _overall_score_rows(df, profile, as_of)
+    if work.empty:
+        return [], []
+    return _group_top_scores(work, gender, profile, "overall", as_of, model_version, top_n, prior_scores=prior_scores)
 
 
 def _split_score_rows(
@@ -600,11 +661,12 @@ def _build_split_cards(
     as_of: pd.Timestamp,
     model_version: str,
     top_n: int,
+    prior_scores: Optional[Dict[str, Tuple[float, int]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     work = _split_score_rows(df, discipline, profile, as_of)
     if work.empty:
         return [], []
-    return _group_top_scores(work, gender, profile, discipline, as_of, model_version, top_n)
+    return _group_top_scores(work, gender, profile, discipline, as_of, model_version, top_n, prior_scores=prior_scores)
 
 
 def _group_top_scores(
@@ -615,6 +677,7 @@ def _group_top_scores(
     as_of: pd.Timestamp,
     model_version: str,
     top_n: int,
+    prior_scores: Optional[Dict[str, Tuple[float, int]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     score_rows: List[Dict[str, Any]] = []
     evidence_rows: List[Dict[str, Any]] = []
@@ -632,7 +695,8 @@ def _group_top_scores(
         if not scores:
             continue
 
-        score        = float(np.mean(scores))
+        performance_score = float(np.mean(scores))
+        athlete_key  = str(top["athlete_key"].iloc[0])
         athlete_url  = _canonical_url(top["athlete_url"].dropna().iloc[0]) if top["athlete_url"].dropna().size else ""
         athlete_name = (_clean(top["athlete_name"].dropna().iloc[0]) if top["athlete_name"].dropna().size
                         else _clean(top["athlete_key"].iloc[0]))
@@ -648,27 +712,56 @@ def _group_top_scores(
         confidence    = _confidence(len(scores), premium_count, strong_count)
         last_race_date = _iso_date(last.get("race_date"))
 
+        prior_available = False
+        prior_evidence_count = 0
+        prior_score = None
+        if prior_scores and athlete_key in prior_scores:
+            prior_score, prior_evidence_count = prior_scores[athlete_key]
+            prior_available = True
+        if prior_score is None:
+            prior_score = _baseline_prior_score(discipline, profile)
+        reliability_weight = _reliability_weight(len(scores), premium_count, strong_count, prior_available)
+        # The saved score is now the ranking score. The raw payload keeps the
+        # unadjusted performance/ceiling score for explanation.
+        score = (performance_score * reliability_weight) + (float(prior_score) * (1.0 - reliability_weight))
+        score = float(max(0.0, min(score, 100.0)))
+
         # Build the raw explainability payload
         raw: Dict[str, Any] = {
             "best_scores_used":       [round(x, 2) for x in scores],
+            "performance_score":       round(performance_score, 4),
+            "ranking_score":           round(score, 4),
+            "prior_score":             round(float(prior_score), 4),
+            "prior_available":         bool(prior_available),
+            "prior_evidence_count":    int(prior_evidence_count),
+            "reliability_weight":      round(float(reliability_weight), 4),
             "premium_evidence_count": premium_count,
             "strong_evidence_count":  strong_count,
             "evidence_count":         len(scores),
+            "ranking_method": "performance_score × reliability_weight + prior_score × (1 - reliability_weight)",
         }
         if discipline != "overall":
             raw.update({
                 "OpenRank Split Score":   round(score, 2),
+                "Performance Split Score": round(performance_score, 2),
+                "Prior Score":            round(float(prior_score), 2),
+                "Reliability Weight":     round(float(reliability_weight), 2),
                 "Best Split Scores Used": ", ".join(f"{x:.1f}" for x in scores),
                 "Premium Evidence Count": premium_count,
                 "Strong Evidence Count":  strong_count,
                 "Evidence Count":         len(scores),
+                "Prior Evidence Count":   int(prior_evidence_count),
                 "Last Rank":              _clean(last.get("split_rank_display")),
                 "Best Recent Split":      _clean(last.get("split_text")),
             })
         else:
             raw.update({
-                "OpenRank Score":   round(score, 2),
-                "Best Scores Used": ", ".join(f"{x:.1f}" for x in scores),
+                "OpenRank Score":          round(score, 2),
+                "Performance Score":       round(performance_score, 2),
+                "Prior Score":             round(float(prior_score), 2),
+                "Reliability Weight":      round(float(reliability_weight), 2),
+                "Best Scores Used":        ", ".join(f"{x:.1f}" for x in scores),
+                "Prior Evidence Count":    int(prior_evidence_count),
             })
 
         score_rows.append({
@@ -689,7 +782,7 @@ def _group_top_scores(
             "confidence":          confidence,
             "last_race_name":      _clean(last.get("race_name")),
             "last_race_date":      last_race_date,
-            "computed_source":     f"score_engine_v5 · {gender} · {profile} · {discipline} · top {top_n}",
+            "computed_source":     f"score_engine_v6 · reliability-prior · {gender} · {profile} · {discipline} · top {top_n}",
             "raw":                 _json_row(raw),
         })
 
@@ -786,14 +879,33 @@ def build_scorecard_slice(
         & _profile_mask(gdf_base, profile)
     ].copy()
 
+    prior_scores: Dict[str, Tuple[float, int]] = {}
+    if profile != "All" and not gdf_base.empty:
+        prior_window_start = as_of - pd.Timedelta(days=ALL_LOOKBACK_DAYS)
+        prior_pdf = gdf_base[
+            gdf_base["race_date"].notna()
+            & (gdf_base["race_date"] >= prior_window_start)
+            & (gdf_base["race_date"] <= as_of)
+        ].copy()
+        # Remove the current profile/recent evidence rows so the prior is true
+        # backup evidence: older same-profile or cross-profile transfer proof.
+        if not pdf.empty:
+            prior_pdf = prior_pdf.drop(index=pdf.index, errors="ignore")
+        if not prior_pdf.empty:
+            if discipline == "overall":
+                prior_work = _overall_score_rows(prior_pdf, "All", as_of)
+            else:
+                prior_work = _split_score_rows(prior_pdf, discipline, "All", as_of)
+            prior_scores = _prior_score_map(prior_work, top_n)
+
     try:
         if discipline == "overall":
             candidate_rows = int(pd.to_numeric(pdf.get("ors", pd.Series(dtype=object)), errors="coerce").gt(0).sum())
-            cards, evidence = _build_overall_cards(pdf, gender, profile, as_of, model_version, top_n)
+            cards, evidence = _build_overall_cards(pdf, gender, profile, as_of, model_version, top_n, prior_scores=prior_scores)
         else:
             split_col      = f"{discipline}_seconds"
             candidate_rows = int(pd.to_numeric(pdf.get(split_col, pd.Series(dtype=object)), errors="coerce").gt(0).sum())
-            cards, evidence = _build_split_cards(pdf, gender, profile, discipline, as_of, model_version, top_n)
+            cards, evidence = _build_split_cards(pdf, gender, profile, discipline, as_of, model_version, top_n, prior_scores=prior_scores)
         status = "ok"
     except Exception as exc:
         candidate_rows  = 0
@@ -808,6 +920,7 @@ def build_scorecard_slice(
         "Candidate Score Rows": int(candidate_rows),
         "Scorecard Rows":       int(len(cards)),
         "Evidence Rows":        int(len(evidence)),
+        "Prior Athletes":       int(len(prior_scores)),
         "Lookback Days":        int(lookback),
         "Status":               status,
     }
