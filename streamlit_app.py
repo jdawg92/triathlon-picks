@@ -29,6 +29,8 @@ try:
         build_races_sync_page,
         build_results_sync_for_races,
         build_start_lists_sync_page,
+        result_to_pick_rows,
+        athlete_master_row_from_api,
     )
 except Exception as _trinews_api_import_error:
     build_clean_results_refresh = None
@@ -38,6 +40,8 @@ except Exception as _trinews_api_import_error:
     build_races_sync_page = None
     build_results_sync_for_races = None
     build_start_lists_sync_page = None
+    result_to_pick_rows = None
+    athlete_master_row_from_api = None
     TRINEWS_API_IMPORT_ERROR = _trinews_api_import_error
 else:
     TRINEWS_API_IMPORT_ERROR = None
@@ -5496,6 +5500,158 @@ elif page == "Import CSVs":
             deleted += delete_rows_in_batches("start_lists", [("race_name", race_name), ("race_date", race_date)])
         return deleted
 
+    def _source_raw_dict(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _source_race_to_api(row: Dict[str, Any]) -> Dict[str, Any]:
+        raw = _source_raw_dict(row.get("raw"))
+        if raw.get("id"):
+            return raw
+        return {
+            "id": clean_str(row.get("id")),
+            "name": clean_str(row.get("name")),
+            "slug": clean_str(row.get("slug")),
+            "date": clean_str(row.get("race_date")),
+            "distance_category": clean_str(row.get("distance_category")),
+            "tier": clean_str(row.get("tier")),
+            "brand": clean_str(row.get("brand")),
+            "circuit": clean_str(row.get("circuit")),
+            "organization": clean_str(row.get("organization")),
+            "venue": clean_str(row.get("venue")),
+            "country_name": clean_str(row.get("country_name")),
+            "country_iso2": clean_str(row.get("country_iso2")),
+            "strength_of_field": row.get("strength_of_field"),
+            "difficulty_score": row.get("difficulty_score"),
+            "has_results": row.get("has_results"),
+        }
+
+    def _source_athlete_to_api(row: Dict[str, Any]) -> Dict[str, Any]:
+        raw = _source_raw_dict(row.get("raw"))
+        if raw.get("id"):
+            return raw
+        return {
+            "id": clean_str(row.get("id")),
+            "full_name": clean_str(row.get("full_name") or row.get("athlete_name")),
+            "slug": clean_str(row.get("slug") or row.get("athlete_slug")),
+            "gender": clean_str(row.get("gender")),
+            "country_name": clean_str(row.get("country_name")),
+            "country_iso2": clean_str(row.get("country_iso2")),
+            "country_iso3": clean_str(row.get("country_iso3")),
+            "photo_url": clean_str(row.get("photo_url")),
+            "is_pro": row.get("is_pro"),
+        }
+
+    def _source_result_to_api(row: Dict[str, Any]) -> Dict[str, Any]:
+        raw = _source_raw_dict(row.get("raw"))
+        if raw.get("id"):
+            return raw
+        points = {}
+        if row_has_value(row.get("openrank")):
+            points["openrank"] = row.get("openrank")
+        if row_has_value(row.get("pto_points")):
+            points["pto"] = row.get("pto_points")
+        if row_has_value(row.get("t100_points")):
+            points["t100"] = row.get("t100_points")
+        return {
+            "id": clean_str(row.get("id")),
+            "race_id": clean_str(row.get("race_id")),
+            "athlete_id": clean_str(row.get("athlete_id")),
+            "program_name": clean_str(row.get("program_name")),
+            "placement": row.get("placement"),
+            "status": clean_str(row.get("status")),
+            "finish_time": clean_str(row.get("finish_time")),
+            "swim_time": clean_str(row.get("swim_time")),
+            "bike_time": clean_str(row.get("bike_time")),
+            "run_time": clean_str(row.get("run_time")),
+            "swim_rank": row.get("swim_rank"),
+            "bike_rank": row.get("bike_rank"),
+            "run_rank": row.get("run_rank"),
+            "source": clean_str(row.get("source")),
+            "updated_at": clean_str(row.get("updated_at")),
+            "points": points,
+        }
+
+    def _fetch_source_rows_by_ids(table_name: str, ids: List[str], id_col: str = "id", chunk_size: int = 500) -> Dict[str, Dict[str, Any]]:
+        clean_ids = sorted({clean_str(x) for x in ids if clean_str(x)})
+        out: Dict[str, Dict[str, Any]] = {}
+        for i in range(0, len(clean_ids), chunk_size):
+            chunk = clean_ids[i:i + chunk_size]
+            try:
+                rows = supabase.table(table_name).select("*").in_(id_col, chunk).execute().data or []
+            except Exception:
+                rows = []
+            for row in rows:
+                key = clean_str(row.get(id_col))
+                if key:
+                    out[key] = row
+        return out
+
+    def load_trinews_results_batch(offset: int, limit: int) -> List[Dict[str, Any]]:
+        return supabase.table("trinews_results").select("*").order("race_date", desc=True).range(int(offset), int(offset) + int(limit) - 1).execute().data or []
+
+    def build_app_rows_from_cached_trinews_results(source_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
+        if result_to_pick_rows is None:
+            raise RuntimeError(f"trinews_api_refresh.py conversion helpers could not be imported: {TRINEWS_API_IMPORT_ERROR}")
+        race_ids = [clean_str(r.get("race_id")) for r in source_rows if clean_str(r.get("race_id"))]
+        athlete_ids = [clean_str(r.get("athlete_id")) for r in source_rows if clean_str(r.get("athlete_id"))]
+        race_source_map = _fetch_source_rows_by_ids("trinews_races", race_ids)
+        athlete_source_map = _fetch_source_rows_by_ids("trinews_athletes", athlete_ids)
+
+        app_rows: List[Dict[str, Any]] = []
+        athlete_rows: List[Dict[str, Any]] = []
+        missing_race = 0
+        missing_athlete = 0
+        skipped = 0
+        for src in source_rows:
+            rid = clean_str(src.get("race_id"))
+            aid = clean_str(src.get("athlete_id"))
+            race_src = race_source_map.get(rid) or {}
+            athlete_src = athlete_source_map.get(aid) or {}
+            if not race_src:
+                missing_race += 1
+            if not athlete_src:
+                missing_athlete += 1
+            api_result = _source_result_to_api(src)
+            api_race = _source_race_to_api(race_src) if race_src else {
+                "id": rid,
+                "name": clean_str(src.get("race_name")),
+                "slug": clean_str(src.get("race_slug")),
+                "date": clean_str(src.get("race_date")),
+            }
+            api_athlete = _source_athlete_to_api(athlete_src) if athlete_src else {
+                "id": aid,
+                "full_name": clean_str(src.get("athlete_name")),
+                "slug": clean_str(src.get("athlete_slug")),
+                "gender": clean_str(src.get("gender")),
+            }
+            row = result_to_pick_rows(api_result, api_race, api_athlete)
+            if clean_str(row.get("athlete_name")) and clean_str(row.get("race_name")) and clean_str(row.get("athlete_url")):
+                app_rows.append(row)
+                if athlete_master_row_from_api is not None:
+                    athlete_rows.append(athlete_master_row_from_api(api_athlete))
+            else:
+                skipped += 1
+
+        app_rows = dedupe_result_rows(app_rows)
+        athlete_rows = athlete_upsert_rows_preserve_gender(athlete_rows)
+        stats = {
+            "source_rows": len(source_rows),
+            "app_rows_ready": len(app_rows),
+            "athlete_rows_ready": len(athlete_rows),
+            "missing_race_metadata": missing_race,
+            "missing_athlete_metadata": missing_athlete,
+            "skipped": skipped,
+        }
+        return app_rows, list(app_rows), athlete_rows, stats
+
     tabs = st.tabs(["Test pulls", "Sync athletes", "Sync races", "Sync results", "Sync start lists", "Coverage"])
 
     with tabs[0]:
@@ -5746,6 +5902,47 @@ elif page == "Import CSVs":
                         st.caption(" | ".join(source_writes))
                     else:
                         st.success("Preview complete. No data was written.")
+
+
+
+        st.divider()
+        section_title("📤", "Publish cached results")
+        st.caption("Use this after source results exist in trinews_results. It copies cached TriNews results into the prediction tables used by the dashboard and scorecards.")
+        pc1, pc2, pc3 = st.columns(3)
+        publish_offset = pc1.number_input("Cached result offset", min_value=0, value=0, step=1000, key="publish_cached_results_offset")
+        publish_limit = pc2.number_input("Cached result rows", min_value=10, max_value=10000, value=1000, step=500, key="publish_cached_results_limit")
+        publish_mode = pc3.radio("Publish mode", ["Preview", "Write"], horizontal=True, key="publish_cached_results_mode")
+        if st.button("Publish cached results to app tables", type="primary", key="publish_cached_results_to_app_tables"):
+            try:
+                cached_rows = load_trinews_results_batch(int(publish_offset), int(publish_limit))
+            except Exception as e:
+                st.error("Could not read trinews_results. Run the source-cache SQL and sync results first.")
+                st.exception(e)
+                cached_rows = []
+            if cached_rows:
+                app_rows, race_field_rows, athlete_rows, stats = build_app_rows_from_cached_trinews_results(cached_rows)
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Cached rows", f"{stats.get('source_rows', 0):,}")
+                c2.metric("Ready for app", f"{stats.get('app_rows_ready', 0):,}")
+                c3.metric("Missing race meta", f"{stats.get('missing_race_metadata', 0):,}")
+                c4.metric("Missing athlete meta", f"{stats.get('missing_athlete_metadata', 0):,}")
+                sample = pd.DataFrame(app_rows[:25])
+                if not sample.empty:
+                    cols = [col for col in ["athlete_name", "gender", "race_date", "race_name", "race_type", "place", "sof", "ors", "swim_seconds", "bike_seconds", "run_seconds", "status"] if col in sample.columns]
+                    st.dataframe(sample[cols], width="stretch", hide_index=True)
+                if publish_mode == "Write":
+                    app_rows, a_ins, a_upd, a_prop = sync_athlete_master_import(app_rows, athlete_rows)
+                    race_field_rows, rf_ins, rf_upd, rf_prop = sync_athlete_master_import(race_field_rows, athlete_rows)
+                    ar_inserted, ar_skipped, ar_updated = merge_result_rows("athlete_results", app_rows)
+                    rf_inserted, rf_skipped, rf_updated = merge_result_rows("race_field_results", race_field_rows)
+                    clear_cache()
+                    st.success(
+                        f"Published cached results. athlete_results inserted {ar_inserted:,}, updated {ar_updated:,}; "
+                        f"race_field_results inserted {rf_inserted:,}, updated {rf_updated:,}."
+                    )
+                    st.caption(f"Athlete master upserts: {a_ins + rf_ins:,}; athlete updates: {a_upd + rf_upd:,}; gender propagated: {a_prop + rf_prop:,}.")
+                else:
+                    st.success("Preview complete. No app tables were changed.")
 
     with tabs[4]:
         section_title("📋", "Sync start lists")
