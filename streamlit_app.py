@@ -1475,6 +1475,96 @@ def fetch_scoring_pool_for_gender_window(
     return pd.DataFrame(all_rows)
 
 
+def fetch_scoring_pool_for_startlist_context(
+    as_of_date: Any,
+    gender: str,
+    start_athletes: pd.DataFrame,
+    lookback_days: int = MAX_SCORECARD_POOL_LOOKBACK_DAYS,
+    page_size: int = 1000,
+) -> pd.DataFrame:
+    """Load selected athletes plus their same-race rows for fast test rebuilds."""
+    if start_athletes is None or start_athletes.empty:
+        return pd.DataFrame()
+
+    as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
+    if pd.isna(as_of_ts):
+        as_of_ts = pd.Timestamp.today().normalize()
+    cutoff = (as_of_ts - pd.Timedelta(days=int(lookback_days or MAX_SCORECARD_POOL_LOOKBACK_DAYS))).strftime("%Y-%m-%d")
+    as_of_label = as_of_ts.strftime("%Y-%m-%d")
+    gender_norm = normalize_gender(gender) or gender
+    page_size = max(100, min(int(page_size), 1000))
+
+    urls = sorted({
+        canonical_athlete_url(r.get("athlete_url")) or clean_str(r.get("athlete_url"))
+        for _, r in start_athletes.iterrows()
+        if clean_str(r.get("athlete_url"))
+    })
+    names = sorted({
+        clean_str(r.get("athlete_name"))
+        for _, r in start_athletes.iterrows()
+        if clean_str(r.get("athlete_name"))
+    })
+
+    def fetch_query(make_query) -> List[Dict[str, Any]]:
+        rows_out: List[Dict[str, Any]] = []
+        start = 0
+        while True:
+            end = start + page_size - 1
+            res = make_query().range(start, end).execute()
+            rows = res.data or []
+            rows_out.extend(rows)
+            if len(rows) < page_size:
+                break
+            start += page_size
+        return rows_out
+
+    def base_query():
+        q = (
+            supabase.table("scoring_result_pool")
+            .select(SCORING_POOL_SCORECARD_COLUMNS)
+            .gte("race_date", cutoff)
+            .lte("race_date", as_of_label)
+            .order("race_date", desc=False)
+        )
+        if gender_norm:
+            q = q.eq("gender", gender_norm)
+        return q
+
+    selected_rows: List[Dict[str, Any]] = []
+    for vals, col in [(urls, "athlete_url"), (names, "athlete_name")]:
+        for i in range(0, len(vals), 100):
+            chunk = vals[i:i + 100]
+            if not chunk:
+                continue
+            selected_rows.extend(fetch_query(lambda c=chunk, column=col: base_query().in_(column, c)))
+
+    selected_df = pd.DataFrame(selected_rows)
+    if selected_df.empty:
+        return selected_df
+
+    race_names = sorted({
+        clean_str(x)
+        for x in selected_df.get("race_name", pd.Series(dtype=object)).dropna().tolist()
+        if clean_str(x)
+    })
+    context_rows: List[Dict[str, Any]] = []
+    for i in range(0, len(race_names), 50):
+        chunk = race_names[i:i + 50]
+        if not chunk:
+            continue
+        context_rows.extend(fetch_query(lambda c=chunk: base_query().in_("race_name", c)))
+
+    combined = pd.DataFrame(selected_rows + context_rows)
+    if combined.empty:
+        return selected_df
+    dedupe_cols = [c for c in ["id", "athlete_url", "athlete_name", "race_name", "race_date", "gender"] if c in combined.columns]
+    if dedupe_cols:
+        combined = combined.drop_duplicates(subset=dedupe_cols, keep="first")
+    else:
+        combined = combined.drop_duplicates(keep="first")
+    return combined.reset_index(drop=True)
+
+
 def fetch_all_filtered(table_name: str, filters: Tuple[Tuple[str, Any], ...], select: str = "*", page_size: int = 1000) -> List[Dict[str, Any]]:
     """Fetch rows with simple equality filters using pagination.
 
@@ -4937,6 +5027,58 @@ def _rank_scorecard_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _startlist_mask_for_prepped_results(prep_df: pd.DataFrame, start_athletes: pd.DataFrame) -> pd.Series:
+    if prep_df is None or prep_df.empty:
+        return pd.Series([], dtype=bool)
+    urls, names, _ = _startlist_identity_sets(start_athletes)
+    urls = {canonical_athlete_url(u) or clean_str(u) for u in urls if clean_str(u)}
+    names = {clean_str(n).lower() for n in names if clean_str(n)}
+    url_ser = prep_df.get("athlete_url", pd.Series(index=prep_df.index, dtype=object)).map(lambda x: canonical_athlete_url(x) or clean_str(x))
+    name_ser = prep_df.get("athlete_name", pd.Series(index=prep_df.index, dtype=object)).fillna("").astype(str).str.lower()
+    key_ser = prep_df.get("athlete_key", pd.Series(index=prep_df.index, dtype=object)).fillna("").astype(str).str.lower()
+    return url_ser.isin(urls) | name_ser.isin(names) | key_ser.isin(urls) | key_ser.isin(names)
+
+
+def _score_engine_race_key(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series([], dtype=str)
+    dates = pd.to_datetime(df.get("race_date", pd.Series(index=df.index, dtype=object)), errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    names = df.get("race_name", pd.Series(index=df.index, dtype=object)).fillna("").astype(str)
+    genders = df.get("gender", pd.Series(index=df.index, dtype=object)).fillna("").astype(str)
+    return dates + "|" + names + "|" + genders
+
+
+def _scoped_prep_for_startlist_discipline(
+    prep_df: pd.DataFrame,
+    start_athletes: pd.DataFrame,
+    discipline: str,
+) -> pd.DataFrame:
+    """Reduce score-engine input to selected athletes plus needed split context."""
+    if prep_df is None or prep_df.empty:
+        return pd.DataFrame()
+    start_mask = _startlist_mask_for_prepped_results(prep_df, start_athletes)
+    start_rows = prep_df[start_mask].copy()
+    if start_rows.empty:
+        return start_rows
+
+    if discipline == "overall":
+        return start_rows
+
+    split_col = f"{discipline}_seconds"
+    if split_col not in prep_df.columns:
+        return start_rows
+
+    start_split_rows = start_rows[pd.to_numeric(start_rows[split_col], errors="coerce").gt(0)].copy()
+    if start_split_rows.empty:
+        return start_rows
+
+    needed_races = set(_score_engine_race_key(start_split_rows).dropna().astype(str).tolist())
+    race_context = prep_df[_score_engine_race_key(prep_df).isin(needed_races)].copy()
+    scoped = pd.concat([start_rows, race_context], ignore_index=False, sort=False)
+    scoped = scoped.loc[~scoped.index.duplicated(keep="first")].copy()
+    return scoped
+
+
 def _delete_scorecard_rows_for_athletes(
     gender: str,
     profile: str,
@@ -5014,8 +5156,9 @@ def rebuild_startlist_scorecards_for_testing(
 
     for idx, discipline in enumerate(SCORE_ENGINE_DISCIPLINES, start=1):
         progress.progress(0.10 + 0.75 * ((idx - 1) / max(len(SCORE_ENGINE_DISCIPLINES), 1)), text=f"Building {discipline} scorecards for selected start list...")
+        scoped_prep_df = _scoped_prep_for_startlist_discipline(prep_df, start_athletes, discipline)
         cards, evidence, log = build_scorecard_slice(
-            prep_df=prep_df,
+            prep_df=scoped_prep_df,
             gender=gender_norm,
             profile=profile,
             discipline=discipline,
@@ -5036,6 +5179,7 @@ def rebuild_startlist_scorecards_for_testing(
             insert_chunks("athlete_scorecard_evidence", evidence_rows, chunk_size=500)
 
         log["Model Version"] = MODEL_CACHE_VERSION
+        log["Input Rows"] = int(len(scoped_prep_df))
         log["Saved Scorecards"] = len(card_rows)
         log["Saved Evidence Rows"] = len(evidence_rows)
         log["Rebuild Scope"] = "selected start list"
@@ -7738,19 +7882,29 @@ elif page == "Model Cache":
             if test_start.empty:
                 st.warning("Selected start list has no athletes.")
                 st.stop()
-            loader = loading_card("Loading scoped scoring pool", f"Fetching {test_gender} rows for the recent model window...")
+            loader = loading_card("Loading scoped scoring pool", "Fetching selected athletes and same-race split context...")
             try:
-                scoped_pool = fetch_scoring_pool_for_gender_window(
-                    rebuild_date,
-                    gender=test_gender,
-                    lookback_days=MAX_SCORECARD_POOL_LOOKBACK_DAYS,
-                )
+                try:
+                    scoped_pool = fetch_scoring_pool_for_startlist_context(
+                        rebuild_date,
+                        gender=test_gender,
+                        start_athletes=test_start,
+                        lookback_days=MAX_SCORECARD_POOL_LOOKBACK_DAYS,
+                    )
+                    fetch_scope = "selected athletes + same-race context"
+                except Exception:
+                    scoped_pool = fetch_scoring_pool_for_gender_window(
+                        rebuild_date,
+                        gender=test_gender,
+                        lookback_days=MAX_SCORECARD_POOL_LOOKBACK_DAYS,
+                    )
+                    fetch_scope = "gender window fallback"
             finally:
                 loader.empty()
             if scoped_pool.empty:
                 st.warning("No scoring-pool rows found for this gender/date window.")
                 st.stop()
-            st.info(f"Loaded {len(scoped_pool):,} {test_gender} scoring-pool rows for the scoped test rebuild.")
+            st.info(f"Loaded {len(scoped_pool):,} scoring-pool rows via {fetch_scope}, then reduced each discipline to the selected athletes plus needed same-race split context.")
             loader = loading_card("Building scoped scorecards", "Replacing selected start-list athletes only...")
             try:
                 logs = rebuild_startlist_scorecards_for_testing(
@@ -7766,7 +7920,7 @@ elif page == "Model Cache":
             st.success("Finished selected-race scorecard rebuild.")
             display_table(
                 logs,
-                ["Gender", "Profile", "Discipline", "Rows After Profile", "Candidate Score Rows", "Saved Scorecards", "Saved Evidence Rows", "Status", "Rebuild Scope"],
+                ["Gender", "Profile", "Discipline", "Input Rows", "Rows After Profile", "Candidate Score Rows", "Saved Scorecards", "Saved Evidence Rows", "Status", "Rebuild Scope"],
                 height=300,
             )
             clear_cache()
