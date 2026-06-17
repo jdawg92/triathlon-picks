@@ -4427,6 +4427,436 @@ PAGE_OPTIONS = {label: page_name for _, items in NAV_GROUPS for label, page_name
 if "page_label" not in st.session_state or st.session_state["page_label"] not in PAGE_OPTIONS:
     st.session_state["page_label"] = "🏆 Race Dashboard"
 
+# ============================================================
+# Simplified scorecard predictor overrides
+# ============================================================
+# The predictor now works from durable athlete scorecards:
+#   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
+# A selected start list simply joins to those scorecards and displays them.
+MODEL_CACHE_VERSION = "scorecard_simple_v1"
+TOP_SCORES_USED = 5
+LOW_SAMPLE_WARNING_THRESHOLD = 5
+STRONG_SOF_THRESHOLD = 65.0
+RANKING_FAMILIES = ["Long Course / 70.3 + T100", "Short Course / WTCS", "Full IRONMAN", "All"]
+
+
+def scorecard_profile_from_race(race_name: Any, race_type: Any = None, distance: Any = None) -> str:
+    """Map a selected race to the scorecard profile that should feed predictions."""
+    rt = normalize_race_type(race_name, race_type, distance)
+    txt = " ".join([clean_str(race_name) or "", clean_str(race_type) or "", clean_str(distance) or ""]).lower()
+    if rt in {"WTCS", "World Triathlon Cup", "Continental Cup", "Olympic", "Sprint"}:
+        return "Short Course / WTCS"
+    if any(x in txt for x in ["wtcs", "world triathlon", "olympic", "sprint", "triathlon cup"]):
+        return "Short Course / WTCS"
+    if rt == "Full" or ("ironman" in txt and "70.3" not in txt and "t100" not in txt and "pto" not in txt):
+        return "Full IRONMAN"
+    # Treat 70.3 and T100 as the same long-course race-speed problem.
+    return "Long Course / 70.3 + T100"
+
+
+def prediction_scope_from_race(race_name: Any, race_type: Any = None, distance: Any = None) -> str:
+    return scorecard_profile_from_race(race_name, race_type, distance)
+
+
+def ranking_scope_mask(df: pd.DataFrame, scope: str) -> pd.Series:
+    """Return a boolean mask for the selected scorecard profile."""
+    if df is None or df.empty:
+        return pd.Series([], dtype=bool)
+    rt = df.get("race_type", pd.Series([None] * len(df), index=df.index)).map(lambda x: (clean_str(x) or "").lower())
+    race = df.get("race_name", pd.Series([None] * len(df), index=df.index)).map(lambda x: (clean_str(x) or "").lower())
+    dist = df.get("distance", pd.Series([None] * len(df), index=df.index)).map(lambda x: (clean_str(x) or "").lower())
+    txt = (rt + " " + race + " " + dist)
+
+    if scope == "Long Course / 70.3 + T100":
+        # One long-course profile for 70.3 / middle / Challenge / T100 / PTO.
+        # Exclude full IM and short-course development rows.
+        long_middle = txt.str.contains("70.3|middle|challenge|t100|pto", regex=True, na=False)
+        full_only = (txt.str.contains("full|140.6", regex=True, na=False) | (txt.str.contains("ironman", na=False) & ~txt.str.contains("70.3", na=False)))
+        return long_middle & ~full_only
+    if scope == "Full IRONMAN":
+        return txt.str.contains("full|140.6", regex=True, na=False) | ((txt.str.contains("ironman", na=False)) & ~txt.str.contains("70.3", na=False))
+    if scope == "Short Course / WTCS":
+        return short_course_predictor_mask(df)
+    if scope == "All":
+        return pd.Series([True] * len(df), index=df.index)
+    # Backward-compatible aliases if an older cache/control value appears.
+    if scope == "IRONMAN 70.3 / Middle":
+        return txt.str.contains("70.3|middle|challenge", regex=True, na=False) & ~txt.str.contains("t100|pto", regex=True, na=False)
+    if scope == "T100 / PTO":
+        return txt.str.contains("t100|pto", regex=True, na=False)
+    return pd.Series([True] * len(df), index=df.index)
+
+
+def apply_prediction_scope(df: pd.DataFrame, scope: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+    return df[ranking_scope_mask(df, scope)].copy()
+
+
+def _overall_evidence_rows(gg: pd.DataFrame, top_n: int) -> List[Dict[str, Any]]:
+    if gg is None or gg.empty:
+        return []
+    evidence = gg.sort_values("ors_for_rank", ascending=False).head(top_n).copy()
+    rows = []
+    for _, r in evidence.iterrows():
+        rows.append({
+            "Date": format_date(r.get("race_date")),
+            "Race": clean_str(r.get("race_name")),
+            "Race Type": clean_str(r.get("race_type")),
+            "Place": clean_str(r.get("place")),
+            "Status": clean_str(r.get("status")),
+            "ORS": None if safe_float(r.get("ors_for_rank")) is None else round(float(r.get("ors_for_rank")), 2),
+            "SOF": None if safe_float(r.get("sof")) is None else round(float(r.get("sof")), 2),
+        })
+    return rows
+
+
+def _split_evidence_rows(g: pd.DataFrame, top_n: int) -> List[Dict[str, Any]]:
+    if g is None or g.empty:
+        return []
+    evidence = g.sort_values(["split_openrank_score", "race_date"], ascending=[False, False]).head(top_n).copy()
+    rows = []
+    for _, r in evidence.iterrows():
+        rows.append({
+            "Date": format_date(r.get("race_date")),
+            "Race": clean_str(r.get("race_name")),
+            "Race Type": clean_str(r.get("race_type")),
+            "Quality": clean_str(r.get("quality_tier")),
+            "Place": clean_str(r.get("place")),
+            "SOF": None if safe_float(r.get("sof")) is None else round(float(r.get("sof")), 2),
+            "Sample": parse_int(r.get("sample_size")) or parse_int(r.get("field_size")),
+            "Split": clean_str(r.get("split")),
+            "Split Rank": clean_str(r.get("rank_display")) or clean_str(r.get("sample_rank_display")),
+            "% Behind Fastest": None if safe_float(r.get("pct_behind_fastest")) is None else round(float(r.get("pct_behind_fastest")), 2),
+            "Evidence Score": None if safe_float(r.get("split_openrank_score")) is None else round(float(r.get("split_openrank_score")), 2),
+        })
+    return rows
+
+
+# Simple overall score: top X ORS rows inside trailing 52 weeks, padded with zero.
+def score_overall(
+    results: pd.DataFrame,
+    start_athletes: pd.DataFrame,
+    overrides: pd.DataFrame,
+    target_date: pd.Timestamp,
+    target_year: int,
+    top_n: int,
+) -> pd.DataFrame:
+    if results is None or results.empty or start_athletes is None or start_athletes.empty:
+        return pd.DataFrame()
+    start_urls = set(start_athletes.get("athlete_url", pd.Series(dtype=str)).dropna().astype(str).tolist())
+    start_names = set(start_athletes.get("athlete_name", pd.Series(dtype=str)).dropna().astype(str).str.lower().tolist())
+    df = results.copy()
+    window_start = pd.to_datetime(target_date) - pd.Timedelta(days=365)
+    df = df[(df["race_date"].notna()) & (df["race_date"] >= window_start) & (df["race_date"] <= target_date) & (~df["bad_status"])]
+    df = df[(df["athlete_url"].isin(start_urls)) | (df["athlete_name"].fillna("").str.lower().isin(start_names))]
+    df = df[df["ors"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for athlete_key, g in df.groupby(df["athlete_url"].fillna(df["athlete_name"])):
+        scored_rows = []
+        for _, r in g.sort_values("race_date", ascending=False).iterrows():
+            excluded, mult, reason = match_override(r, overrides, "Overall")
+            if excluded:
+                continue
+            rr = r.copy()
+            rr["ors_for_rank"] = (safe_float(r.get("ors")) or 0.0) * mult
+            rr["override_reason"] = reason
+            scored_rows.append(rr)
+        if not scored_rows:
+            continue
+        gg = pd.DataFrame(scored_rows).sort_values("race_date", ascending=False)
+        rank_score_val, best_scores = best4_openrank_average(gg["ors_for_rank"].tolist(), top_n)
+        current_year = gg[gg["race_date"].dt.year == target_year].copy()
+        current_year_values = pd.to_numeric(current_year.get("ors_for_rank", pd.Series(dtype=float)), errors="coerce").dropna().tolist() if not current_year.empty else []
+        current_year_score = float(np.mean(sorted(current_year_values, reverse=True)[:top_n])) if current_year_values else None
+        strong = gg[(gg["sof"].fillna(0) >= STRONG_SOF_THRESHOLD) | (gg["race_type"].isin(["T100", "WTCS"]))]
+        strong_score = pd.to_numeric(strong.get("ors_for_rank", pd.Series(dtype=float)), errors="coerce").mean() if not strong.empty else 0
+        name = g["athlete_name"].dropna().iloc[0] if g["athlete_name"].notna().any() else str(athlete_key)
+        url = g["athlete_url"].dropna().iloc[0] if g["athlete_url"].notna().any() else None
+        last_row = gg.sort_values("race_date", ascending=False).head(1)
+        rows.append({
+            "Athlete": name,
+            "Athlete URL": url,
+            "Score": round(rank_score_val, 1),
+            "OpenRank Score": round(rank_score_val, 1),
+            "Best Scores Used": ", ".join([f"{x:.1f}" for x in best_scores]),
+            "Score Evidence": _overall_evidence_rows(gg, top_n),
+            "Recent Form ORS": round(rank_score_val, 1),
+            "Current Year ORS": round(float(current_year_score), 1) if current_year_score is not None and not pd.isna(current_year_score) else None,
+            "Current Year Races": int(len(current_year)),
+            "Current Year Scored": int(len(current_year_values)),
+            "Best Recent ORS": round(max(best_scores), 1) if best_scores else 0,
+            "Strong Field ORS": round(float(strong_score), 1) if strong_score is not None and not pd.isna(strong_score) else 0,
+            "Recent Races Used": len([x for x in best_scores if x > 0]),
+            "Last Race": clean_str(last_row["race_name"].iloc[0]) if not last_row.empty else "",
+            "Last Race Date": format_date(last_row["race_date"].iloc[0]) if not last_row.empty else "",
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values("Score", ascending=False).reset_index(drop=True)
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    return out
+
+
+# Simple split score: top X discipline-specific split scores inside trailing 52 weeks, padded with zero.
+def score_splits_for_start_list(
+    audit: pd.DataFrame,
+    start_athletes: pd.DataFrame,
+    target_date: pd.Timestamp,
+    top_n: int,
+    strong_sof_threshold: float,
+) -> pd.DataFrame:
+    if audit is None or audit.empty:
+        return pd.DataFrame()
+    start_urls = set(start_athletes.get("athlete_url", pd.Series(dtype=str)).dropna().astype(str).tolist())
+    start_names = set(start_athletes.get("athlete_name", pd.Series(dtype=str)).dropna().astype(str).str.lower().tolist())
+    df = add_split_openrank_scores(audit)
+    df = df[df.get("included", False).astype(bool)].copy()
+    df = df[(df["athlete_url"].isin(start_urls)) | (df["athlete_name"].fillna("").str.lower().isin(start_names))]
+    if df.empty:
+        return pd.DataFrame()
+    discipline = clean_str(df["discipline"].dropna().iloc[0]) if "discipline" in df.columns and df["discipline"].notna().any() else "swim"
+    window_start = pd.to_datetime(target_date) - pd.Timedelta(days=365)
+    df = df[(df["race_date"].notna()) & (df["race_date"] >= window_start) & (df["race_date"] <= target_date)].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    df["premium_evidence"] = df.apply(lambda r: is_premium_split_evidence(r, discipline, strong_sof_threshold), axis=1)
+    df["strong_evidence"] = df.apply(lambda r: is_strong_split_evidence(r, discipline, strong_sof_threshold), axis=1)
+    df["quality_tier"] = df.apply(lambda r: evidence_quality_label(r, discipline, strong_sof_threshold), axis=1)
+
+    rows = []
+    for athlete_key, g in df.groupby(df["athlete_url"].fillna(df["athlete_name"])):
+        g = g.sort_values("race_date", ascending=False).copy()
+        score_values = pd.to_numeric(g.get("split_openrank_score"), errors="coerce").dropna().tolist()
+        openrank_score, best_scores = best4_openrank_average(score_values, top_n)
+        premium = g[g["premium_evidence"].astype(bool)]
+        strong = g[g["strong_evidence"].astype(bool)]
+        evidence_count = len(g)
+        final = float(openrank_score)
+        if evidence_count <= 1:
+            final = min(final, 45)
+            confidence = "Low - 1 race"
+        elif len(premium) >= 2:
+            confidence = "High - repeated premium proof"
+        elif len(premium) == 1:
+            confidence = "Good - 1 premium race"
+        elif len(strong) >= 2:
+            confidence = "Good - repeated strong proof"
+        elif len(strong) == 1:
+            confidence = "Medium - 1 strong race"
+        else:
+            final = min(final, 28)
+            confidence = "Low - weak evidence only"
+        last_row = g.sort_values("race_date", ascending=False).head(1)
+        best_row = g.sort_values(["split_openrank_score", "race_date"], ascending=[False, False]).head(1)
+        rows.append({
+            "Athlete": g["athlete_name"].dropna().iloc[0] if g["athlete_name"].notna().any() else athlete_key,
+            "Athlete URL": g["athlete_url"].dropna().iloc[0] if g["athlete_url"].notna().any() else None,
+            "Score": round(final, 1),
+            "OpenRank Split Score": round(openrank_score, 1),
+            "Best Split Scores Used": ", ".join([f"{x:.1f}" for x in best_scores]),
+            "Score Evidence": _split_evidence_rows(g, top_n),
+            "Confidence": confidence,
+            "Premium Evidence Count": int(len(premium)),
+            "Strong Evidence Count": int(len(strong)),
+            "Evidence Count": int(evidence_count),
+            "Last Race": clean_str(last_row["race_name"].iloc[0]) if not last_row.empty else "",
+            "Last Race Date": format_date(last_row["race_date"].iloc[0]) if not last_row.empty else "",
+            "Last Rank": clean_str(last_row["rank_display"].iloc[0]) if not last_row.empty else "",
+            "Best Recent Split": clean_str(best_row["split"].iloc[0]) if not best_row.empty else "",
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values("Score", ascending=False).reset_index(drop=True)
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    return out
+
+
+def _startlist_identity_sets(start_athletes: pd.DataFrame) -> Tuple[set, set, Dict[str, str]]:
+    if start_athletes is None or start_athletes.empty:
+        return set(), set(), {}
+    urls = set(start_athletes.get("athlete_url", pd.Series(dtype=str)).dropna().astype(str).tolist())
+    names = set(start_athletes.get("athlete_name", pd.Series(dtype=str)).dropna().astype(str).str.lower().tolist())
+    name_by_url = {}
+    for _, r in start_athletes.iterrows():
+        u = clean_str(r.get("athlete_url"))
+        n = clean_str(r.get("athlete_name"))
+        if u and n:
+            name_by_url[u] = n
+    return urls, names, name_by_url
+
+
+def filter_scorecard_to_startlist(scorecard: pd.DataFrame, start_athletes: pd.DataFrame, section: str) -> pd.DataFrame:
+    """Join a global scorecard to the selected start list."""
+    if start_athletes is None or start_athletes.empty:
+        return pd.DataFrame()
+    urls, names, name_by_url = _startlist_identity_sets(start_athletes)
+    if scorecard is None or scorecard.empty:
+        scorecard = pd.DataFrame(columns=["Athlete", "Athlete URL", "Score"])
+    df = scorecard.copy()
+    if "Athlete URL" not in df.columns:
+        df["Athlete URL"] = None
+    if "Athlete" not in df.columns:
+        df["Athlete"] = None
+    mask = df["Athlete URL"].astype(str).isin(urls) | df["Athlete"].fillna("").astype(str).str.lower().isin(names)
+    out = df[mask].copy()
+
+    # Add start-list athletes with no eligible evidence so the missing data is visible.
+    scored_urls = set(out.get("Athlete URL", pd.Series(dtype=str)).dropna().astype(str).tolist())
+    scored_names = set(out.get("Athlete", pd.Series(dtype=str)).dropna().astype(str).str.lower().tolist())
+    missing = []
+    for _, r in start_athletes.iterrows():
+        u = clean_str(r.get("athlete_url"))
+        n = clean_str(r.get("athlete_name"))
+        if (u and u in scored_urls) or (n and n.lower() in scored_names):
+            continue
+        missing.append({
+            "Athlete": n or u,
+            "Athlete URL": u,
+            "Score": 0.0,
+            "OpenRank Score": 0.0 if section == "overall" else None,
+            "OpenRank Split Score": 0.0 if section != "overall" else None,
+            "Best Scores Used": "0.0, 0.0, 0.0, 0.0, 0.0" if section == "overall" else None,
+            "Best Split Scores Used": "0.0, 0.0, 0.0, 0.0, 0.0" if section != "overall" else None,
+            "Confidence": "No eligible scorecard evidence",
+            "Score Evidence": [],
+        })
+    if missing:
+        out = pd.concat([out, pd.DataFrame(missing)], ignore_index=True)
+    if out.empty:
+        return out
+    out["Score"] = pd.to_numeric(out.get("Score"), errors="coerce").fillna(0.0)
+    out = out.sort_values("Score", ascending=False).reset_index(drop=True)
+    if "Rank" in out.columns:
+        out = out.drop(columns=["Rank"])
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    out["_section"] = section
+    return out
+
+
+def build_race_prediction_result(
+    results: pd.DataFrame,
+    starts: pd.DataFrame,
+    overrides: pd.DataFrame,
+    selected_race: str,
+    selected_date: pd.Timestamp,
+    selected_gender: str,
+    top_n: int,
+    min_field_size: int,
+    strong_sof_threshold: float,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Build a race prediction by joining the start list to global athlete scorecards."""
+    if results is None or results.empty or starts is None or starts.empty:
+        return pd.DataFrame(), {}
+    selected_date = pd.to_datetime(selected_date) if not pd.isna(selected_date) else pd.Timestamp.today().normalize()
+    prediction_scope = scorecard_profile_from_race(selected_race, None, None)
+    start_athletes = starts[(starts["race_name"] == selected_race) & (starts["gender"] == selected_gender)].copy()
+    if "race_date" in start_athletes.columns:
+        start_athletes = start_athletes[start_athletes["race_date"] == selected_date]
+    imported_start_rows = len(start_athletes)
+    start_athletes = dedupe_start_athletes(start_athletes)
+    duplicate_start_rows = imported_start_rows - len(start_athletes)
+
+    combined_rows: List[Dict[str, Any]] = []
+    metrics_by_view: Dict[str, Any] = {}
+    for view_kind in ["overall", "swim", "bike", "run"]:
+        scorecard, metrics = build_athlete_ranking_result(results, overrides, selected_gender, prediction_scope, selected_date, top_n, view_kind)
+        metrics_by_view[f"{view_kind}_scorecard_rows"] = int(len(scorecard)) if scorecard is not None else 0
+        selected = filter_scorecard_to_startlist(scorecard, start_athletes, view_kind)
+        for row in cache_safe_rows(selected.head(100)):
+            combined_rows.append(row)
+
+    meta = {
+        "start_list_athletes": int(len(start_athletes)),
+        "duplicate_start_rows": int(duplicate_start_rows),
+        "prediction_scope": prediction_scope,
+        "scoring_source": "athlete_scorecards",
+        "top_scores_used": int(top_n),
+        **metrics_by_view,
+    }
+    return pd.DataFrame(combined_rows), meta
+
+
+def save_race_prediction_cache(
+    results: pd.DataFrame,
+    starts: pd.DataFrame,
+    overrides: pd.DataFrame,
+    selected_race: str,
+    selected_date: pd.Timestamp,
+    selected_gender: str,
+    top_n: int,
+    min_field_size: int,
+    strong_sof_threshold: float,
+) -> Tuple[int, Dict[str, Any], str]:
+    prediction_scope = scorecard_profile_from_race(selected_race, None, None)
+    params = race_prediction_cache_params(selected_race, selected_date, selected_gender, top_n, LOW_SAMPLE_WARNING_THRESHOLD, STRONG_SOF_THRESHOLD, prediction_scope)
+    cache_key = make_cache_key("race_prediction", params)
+    df, meta = build_race_prediction_result(results, starts, overrides, selected_race, selected_date, selected_gender, top_n, LOW_SAMPLE_WARNING_THRESHOLD, STRONG_SOF_THRESHOLD)
+    label = f"{format_date(selected_date)} · {selected_gender} · {selected_race} · {prediction_scope} · top {top_n}"
+    rows = save_model_cache_df("race_prediction", cache_key, label, {**params, **meta}, df, limit=500)
+    return rows, meta, cache_key
+
+
+def render_score_evidence(scored: pd.DataFrame, title: str, limit: int = 5) -> None:
+    if scored is None or scored.empty or "Score Evidence" not in scored.columns:
+        return
+    st.caption(f"Open an athlete to see the {TOP_SCORES_USED} race rows feeding the displayed score.")
+    for _, r in scored.head(limit).iterrows():
+        athlete = clean_str(r.get("Athlete")) or "Athlete"
+        score = r.get("Score")
+        evidence = r.get("Score Evidence")
+        if isinstance(evidence, str):
+            try:
+                evidence = json.loads(evidence)
+            except Exception:
+                evidence = []
+        if not isinstance(evidence, list):
+            evidence = []
+        with st.expander(f"{athlete} — Score {score}", expanded=False):
+            if evidence:
+                display_table(pd.DataFrame(evidence), list(pd.DataFrame(evidence).columns), height=240)
+            else:
+                st.info("No eligible evidence rows for this scorecard profile.")
+
+
+def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional[Dict[str, Any]] = None) -> None:
+    if cached_df is None or cached_df.empty:
+        st.info("No cached prediction rows found.")
+        return
+    params = (cache_meta or {}).get("params", {}) if isinstance(cache_meta, dict) else {}
+    computed_at = (cache_meta or {}).get("computed_at") if isinstance(cache_meta, dict) else None
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Cached rows", f"{len(cached_df):,}")
+    c2.metric("Start athletes", params.get("start_list_athletes", "—"))
+    c3.metric("Profile", params.get("prediction_scope", "—"))
+    c4.metric("Cached at", clean_str(computed_at)[:19] if computed_at else "—")
+    st.info("Fast mode: showing saved athlete scorecards joined to this start list. Rebuild the selected race after editing the start list or importing new results.")
+
+    section_title("🏆", "Overall Picks")
+    overall = cached_section(cached_df, "overall")
+    display_table(overall.head(20), ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date"])
+    render_score_evidence(overall, "Overall score evidence", limit=8)
+
+    st.divider()
+    tabs = st.tabs(["🏊 Fastest Swim", "🚴 Fastest Bike", "🏃 Fastest Run"])
+    for tab, disc, title in zip(tabs, ["swim", "bike", "run"], ["Fastest Swim", "Fastest Bike", "Fastest Run"]):
+        with tab:
+            section_title("🏊" if disc == "swim" else "🚴" if disc == "bike" else "🏃", title)
+            scored = cached_section(cached_df, disc)
+            display_table(
+                scored.head(20),
+                ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
+                height=360,
+            )
+            render_score_evidence(scored, f"{title} evidence", limit=8)
+
+
 with st.sidebar:
     st.markdown(
         """
@@ -5139,10 +5569,10 @@ elif page == "Athlete Rankings":
     c1, c2, c3, c4 = st.columns([1.1, 1.3, 1.1, 1.1])
     ranking_gender = c1.selectbox("Gender", ["Men", "Women"], index=0)
     ranking_scope = c2.selectbox(
-        "Race family",
-        ["All", "IRONMAN 70.3 / Middle", "T100 / PTO", "Full IRONMAN", "Short Course / WTCS"],
-        index=1,
-        help="Use 70.3/Middle for normal 70.3-style rankings, or T100/PTO for that race family only.",
+        "Scorecard profile",
+        RANKING_FAMILIES,
+        index=0,
+        help="Long Course combines 70.3, middle, Challenge, T100, and PTO. Short Course uses WTCS/elite Olympic-distance evidence. These same scorecards feed the predictor.",
     )
     as_of = c3.date_input("As of date", value=date.today())
     top_n_rank = TOP_SCORES_USED
