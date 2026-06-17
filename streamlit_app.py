@@ -4134,6 +4134,12 @@ def display_table(df: pd.DataFrame, columns: List[str], height: Optional[int] = 
     compact_height = dynamic_table_height(show, height)
     if isinstance(compact_height, int) and compact_height > 0:
         kwargs["height"] = compact_height
+    link_cols = [c for c in show.columns if c in {"Athlete URL", "PTN", "PTN URL"}]
+    if link_cols and hasattr(st, "column_config"):
+        kwargs["column_config"] = {
+            c: st.column_config.LinkColumn(c, display_text="Open PTN")
+            for c in link_cols
+        }
 
     st.dataframe(show, **kwargs)
 
@@ -5278,6 +5284,25 @@ def race_overall_scores_from_evidence(row: pd.Series, profile: str) -> Tuple[Opt
     return ranking_score, performance_score, score_text
 
 
+def race_split_scores_from_evidence(row: pd.Series, top_n: int = 3) -> Tuple[Optional[float], str, Optional[float], str, Optional[float]]:
+    """Race-analysis split score: best 3 evidence scores, averaged without padding."""
+    vals: List[Tuple[float, Dict[str, Any]]] = []
+    for ev in _evidence_list(row.get("Score Evidence")):
+        base = safe_float(ev.get("Evidence Score")) or safe_float(ev.get("ORS"))
+        if base is None or base <= 0:
+            continue
+        vals.append((float(base), ev))
+    if not vals:
+        return None, "", None, "", None
+    vals = sorted(vals, key=lambda x: x[0], reverse=True)[:max(1, int(top_n))]
+    scores = [x[0] for x in vals]
+    best_ev = vals[0][1]
+    best_race = clean_str(best_ev.get("Race"))
+    best_gap = safe_float(best_ev.get("% Behind Fastest"))
+    score_text = ", ".join(f"{x:.1f}" for x in scores)
+    return float(np.mean(scores)), score_text, float(scores[0]), best_race, best_gap
+
+
 def race_pick_score_from_scorecard_row(row: pd.Series, section: str, race_profile: str = "") -> float:
     """Race-analysis score: ceiling-weighted, but still sample-aware.
 
@@ -5287,6 +5312,11 @@ def race_pick_score_from_scorecard_row(row: pd.Series, section: str, race_profil
     they are missing a fourth result.
     """
     ranking_score = safe_float(row.get("Score")) or 0.0
+    if section != "overall":
+        split_avg, _split_text, _best_score, _best_race, _best_gap = race_split_scores_from_evidence(row, top_n=3)
+        if split_avg is not None:
+            return round(float(max(0.0, min(split_avg, 100.0))), 1)
+
     perf_col = "Performance Score" if section == "overall" else "Performance Split Score"
     performance_score = safe_float(row.get(perf_col))
     if section == "overall" and race_profile:
@@ -5347,7 +5377,15 @@ def filter_scorecard_to_startlist(scorecard: pd.DataFrame, start_athletes: pd.Da
         out["Race Evidence Score"] = [round(x[0], 1) if x[0] is not None else None for x in derived]
         out["Race Performance Score"] = [round(x[1], 1) if x[1] is not None else None for x in derived]
         out["Race Evidence Scores"] = [x[2] for x in derived]
+    if section != "overall":
+        split_derived = out.apply(lambda r: race_split_scores_from_evidence(r, top_n=3), axis=1)
+        out["Race Split Top 3 Avg"] = [round(x[0], 1) if x[0] is not None else None for x in split_derived]
+        out["Race Split Top 3"] = [x[1] for x in split_derived]
+        out["Best Race Split Score"] = [round(x[2], 1) if x[2] is not None else None for x in split_derived]
+        out["Best Race Split Race"] = [x[3] for x in split_derived]
+        out["Best Race Split Gap %"] = [round(x[4], 2) if x[4] is not None else None for x in split_derived]
     out["Race Pick Score"] = out.apply(lambda r: race_pick_score_from_scorecard_row(r, section, race_profile), axis=1)
+    out["PTN"] = out["Athlete URL"].map(canonical_athlete_url)
     out = out.sort_values(["Race Pick Score", "Score"], ascending=[False, False]).reset_index(drop=True)
     if "Rank" in out.columns:
         out = out.drop(columns=["Rank"])
@@ -5958,6 +5996,9 @@ def render_score_evidence(scored: pd.DataFrame, title: str, limit: int = 5) -> N
         if not isinstance(evidence, list):
             evidence = []
         with st.expander(f"{athlete} — Score {score}", expanded=False):
+            athlete_url = canonical_athlete_url(r.get("Athlete URL") or r.get("PTN"))
+            if athlete_url:
+                st.markdown(f'<a href="{athlete_url}" target="_blank" rel="noopener noreferrer">Open PTN athlete results</a>', unsafe_allow_html=True)
             if evidence:
                 display_table(pd.DataFrame(evidence), list(pd.DataFrame(evidence).columns), height=240)
             else:
@@ -5972,6 +6013,35 @@ def _positive_score_rows(df: pd.DataFrame) -> pd.DataFrame:
     return out[out["Score"] > 0].copy()
 
 
+def prepare_cached_race_prediction_display(cached_df: pd.DataFrame) -> pd.DataFrame:
+    """Refresh display-only race-analysis columns for old and new caches."""
+    if cached_df is None or cached_df.empty:
+        return cached_df
+    out = cached_df.copy()
+    if "Athlete URL" in out.columns and "PTN" not in out.columns:
+        out["PTN"] = out["Athlete URL"].map(canonical_athlete_url)
+    section_col = next((c for c in ["_section", "section", "Section", "cache_section"] if c in out.columns), None)
+    if section_col is None:
+        return out
+
+    for section in ["swim", "bike", "run"]:
+        mask = out[section_col].astype(str).str.strip().str.lower().eq(section)
+        if not mask.any():
+            continue
+        section_rows = out.loc[mask].copy()
+        split_derived = section_rows.apply(lambda r: race_split_scores_from_evidence(r, top_n=3), axis=1)
+        out.loc[mask, "Race Split Top 3 Avg"] = [round(x[0], 1) if x[0] is not None else None for x in split_derived]
+        out.loc[mask, "Race Split Top 3"] = [x[1] for x in split_derived]
+        out.loc[mask, "Best Race Split Score"] = [round(x[2], 1) if x[2] is not None else None for x in split_derived]
+        out.loc[mask, "Best Race Split Race"] = [x[3] for x in split_derived]
+        out.loc[mask, "Best Race Split Gap %"] = [round(x[4], 2) if x[4] is not None else None for x in split_derived]
+        out.loc[mask, "Race Pick Score"] = out.loc[mask].apply(lambda r: race_pick_score_from_scorecard_row(r, section), axis=1)
+        ranked_idx = out.loc[mask].sort_values(["Race Pick Score", "Score"], ascending=[False, False]).index
+        out.loc[ranked_idx, "Rank"] = range(1, len(ranked_idx) + 1)
+
+    return out
+
+
 def _render_missing_scorecards(params: Dict[str, Any], discipline: str) -> None:
     missing = []
     if isinstance(params, dict):
@@ -5982,8 +6052,28 @@ def _render_missing_scorecards(params: Dict[str, Any], discipline: str) -> None:
             display_table(pd.DataFrame(missing), ["Athlete", "Discipline", "Reason", "Athlete URL"], height=280)
 
 
+def _best_split_watch_signal(row: pd.Series) -> Tuple[Optional[float], Optional[float], str]:
+    best_score = safe_float(row.get("Best Race Split Score"))
+    best_gap = safe_float(row.get("Best Race Split Gap %"))
+    best_race = clean_str(row.get("Best Race Split Race"))
+    if best_score is not None:
+        return best_score, best_gap, best_race
+    best_score = None
+    best_gap = None
+    best_race = ""
+    for ev in _evidence_list(row.get("Score Evidence")):
+        ev_score = safe_float(ev.get("Evidence Score")) or safe_float(ev.get("ORS"))
+        if ev_score is None:
+            continue
+        if best_score is None or float(ev_score) > float(best_score):
+            best_score = float(ev_score)
+            best_gap = safe_float(ev.get("% Behind Fastest"))
+            best_race = clean_str(ev.get("Race"))
+    return best_score, best_gap, best_race
+
+
 def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
-    """Surface limited-sample or improving athletes who may outrun ranking score."""
+    """Surface high-ceiling athletes and split outliers for PTN podium picks."""
     if cached_df is None or cached_df.empty:
         return pd.DataFrame()
     rows: List[Dict[str, Any]] = []
@@ -6005,15 +6095,21 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
             perf_score = safe_float(r.get("Performance Score" if section == "overall" else "Performance Split Score")) or race_pick
             premium = parse_int(r.get("Premium Evidence Count")) or 0
             strong = parse_int(r.get("Strong Evidence Count")) or 0
+            best_split, best_gap, best_split_race = _best_split_watch_signal(r) if section != "overall" else (None, None, "")
             reasons = []
-            if rank > 5 and race_pick >= 60:
-                reasons.append("best outside top 5")
+            if rank > 5 and race_pick >= 68:
+                reasons.append("podium-adjacent score outside top 5")
             if evidence_count <= 2 and perf_score >= 78:
                 reasons.append("limited sample, high ceiling")
             if race_pick - ranking_score >= 12 and race_pick >= 65:
                 reasons.append("race score above ranking")
-            if section in {"run", "bike", "swim"} and evidence_count <= 3 and (premium >= 1 or strong >= 1) and perf_score >= 72:
-                reasons.append("fast recent split signal")
+            if section in {"run", "bike", "swim"}:
+                if best_split is not None and best_split >= 84:
+                    reasons.append("super high split score")
+                if best_gap is not None and best_gap <= 1.5:
+                    reasons.append("gapped/near-fastest split")
+                if evidence_count <= 3 and (premium >= 1 or strong >= 1) and perf_score >= 72:
+                    reasons.append("fast recent split signal")
             if not reasons:
                 continue
             rows.append({
@@ -6025,8 +6121,12 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
                 "Ranking": round(ranking_score, 1),
                 "Evidence": evidence_count,
                 "Reason": "; ".join(reasons),
+                "Best Split": round(best_split, 1) if best_split is not None else None,
+                "Gap %": round(best_gap, 2) if best_gap is not None else None,
+                "Signal Race": best_split_race,
                 "Last Race": clean_str(r.get("Last Race")),
                 "Last Race Date": clean_str(r.get("Last Race Date")),
+                "PTN": canonical_athlete_url(r.get("Athlete URL")),
             })
     out = pd.DataFrame(rows)
     if out.empty:
@@ -6035,7 +6135,7 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
+def _render_keep_an_eye_cards_legacy(watch: pd.DataFrame) -> None:
     if watch is None or watch.empty:
         return
     sections = ["Overall", "Swim", "Bike", "Run"]
@@ -6066,6 +6166,29 @@ def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
                 """,
                 unsafe_allow_html=True,
             )
+def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
+    if watch is None or watch.empty:
+        return
+    sections = ["Overall", "Swim", "Bike", "Run"]
+    picks = []
+    for section in sections:
+        w = watch[watch["Signal"] == section].copy()
+        if w.empty:
+            continue
+        outside = w[pd.to_numeric(w.get("Rank"), errors="coerce").fillna(999) > 5].copy()
+        pick = (outside if not outside.empty else w).sort_values(["Watch Score", "Performance"], ascending=[False, False]).head(1)
+        if not pick.empty:
+            picks.append(pick.iloc[0].to_dict())
+    if not picks:
+        return
+
+    section_title("Watch", "Keep An Eye On")
+    st.caption("High-ceiling or unusual signals for PTN podium picks, including athletes with a standout recent split or a race score running hotter than their base ranking.")
+    display_table(
+        pd.DataFrame(picks),
+        ["Signal", "Athlete", "Rank", "Watch Score", "Performance", "Best Split", "Gap %", "Evidence", "Reason", "Signal Race", "PTN"],
+        height=190,
+    )
 
 
 def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional[Dict[str, Any]] = None) -> None:
@@ -6077,6 +6200,7 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
     c3.metric("Profile", params.get("prediction_scope", "—"))
     c4.metric("Scorecards as of", clean_str(computed_at)[:19] if computed_at else "—")
     st.info("Fast mode: showing saved athlete scorecards joined to this start list. Missing/no-evidence athletes are shown in separate expanders instead of polluting the pick tables with 0.0 rows.")
+    cached_df = prepare_cached_race_prediction_display(cached_df)
 
     section_title("🏆", "Overall Picks")
     watch = build_keep_an_eye_table(cached_df)
@@ -6085,12 +6209,12 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
         with st.expander(f"Keep an eye on details ({len(watch)})", expanded=False):
             display_table(
                 watch.head(30),
-                ["Athlete", "Signal", "Rank", "Watch Score", "Performance", "Ranking", "Evidence", "Reason", "Last Race", "Last Race Date"],
+                ["Athlete", "Signal", "Rank", "Watch Score", "Performance", "Ranking", "Best Split", "Gap %", "Evidence", "Reason", "Signal Race", "Last Race", "Last Race Date", "PTN"],
                 height=360,
             )
 
     overall = _positive_score_rows(cached_section(cached_df, "overall"))
-    display_table(overall.head(20), ["Rank", "Athlete", "Race Pick Score", "Race Evidence Score", "Race Performance Score", "Race Evidence Scores", "Score", "Performance Score", "OpenRank Score", "Best Scores Used", "Best Scores Padded", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date"])
+    display_table(overall.head(20), ["Rank", "Athlete", "Race Pick Score", "Race Evidence Score", "Race Performance Score", "Race Evidence Scores", "Score", "Performance Score", "OpenRank Score", "Best Scores Used", "Best Scores Padded", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "PTN"])
     render_score_evidence(overall, "Overall score evidence", limit=8)
     _render_missing_scorecards(params, "overall")
 
@@ -6100,9 +6224,14 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
         with tab:
             section_title("🏊" if disc == "swim" else "🚴" if disc == "bike" else "🏃", title)
             scored = _positive_score_rows(cached_section(cached_df, disc))
+            if not scored.empty:
+                scored = scored.sort_values(["Race Pick Score", "Score"], ascending=[False, False]).reset_index(drop=True)
+                if "Rank" in scored.columns:
+                    scored = scored.drop(columns=["Rank"])
+                scored.insert(0, "Rank", range(1, len(scored) + 1))
             display_table(
                 scored.head(20),
-                ["Rank", "Athlete", "Race Pick Score", "Score", "Performance Split Score", "OpenRank Split Score", "Best Split Scores Used", "Best Split Scores Padded", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
+                ["Rank", "Athlete", "Race Pick Score", "Race Split Top 3 Avg", "Race Split Top 3", "Best Race Split Score", "Best Race Split Gap %", "Best Race Split Race", "Score", "Performance Split Score", "OpenRank Split Score", "Best Split Scores Used", "Best Split Scores Padded", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "PTN"],
                 height=360,
             )
             render_score_evidence(scored, f"{title} evidence", limit=8)
