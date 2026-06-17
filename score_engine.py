@@ -133,6 +133,156 @@ def _format_time(seconds: Any) -> str:
     return f"{m}:{s:02d}"
 
 
+
+
+def _parse_raw_payload(value: Any) -> Dict[str, Any]:
+    """Return raw JSON payload as a dict when available."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            import json
+            obj = json.loads(text)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _first_from_mapping(mapping: Dict[str, Any], aliases: Iterable[str]) -> Any:
+    if not mapping:
+        return None
+    normalized = {str(k).strip().lower().replace("_", " "): k for k in mapping.keys()}
+    for alias in aliases:
+        key = str(alias).strip().lower().replace("_", " ")
+        if key in normalized:
+            return mapping[normalized[key]]
+    return None
+
+
+def _validate_split_seconds(seconds: Optional[int], discipline: str, race_context: str) -> Optional[int]:
+    if seconds is None:
+        return None
+    rt = (race_context or "").lower()
+
+    if discipline == "swim":
+        if "full" in rt or "140.6" in rt:
+            return seconds if 35 * 60 <= seconds <= 105 * 60 else None
+        if any(x in rt for x in ["sprint", "world triathlon", "continental", "wtcs", "olympic"]):
+            return seconds if 3 * 60 <= seconds <= 35 * 60 else None
+        return seconds if 12 * 60 <= seconds <= 75 * 60 else None
+
+    if discipline == "bike":
+        if any(x in rt for x in ["wtcs", "draft", "world triathlon", "continental"]):
+            return None
+        if "full" in rt or "140.6" in rt:
+            return seconds if 3 * 3600 <= seconds <= 7 * 3600 else None
+        if any(x in rt for x in ["sprint", "olympic"]):
+            return seconds if 15 * 60 <= seconds <= 2 * 3600 else None
+        return seconds if 75 * 60 <= seconds <= 4.5 * 3600 else None
+
+    if discipline == "run":
+        if "full" in rt or "140.6" in rt:
+            return seconds if 2 * 3600 <= seconds <= 6 * 3600 else None
+        if any(x in rt for x in ["sprint", "world triathlon", "continental", "wtcs", "olympic"]):
+            return seconds if 12 * 60 <= seconds <= 90 * 60 else None
+        return seconds if 55 * 60 <= seconds <= 2.5 * 3600 else None
+
+    return seconds
+
+
+def _parse_split_seconds(value: Any, discipline: str, race_context: str = "") -> Optional[int]:
+    """Parse split strings like 23:33, 2:05:41, or numeric seconds.
+
+    Older CSVs sometimes kept splits in raw JSON or display columns instead of
+    normalized *_seconds columns. The score engine needs to recover those so
+    athletes with visible race history do not end up missing split scorecards.
+    """
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, (int, np.integer)):
+        sec = int(value)
+        return _validate_split_seconds(sec, discipline, race_context)
+    if isinstance(value, (float, np.floating)):
+        if math.isnan(float(value)):
+            return None
+        if float(value) > 200:
+            return _validate_split_seconds(int(round(float(value))), discipline, race_context)
+
+    s = str(value).strip()
+    if not s:
+        return None
+    if re.match(r"^\d{4,}:\d{2}:\d{2}$", s):
+        return None
+    s = s.replace("—", "").replace("-", "").strip()
+    if not s:
+        return None
+
+    seconds = None
+    parts = s.split(":")
+    try:
+        if len(parts) == 3:
+            h, m, sec = [int(float(x)) for x in parts]
+            seconds = h * 3600 + m * 60 + sec
+        elif len(parts) == 2:
+            a, b = [int(float(x)) for x in parts]
+            rt = (race_context or "").lower()
+            if discipline == "swim":
+                seconds = a * 60 + b
+            elif discipline == "bike":
+                # Bikes in long-course rows are usually h:mm; short course can be mm:ss.
+                if any(x in rt for x in ["sprint", "olympic", "world triathlon", "continental", "wtcs"]):
+                    seconds = a * 60 + b if a < 90 else a * 3600 + b * 60
+                else:
+                    seconds = a * 3600 + b * 60
+            elif discipline == "run":
+                if any(x in rt for x in ["sprint", "olympic", "world triathlon", "continental", "wtcs"]):
+                    seconds = a * 60 + b
+                else:
+                    seconds = a * 3600 + b * 60
+        elif len(parts) == 1:
+            v = _safe_float(s)
+            if v is not None:
+                seconds = int(round(v))
+    except Exception:
+        return None
+
+    return _validate_split_seconds(seconds, discipline, race_context)
+
+
+def _recover_split_from_row(row: pd.Series, discipline: str) -> Optional[int]:
+    aliases = {
+        "swim": ["swim_seconds", "Swim Seconds", "Swim", "Swim Split", "Swim Time", "swim", "swim_split", "swim_time"],
+        "bike": ["bike_seconds", "Bike Seconds", "Bike", "Bike Split", "Bike Time", "bike", "bike_split", "bike_time"],
+        "run": ["run_seconds", "Run Seconds", "Run", "Run Split", "Run Time", "run", "run_split", "run_time"],
+    }[discipline]
+    race_context = " ".join([_clean(row.get(c)) for c in ["race_name", "race_type", "distance"]])
+
+    # 1) Check dataframe columns by alias.
+    col_map = {str(c).strip().lower().replace("_", " "): c for c in row.index}
+    for alias in aliases:
+        key = str(alias).strip().lower().replace("_", " ")
+        if key in col_map:
+            sec = _parse_split_seconds(row.get(col_map[key]), discipline, race_context)
+            if sec is not None:
+                return sec
+
+    # 2) Check original raw CSV payload if present.
+    raw = _parse_raw_payload(row.get("raw"))
+    val = _first_from_mapping(raw, aliases)
+    return _parse_split_seconds(val, discipline, race_context)
+
+
 def _race_text(df: pd.DataFrame) -> pd.Series:
     parts = []
     for col in ["race_name", "race_type", "distance"]:
@@ -200,11 +350,24 @@ def _prep_results(results: pd.DataFrame) -> pd.DataFrame:
     df["gender"] = df["gender"].map(_norm_gender)
     df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
 
-    for col in ["ors", "sof", "swim_seconds", "bike_seconds", "run_seconds"]:
+    for col in ["ors", "sof"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         else:
             df[col] = np.nan
+
+    # Normalize/recover split seconds. Some imports have display columns like
+    # Swim/Bike/Run or only the original raw CSV JSON, so recover here too.
+    for disc in ["swim", "bike", "run"]:
+        col = f"{disc}_seconds"
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        missing = df[col].isna()
+        if missing.any():
+            recovered = df.loc[missing].apply(lambda r, d=disc: _recover_split_from_row(r, d), axis=1)
+            df.loc[missing, col] = pd.to_numeric(recovered, errors="coerce").to_numpy()
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if "bad_status" in df.columns:
         df["bad_status"] = df["bad_status"].fillna(False).astype(bool)
@@ -453,19 +616,24 @@ def build_all_scorecards(
                 before_ev = len(evidence)
                 try:
                     if discipline == "overall":
+                        candidate_rows = int(pd.to_numeric(pdf.get("ors", pd.Series(dtype=object)), errors="coerce").gt(0).sum())
                         c, e = _build_overall_cards(pdf, gender, profile, as_of, model_version, top_n)
                     else:
+                        split_col = f"{discipline}_seconds"
+                        candidate_rows = int(pd.to_numeric(pdf.get(split_col, pd.Series(dtype=object)), errors="coerce").gt(0).sum())
                         c, e = _build_split_cards(pdf, gender, profile, discipline, as_of, model_version, top_n)
                     cards.extend(c)
                     evidence.extend(e)
                     status = "saved"
                 except Exception as exc:
+                    candidate_rows = 0
                     status = f"error: {exc}"
                 logs.append({
                     "Gender": gender,
                     "Profile": profile,
                     "Discipline": discipline,
                     "Rows After Profile": int(len(pdf)),
+                    "Candidate Score Rows": int(candidate_rows),
                     "Scorecard Rows": int(len(cards) - before_cards),
                     "Evidence Rows": int(len(evidence) - before_ev),
                     "Lookback Days": int(lookback),
