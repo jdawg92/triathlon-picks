@@ -385,6 +385,26 @@ def apply_dashboard_theme() -> None:
             line-height: 1.35;
         }
 
+        .tri-watch-card .tag-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.35rem;
+            margin: 0.15rem 0 0.68rem 0;
+        }
+
+        .tri-watch-card .signal-chip {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.18rem 0.46rem;
+            border-radius: 999px;
+            color: #DDE7FF;
+            background: rgba(124, 92, 255, 0.18);
+            border: 1px solid rgba(124, 92, 255, 0.34);
+            font-size: 0.68rem;
+            font-weight: 850;
+            line-height: 1.2;
+        }
+
         [data-testid="stMetric"] {
             border-radius: 1rem;
             padding: 0.9rem 1rem;
@@ -6166,6 +6186,129 @@ def _best_split_watch_signal(row: pd.Series) -> Tuple[Optional[float], Optional[
     return best_score, best_gap, best_race
 
 
+def _world_championship_race(text: Any) -> bool:
+    race_text = clean_str(text).lower()
+    return any(token in race_text for token in [
+        "world championship",
+        "world championships",
+        "70.3 world",
+        "ironman world",
+        "im world",
+        "kona",
+        "nice",
+    ])
+
+
+def _evidence_score(ev: Dict[str, Any]) -> Optional[float]:
+    return safe_float(ev.get("Evidence Score")) or safe_float(ev.get("ORS"))
+
+
+def _split_rank_number(value: Any) -> Optional[int]:
+    txt = clean_str(value)
+    if not txt:
+        return None
+    m = re.search(r"\d+", txt)
+    return int(m.group(0)) if m else None
+
+
+def _watch_signal_tags(row: pd.Series, section: str, race_pick: float, perf_score: float, ranking_score: float, evidence_count: int) -> Dict[str, Any]:
+    evidence = _evidence_list(row.get("Score Evidence"))
+    tags: List[str] = []
+    notes: List[str] = []
+    signal_strength = 0.0
+    signal_race = ""
+    best_split, best_gap, best_split_race = _best_split_watch_signal(row) if section != "overall" else (None, None, "")
+
+    scored_evidence = []
+    for ev in evidence:
+        score = _evidence_score(ev)
+        if score is None:
+            continue
+        race_name = clean_str(ev.get("Race"))
+        scored_evidence.append((float(score), ev))
+        signal_strength = max(signal_strength, float(score))
+        if not signal_race:
+            signal_race = race_name
+
+        place_num = parse_place_number(ev.get("Place"))
+        race_text = " ".join([race_name, clean_str(ev.get("Race Type"))])
+        if _world_championship_race(race_text) and place_num is not None and place_num <= 10:
+            tags.append("Top 10 at worlds")
+            notes.append(f"Top {place_num} at {race_name}.")
+            signal_strength = max(signal_strength, 92.0)
+            signal_race = race_name
+        if float(score) >= 88:
+            tags.append("Huge one-race ceiling")
+            notes.append(f"Posted a {float(score):.1f} score at {race_name}.")
+            signal_race = race_name
+
+    if section in {"swim", "bike", "run"}:
+        if best_split is not None and best_split >= 84:
+            tags.append("Elite split pop")
+            notes.append(f"Best recent {section} signal is {best_split:.1f}.")
+            signal_strength = max(signal_strength, float(best_split))
+            signal_race = best_split_race or signal_race
+        if best_gap is not None and best_gap <= 1.5:
+            tags.append("Near fastest split")
+            notes.append(f"Only {best_gap:.1f}% off the fastest {section}.")
+            signal_strength = max(signal_strength, 86.0)
+        for _score, ev in scored_evidence:
+            split_rank = _split_rank_number(ev.get("Split Rank"))
+            if split_rank is not None and split_rank <= 3:
+                tags.append(f"Top {split_rank} split")
+                signal_race = clean_str(ev.get("Race")) or signal_race
+                signal_strength = max(signal_strength, 84.0)
+                break
+            sof = safe_float(ev.get("SOF"))
+            if sof is not None and sof < 65 and _score >= 82:
+                tags.append("Fast split in smaller field")
+                notes.append("Lower-tier field, but the split itself was loud.")
+                signal_race = clean_str(ev.get("Race")) or signal_race
+                signal_strength = max(signal_strength, _score)
+
+    if len(scored_evidence) >= 2:
+        dated = []
+        for score, ev in scored_evidence:
+            dt = pd.to_datetime(ev.get("Date"), errors="coerce")
+            if pd.notna(dt):
+                dated.append((dt, score, ev))
+        dated = sorted(dated, key=lambda x: x[0], reverse=True)
+        if len(dated) >= 2:
+            latest_dt, latest_score, latest_ev = dated[0]
+            prior_scores = [x[1] for x in dated[1:]]
+            prior_avg = float(np.mean(prior_scores)) if prior_scores else 0.0
+            if latest_score >= 75 and latest_score - prior_avg >= 8:
+                tags.append("Recent jump")
+                notes.append(f"Recent result jumped from a {prior_avg:.1f} prior average to {latest_score:.1f}.")
+                signal_race = clean_str(latest_ev.get("Race")) or signal_race
+                signal_strength = max(signal_strength, latest_score + 2.0)
+
+    if evidence_count <= 2 and perf_score >= 78:
+        tags.append("Small sample, big upside")
+        notes.append("Limited evidence, but the ceiling is real.")
+        signal_strength = max(signal_strength, perf_score)
+    if race_pick - ranking_score >= 12 and race_pick >= 65:
+        tags.append("Race fit boost")
+        notes.append("This race setup rates better than the base ranking.")
+        signal_strength = max(signal_strength, race_pick)
+
+    seen = set()
+    clean_tags = []
+    for tag in tags:
+        if tag and tag not in seen:
+            seen.add(tag)
+            clean_tags.append(tag)
+    note = " ".join(notes[:2]) if notes else ""
+    return {
+        "tags": clean_tags,
+        "note": note,
+        "signal_strength": signal_strength,
+        "signal_race": signal_race,
+        "best_split": best_split,
+        "best_gap": best_gap,
+    }
+
+
 def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
     """Surface high-ceiling athletes and split outliers for PTN podium picks."""
     if cached_df is None or cached_df.empty:
@@ -6187,24 +6330,9 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
             race_pick = safe_float(r.get("Race Pick Score")) or 0.0
             ranking_score = safe_float(r.get("Score")) or 0.0
             perf_score = safe_float(r.get("Performance Score" if section == "overall" else "Performance Split Score")) or race_pick
-            premium = parse_int(r.get("Premium Evidence Count")) or 0
-            strong = parse_int(r.get("Strong Evidence Count")) or 0
-            best_split, best_gap, best_split_race = _best_split_watch_signal(r) if section != "overall" else (None, None, "")
-            reasons = []
-            if rank > 5 and race_pick >= 68:
-                reasons.append("podium-adjacent score outside top 5")
-            if evidence_count <= 2 and perf_score >= 78:
-                reasons.append("limited sample, high ceiling")
-            if race_pick - ranking_score >= 12 and race_pick >= 65:
-                reasons.append("race score above ranking")
-            if section in {"run", "bike", "swim"}:
-                if best_split is not None and best_split >= 84:
-                    reasons.append("super high split score")
-                if best_gap is not None and best_gap <= 1.5:
-                    reasons.append("gapped/near-fastest split")
-                if evidence_count <= 3 and (premium >= 1 or strong >= 1) and perf_score >= 72:
-                    reasons.append("fast recent split signal")
-            if not reasons:
+            signal = _watch_signal_tags(r, section, race_pick, perf_score, ranking_score, evidence_count)
+            tags = signal.get("tags") or []
+            if not tags:
                 continue
             rows.append({
                 "Athlete": clean_str(r.get("Athlete")),
@@ -6214,10 +6342,12 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
                 "Performance": round(perf_score, 1),
                 "Ranking": round(ranking_score, 1),
                 "Evidence": evidence_count,
-                "Reason": "; ".join(reasons),
-                "Best Split": round(best_split, 1) if best_split is not None else None,
-                "Gap %": round(best_gap, 2) if best_gap is not None else None,
-                "Signal Race": best_split_race,
+                "Reason": clean_str(signal.get("note")),
+                "Tags": " | ".join(tags),
+                "Signal Strength": round(float(signal.get("signal_strength") or race_pick), 1),
+                "Best Split": round(signal.get("best_split"), 1) if signal.get("best_split") is not None else None,
+                "Gap %": round(signal.get("best_gap"), 2) if signal.get("best_gap") is not None else None,
+                "Signal Race": clean_str(signal.get("signal_race")),
                 "Last Race": clean_str(r.get("Last Race")),
                 "Last Race Date": clean_str(r.get("Last Race Date")),
                 "PTN": canonical_athlete_url(r.get("Athlete URL")),
@@ -6225,7 +6355,7 @@ def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    out = out.sort_values(["Watch Score", "Performance"], ascending=[False, False]).drop_duplicates(subset=["Athlete", "Signal"], keep="first")
+    out = out.sort_values(["Signal Strength", "Watch Score", "Performance"], ascending=[False, False, False]).drop_duplicates(subset=["Athlete", "Signal"], keep="first")
     return out.reset_index(drop=True)
 
 
@@ -6238,8 +6368,7 @@ def _render_keep_an_eye_cards_legacy(watch: pd.DataFrame) -> None:
         w = watch[watch["Signal"] == section].copy()
         if w.empty:
             continue
-        outside = w[pd.to_numeric(w.get("Rank"), errors="coerce").fillna(999) > 5].copy()
-        pick = (outside if not outside.empty else w).sort_values(["Watch Score", "Performance"], ascending=[False, False]).head(1)
+        pick = w.sort_values(["Signal Strength", "Watch Score", "Performance"], ascending=[False, False, False]).head(1)
         if not pick.empty:
             picks.append(pick.iloc[0].to_dict())
     if not picks:
@@ -6269,15 +6398,14 @@ def _render_keep_an_eye_cards_table_legacy(watch: pd.DataFrame) -> None:
         w = watch[watch["Signal"] == section].copy()
         if w.empty:
             continue
-        outside = w[pd.to_numeric(w.get("Rank"), errors="coerce").fillna(999) > 5].copy()
-        pick = (outside if not outside.empty else w).sort_values(["Watch Score", "Performance"], ascending=[False, False]).head(1)
+        pick = w.sort_values(["Signal Strength", "Watch Score", "Performance"], ascending=[False, False, False]).head(1)
         if not pick.empty:
             picks.append(pick.iloc[0].to_dict())
     if not picks:
         return
 
     section_title("Watch", "Keep An Eye On")
-    st.caption("High-ceiling or unusual signals for PTN podium picks, including athletes with a standout recent split or a race score running hotter than their base ranking.")
+    st.caption("Research flags for PTN podium picks: one-off ceiling results, world-championship proof, recent jumps, or standout swim/bike/run splits.")
     card_html = ['<div class="tri-watch-grid">']
     for row in picks:
         profile = canonical_athlete_url(row.get("PTN"))
@@ -6288,6 +6416,8 @@ def _render_keep_an_eye_cards_table_legacy(watch: pd.DataFrame) -> None:
         athlete = html.escape(clean_str(row.get("Athlete")) or "Athlete")
         signal = html.escape(clean_str(row.get("Signal")) or "Signal")
         reason = html.escape(clean_str(row.get("Reason")) or "")
+        tags = [html.escape(t.strip()) for t in clean_str(row.get("Tags")).split("|") if t.strip()]
+        tag_html = "".join([f'<span class="signal-chip">{tag}</span>' for tag in tags[:3]])
         rank = parse_int(row.get("Rank")) or 0
         watch_score = safe_float(row.get("Watch Score")) or 0.0
         performance = safe_float(row.get("Performance")) or 0.0
@@ -6315,7 +6445,7 @@ def _render_keep_an_eye_cards_table_legacy(watch: pd.DataFrame) -> None:
     st.markdown("\n".join(card_html), unsafe_allow_html=True)
 
 
-def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
+def _render_keep_an_eye_cards_signal_legacy(watch: pd.DataFrame) -> None:
     if watch is None or watch.empty:
         return
     sections = ["Overall", "Swim", "Bike", "Run"]
@@ -6332,7 +6462,7 @@ def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
         return
 
     section_title("&#128064;", "Keep An Eye On")
-    st.caption("High-ceiling or unusual signals for PTN podium picks, including athletes with a standout recent split or a race score running hotter than their base ranking.")
+    st.caption("Research flags for PTN podium picks: one-off ceiling results, world-championship proof, recent jumps, or standout swim/bike/run splits.")
     card_html = ['<div class="tri-watch-grid">']
     for row in picks:
         profile = canonical_athlete_url(row.get("PTN"))
@@ -6343,6 +6473,8 @@ def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
         athlete = html.escape(clean_str(row.get("Athlete")) or "Athlete")
         signal = html.escape(clean_str(row.get("Signal")) or "Signal")
         reason = html.escape(clean_str(row.get("Reason")) or "")
+        tags = [html.escape(t.strip()) for t in clean_str(row.get("Tags")).split("|") if t.strip()]
+        tag_html = "".join([f'<span class="signal-chip">{tag}</span>' for tag in tags[:3]])
         rank = parse_int(row.get("Rank")) or 0
         watch_score = safe_float(row.get("Watch Score")) or 0.0
         performance = safe_float(row.get("Performance")) or 0.0
@@ -6355,12 +6487,68 @@ def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
             f'<div class="tri-watch-card">'
             f'<div class="topline">{profile_link}<span class="tag">{signal} &middot; Rank {rank or "-"}</span></div>'
             f'<div class="athlete">{athlete}</div>'
+            f'<div class="tag-row">{tag_html}</div>'
             f'<div class="scores">'
-            f'<div class="scorebox"><div class="label">Watch</div><div class="value">{watch_score:.1f}</div></div>'
+            f'<div class="scorebox"><div class="label">Signal</div><div class="value">{watch_score:.1f}</div></div>'
             f'<div class="scorebox"><div class="label">Perf</div><div class="value">{performance:.1f}</div></div>'
             f'<div class="scorebox"><div class="label">{third_label}</div><div class="value">{third_value}</div></div>'
             f'</div>'
-            f'<div class="reason">{reason}</div>'
+            f'<div class="reason">{reason or "Worth a manual look based on recent evidence."}</div>'
+            f'<div class="reason">{signal_race}</div>'
+            f'</div>'
+        )
+    card_html.append("</div>")
+    st.markdown("\n".join(card_html), unsafe_allow_html=True)
+
+
+def render_keep_an_eye_cards(watch: pd.DataFrame) -> None:
+    if watch is None or watch.empty:
+        return
+    sections = ["Overall", "Swim", "Bike", "Run"]
+    picks = []
+    for section in sections:
+        w = watch[watch["Signal"] == section].copy()
+        if w.empty:
+            continue
+        pick = w.sort_values(["Signal Strength", "Watch Score", "Performance"], ascending=[False, False, False]).head(1)
+        if not pick.empty:
+            picks.append(pick.iloc[0].to_dict())
+    if not picks:
+        return
+
+    section_title("&#128064;", "Keep An Eye On")
+    st.caption("Research flags for PTN podium picks: one-off ceiling results, world-championship proof, recent jumps, or standout swim/bike/run splits.")
+    card_html = ['<div class="tri-watch-grid">']
+    for row in picks:
+        profile = canonical_athlete_url(row.get("PTN"))
+        profile_link = (
+            f'<a class="profile-link" href="{html.escape(profile)}" target="_blank" rel="noopener noreferrer">Profile</a>'
+            if profile else '<span class="profile-link">Profile</span>'
+        )
+        athlete = html.escape(clean_str(row.get("Athlete")) or "Athlete")
+        signal = html.escape(clean_str(row.get("Signal")) or "Signal")
+        reason = html.escape(clean_str(row.get("Reason")) or "")
+        tags = [html.escape(t.strip()) for t in clean_str(row.get("Tags")).split("|") if t.strip()]
+        tag_html = "".join([f'<span class="signal-chip">{tag}</span>' for tag in tags[:3]])
+        rank = parse_int(row.get("Rank")) or 0
+        watch_score = safe_float(row.get("Watch Score")) or 0.0
+        performance = safe_float(row.get("Performance")) or 0.0
+        best_split = safe_float(row.get("Best Split"))
+        evidence = parse_int(row.get("Evidence")) or 0
+        third_label = "Split" if best_split is not None else "Evidence"
+        third_value = f"{best_split:.1f}" if best_split is not None else str(evidence)
+        signal_race = html.escape(clean_str(row.get("Signal Race")) or clean_str(row.get("Last Race")) or "")
+        card_html.append(
+            f'<div class="tri-watch-card">'
+            f'<div class="topline">{profile_link}<span class="tag">{signal} &middot; Rank {rank or "-"}</span></div>'
+            f'<div class="athlete">{athlete}</div>'
+            f'<div class="tag-row">{tag_html}</div>'
+            f'<div class="scores">'
+            f'<div class="scorebox"><div class="label">Signal</div><div class="value">{watch_score:.1f}</div></div>'
+            f'<div class="scorebox"><div class="label">Perf</div><div class="value">{performance:.1f}</div></div>'
+            f'<div class="scorebox"><div class="label">{third_label}</div><div class="value">{third_value}</div></div>'
+            f'</div>'
+            f'<div class="reason">{reason or "Worth a manual look based on recent evidence."}</div>'
             f'<div class="reason">{signal_race}</div>'
             f'</div>'
         )
@@ -6388,9 +6576,9 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
         with st.expander(f"Keep an eye on details ({len(watch)})", expanded=False):
             display_table(
                 watch.head(30),
-                (["PTN", "Athlete", "Signal", "Rank", "Watch Score", "Best Split", "Gap %", "Reason", "Signal Race"]
+                (["PTN", "Athlete", "Signal", "Tags", "Rank", "Watch Score", "Best Split", "Gap %", "Reason", "Signal Race"]
                  if not pro_mode else
-                 ["PTN", "Athlete", "Signal", "Rank", "Watch Score", "Performance", "Ranking", "Best Split", "Gap %", "Evidence", "Reason", "Signal Race", "Last Race", "Last Race Date"]),
+                 ["PTN", "Athlete", "Signal", "Tags", "Signal Strength", "Rank", "Watch Score", "Performance", "Ranking", "Best Split", "Gap %", "Evidence", "Reason", "Signal Race", "Last Race", "Last Race Date"]),
                 height=360,
             )
 
