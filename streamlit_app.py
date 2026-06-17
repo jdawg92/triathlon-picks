@@ -28,7 +28,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "openrank_703_split_scope_v2"
+MODEL_CACHE_VERSION = "scorecard_tables_v4"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -372,6 +372,58 @@ def apply_dashboard_theme() -> None:
             color: var(--tri-text);
             letter-spacing: -0.035em;
         }
+
+        .tri-loader-card {
+            display: flex;
+            align-items: center;
+            gap: 0.9rem;
+            padding: 1rem 1.1rem;
+            margin: 0.65rem 0 1rem 0;
+            border-radius: 1.05rem;
+            border: 1px solid rgba(99, 91, 255, 0.36);
+            background:
+                radial-gradient(circle at 15% 20%, rgba(0, 212, 255, 0.16), transparent 28%),
+                linear-gradient(135deg, rgba(124, 92, 255, 0.18), rgba(15, 23, 42, 0.88));
+            box-shadow: 0 18px 44px rgba(0, 0, 0, 0.28);
+        }
+
+        .tri-loader-orb {
+            width: 2.1rem;
+            height: 2.1rem;
+            border-radius: 999px;
+            background: conic-gradient(from 0deg, var(--tri-cyan), var(--tri-primary), transparent 72%);
+            position: relative;
+            animation: tri-spin 0.9s linear infinite;
+            box-shadow: 0 0 28px rgba(0, 212, 255, 0.28);
+            flex: 0 0 auto;
+        }
+
+        .tri-loader-orb:after {
+            content: "";
+            position: absolute;
+            inset: 0.32rem;
+            border-radius: 999px;
+            background: #0B1020;
+            border: 1px solid rgba(148, 163, 184, 0.16);
+        }
+
+        .tri-loader-title {
+            color: var(--tri-text);
+            font-weight: 850;
+            letter-spacing: -0.02em;
+            line-height: 1.15;
+        }
+
+        .tri-loader-detail {
+            color: var(--tri-muted);
+            font-size: 0.86rem;
+            margin-top: 0.2rem;
+        }
+
+        @keyframes tri-spin {
+            to { transform: rotate(360deg); }
+        }
+
         </style>
         """,
         unsafe_allow_html=True,
@@ -406,6 +458,28 @@ def render_race_card(race_name: str, gender: str, race_date: Any, window_start: 
 
 def section_title(icon: str, title: str) -> None:
     st.markdown(f'<div class="tri-section-title"><span>{icon}</span><span>{title}</span></div>', unsafe_allow_html=True)
+
+# ============================================================
+# Loading UI helpers
+# ============================================================
+def loading_card(message: str = "Working...", detail: str = ""):
+    """Render a branded temporary loading panel and return its placeholder."""
+    placeholder = st.empty()
+    safe_message = str(message).replace("<", "&lt;").replace(">", "&gt;")
+    safe_detail = str(detail or "").replace("<", "&lt;").replace(">", "&gt;")
+    detail_html = f'<div class="tri-loader-detail">{safe_detail}</div>' if safe_detail else ""
+    html = f"""
+        <div class="tri-loader-card">
+            <div class="tri-loader-orb"></div>
+            <div>
+                <div class="tri-loader-title">{safe_message}</div>
+                {detail_html}
+            </div>
+        </div>
+    """
+    placeholder.markdown(html, unsafe_allow_html=True)
+    return placeholder
+
 
 # ============================================================
 # Basic helpers
@@ -624,6 +698,19 @@ def format_date(value: Any) -> str:
             return d.strftime("%-d %b %Y")
         except Exception:
             return str(value)
+
+
+def iso_date(value: Any) -> str:
+    """Return a stable YYYY-MM-DD key for SQL date columns and cache matching."""
+    if value is None or value == "":
+        return ""
+    try:
+        d = pd.to_datetime(value, errors="coerce")
+        if pd.isna(d):
+            return str(value)[:10]
+        return d.strftime("%Y-%m-%d")
+    except Exception:
+        return str(value)[:10]
 
 
 def parse_split_seconds(value: Any, discipline: str, race_type: Optional[str] = None) -> Optional[int]:
@@ -2205,7 +2292,7 @@ def fill_missing_sof_from_same_race(results: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # Scoring helpers
 # ============================================================
-@st.cache_data(ttl=900, show_spinner="Loading and cleaning Supabase data...")
+@st.cache_data(ttl=900, show_spinner="⚡ Syncing and normalizing Supabase data...")
 def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     athlete_results = load_table("athlete_results")
     race_field_results = load_table("race_field_results")
@@ -3684,7 +3771,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "openrank_703_split_scope_v2"
+MODEL_CACHE_VERSION = "scorecard_tables_v4"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4433,7 +4520,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "scorecard_simple_v1"
+MODEL_CACHE_VERSION = "scorecard_tables_v4"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4698,7 +4785,9 @@ def filter_scorecard_to_startlist(scorecard: pd.DataFrame, start_athletes: pd.Da
         return pd.DataFrame()
     urls, names, name_by_url = _startlist_identity_sets(start_athletes)
     if scorecard is None or scorecard.empty:
-        scorecard = pd.DataFrame(columns=["Athlete", "Athlete URL", "Score"])
+        # Do not create zero-score placeholders when the whole profile has no saved scorecards.
+        # That was hiding cache/build problems by making every athlete look like a real 0.0.
+        return pd.DataFrame()
     df = scorecard.copy()
     if "Athlete URL" not in df.columns:
         df["Athlete URL"] = None
@@ -4821,7 +4910,7 @@ def scorecard_tables_ready() -> bool:
 
 
 def _delete_scorecard_combo(gender: str, profile: str, discipline: str, as_of_ts: pd.Timestamp) -> None:
-    as_of_label = format_date(as_of_ts)
+    as_of_label = iso_date(as_of_ts)
     for table_name in ["athlete_scorecard_evidence", "athlete_scorecards"]:
         try:
             (
@@ -4884,9 +4973,9 @@ def save_athlete_scorecard_combo(
     if df is None or df.empty:
         return 0, 0, metrics
 
-    as_of_label = format_date(as_of_ts)
+    as_of_label = iso_date(as_of_ts)
     gender_norm = normalize_gender(gender) or gender
-    computed_source = f"{gender_norm} · {profile} · {discipline} · top {top_n} · {as_of_label}"
+    computed_source = f"{gender_norm} · {profile} · {discipline} · top {top_n} · {format_date(as_of_ts)}"
     score_rows: List[Dict[str, Any]] = []
     evidence_rows: List[Dict[str, Any]] = []
 
@@ -4916,6 +5005,10 @@ def save_athlete_scorecard_combo(
             last_race_name = clean_str(row.get("Last Race"))
             last_race_date = clean_str(row.get("Last Race Date"))
 
+        ev_rows = _evidence_list(row.get("Score Evidence"))
+        if (score <= 0) and not ev_rows:
+            continue
+
         rank_val = parse_int(row.get("Rank"))
         score_rows.append({
             "model_version": MODEL_CACHE_VERSION,
@@ -4939,7 +5032,6 @@ def save_athlete_scorecard_combo(
             "raw": row,
         })
 
-        ev_rows = _evidence_list(row.get("Score Evidence"))
         for used_rank, ev in enumerate(ev_rows[:top_n], start=1):
             ev_safe = json_safe_row(ev)
             evidence_rows.append({
@@ -5007,7 +5099,7 @@ def _latest_scorecard_date(df: pd.DataFrame) -> Optional[str]:
     vals = pd.to_datetime(df["as_of_date"], errors="coerce").dropna()
     if vals.empty:
         return None
-    return format_date(vals.max())
+    return vals.max().strftime("%Y-%m-%d")
 
 
 def load_athlete_scorecard_view(gender: str, profile: str, discipline: str, as_of_ts: Optional[pd.Timestamp] = None) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
@@ -5028,31 +5120,42 @@ def load_athlete_scorecard_view(gender: str, profile: str, discipline: str, as_o
     ].copy()
     if cards.empty:
         return pd.DataFrame(), pd.DataFrame(), {}
-    if as_of_ts is not None and "as_of_date" in cards.columns:
-        target = format_date(as_of_ts)
-        exact = cards[cards["as_of_date"].astype(str) == target].copy()
+    if "as_of_date" in cards.columns:
+        cards["_asof_key"] = cards["as_of_date"].map(iso_date)
+    else:
+        cards["_asof_key"] = ""
+
+    if as_of_ts is not None:
+        target = iso_date(as_of_ts)
+        exact = cards[cards["_asof_key"] == target].copy()
         if not exact.empty:
             cards = exact
         else:
             latest_date = _latest_scorecard_date(cards)
             if latest_date:
-                cards = cards[cards["as_of_date"].astype(str) == latest_date].copy()
+                cards = cards[cards["_asof_key"] == latest_date].copy()
     else:
         latest_date = _latest_scorecard_date(cards)
         if latest_date:
-            cards = cards[cards["as_of_date"].astype(str) == latest_date].copy()
-    as_of_label = clean_str(cards["as_of_date"].iloc[0]) if "as_of_date" in cards.columns and not cards.empty else ""
+            cards = cards[cards["_asof_key"] == latest_date].copy()
+    as_of_label = cards["_asof_key"].iloc[0] if "_asof_key" in cards.columns and not cards.empty else ""
+    cards = cards.drop(columns=["_asof_key"], errors="ignore")
 
     if ev is None or ev.empty:
         ev_filtered = pd.DataFrame()
     else:
-        ev_filtered = ev[
-            (ev.get("model_version", "") == MODEL_CACHE_VERSION)
-            & (ev.get("gender", "") == gender_norm)
-            & (ev.get("profile", "") == profile)
-            & (ev.get("discipline", "") == discipline)
-            & (ev.get("as_of_date", "").astype(str) == as_of_label)
-        ].copy()
+        ev_work = ev.copy()
+        if "as_of_date" in ev_work.columns:
+            ev_work["_asof_key"] = ev_work["as_of_date"].map(iso_date)
+        else:
+            ev_work["_asof_key"] = ""
+        ev_filtered = ev_work[
+            (ev_work.get("model_version", "") == MODEL_CACHE_VERSION)
+            & (ev_work.get("gender", "") == gender_norm)
+            & (ev_work.get("profile", "") == profile)
+            & (ev_work.get("discipline", "") == discipline)
+            & (ev_work.get("_asof_key", "") == as_of_label)
+        ].drop(columns=["_asof_key"], errors="ignore").copy()
     return cards, ev_filtered, {"as_of_date": as_of_label, "rows": len(cards), "evidence_rows": len(ev_filtered)}
 
 
@@ -5846,8 +5949,11 @@ elif page == "Model Cache":
             rebuild_date = st.date_input("Scorecards as of", value=date.today(), key="scorecards_asof")
             st.info("Rebuild scorecards after importing new results or fixing athlete genders. Start-list edits usually do not require rebuilding scorecards unless new athletes/results were also added.")
             if st.button("Rebuild all athlete scorecards", type="primary", width="stretch"):
-                with st.spinner("Building athlete scorecards into Supabase tables..."):
+                loader = loading_card("Building athlete scorecards", "Saving profile + discipline scores and top-5 evidence rows into Supabase...")
+                try:
                     logs = rebuild_all_athlete_scorecards(results, overrides, pd.Timestamp(rebuild_date))
+                finally:
+                    loader.empty()
                 st.success("Finished rebuilding athlete scorecards.")
                 display_table(logs, ["Gender", "Profile", "Discipline", "Scorecard Rows", "Evidence Rows", "Status", "rows_after_gender", "rows_after_family", "athletes_ranked"], height=520)
             try:
@@ -6031,8 +6137,11 @@ elif page == "Athlete Rankings":
         if results.empty:
             st.warning("No athlete results found. Import Athlete Results first.")
         else:
-            with st.spinner("Rebuilding selected scorecard..."):
+            loader = loading_card("Rebuilding selected scorecard", f"{ranking_gender} · {ranking_scope} · {view_kind}")
+            try:
                 rows, ev_rows, metrics = save_athlete_scorecard_combo(results, overrides, ranking_gender, ranking_scope, pd.Timestamp(date.today()), view_kind, TOP_SCORES_USED)
+            finally:
+                loader.empty()
             st.success(f"Saved {rows:,} scorecard rows and {ev_rows:,} evidence rows.")
             st.json(metrics)
             st.rerun()
