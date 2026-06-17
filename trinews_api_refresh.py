@@ -1262,3 +1262,203 @@ def test_api_pulls(
             summary.append(_sample_summary_row("start-list source probe", "error", 0, str(e)[:180]))
 
     return {"summary": summary, "samples": samples, "errors": errors}
+
+# ============================================================
+# Staged API sync helpers
+# ============================================================
+
+def _paged_get(api_key: str, table: str, params: Dict[str, Any], offset: int = 0, limit: int = 1000, timeout: int = 45) -> List[Dict[str, Any]]:
+    q = dict(params or {})
+    q["limit"] = int(limit)
+    q["offset"] = int(offset)
+    return _get(api_key, table, q, timeout=timeout)
+
+
+def build_athletes_sync_page(
+    api_key: str,
+    offset: int = 0,
+    limit: int = 1000,
+    pro_only: bool = True,
+) -> Dict[str, Any]:
+    """Pull one page from /athletes and shape it for local athlete tables."""
+    if not _clean(api_key):
+        raise ValueError("TriNews API key is required.")
+    params: Dict[str, Any] = {"select": "*", "order": "full_name.asc"}
+    if pro_only:
+        params["is_pro"] = "eq.true"
+    rows = _paged_get(api_key, "athletes", params, offset=offset, limit=limit)
+    app_rows = [athlete_master_row_from_api(r) for r in rows if _clean(r.get("id"))]
+    source_rows = [trinews_athlete_source_row(r) for r in rows if _clean(r.get("id"))]
+    return {
+        "athletes": app_rows,
+        "trinews_athletes": source_rows,
+        "summary": {
+            "athletes_returned": len(rows),
+            "athletes_ready": len(app_rows),
+            "offset": int(offset),
+            "limit": int(limit),
+            "next_offset": int(offset) + len(rows),
+            "done": len(rows) < int(limit),
+        },
+        "logs": [{"stage": "athletes", "status": "ok", "rows": len(rows), "offset": int(offset), "limit": int(limit)}],
+    }
+
+
+def build_races_sync_page(
+    api_key: str,
+    offset: int = 0,
+    limit: int = 1000,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    circuit: Optional[str] = None,
+    brand: Optional[str] = None,
+    has_results_only: bool = True,
+) -> Dict[str, Any]:
+    """Pull one page from /races and shape it for local source race table."""
+    if not _clean(api_key):
+        raise ValueError("TriNews API key is required.")
+    params: Dict[str, Any] = {"select": "*", "order": "date.desc"}
+    if has_results_only:
+        params["has_results"] = "eq.true"
+    sd = _clean(start_date)
+    ed = _clean(end_date)
+    filters = []
+    if sd:
+        filters.append(f"date.gte.{sd}")
+    if ed:
+        filters.append(f"date.lte.{ed}")
+    if filters:
+        # PostgREST supports combining filters with the reserved `and` operator.
+        params["and"] = f"({','.join(filters)})"
+    if circuit:
+        params["circuit"] = f"eq.{circuit}"
+    if brand:
+        params["brand"] = f"eq.{brand}"
+    rows = _paged_get(api_key, "races", params, offset=offset, limit=limit)
+    source_rows = [trinews_race_source_row(r, _as_float(r.get("strength_of_field"))) for r in rows if _clean(r.get("id"))]
+    return {
+        "trinews_races": source_rows,
+        "summary": {
+            "races_returned": len(rows),
+            "races_ready": len(source_rows),
+            "offset": int(offset),
+            "limit": int(limit),
+            "next_offset": int(offset) + len(rows),
+            "done": len(rows) < int(limit),
+        },
+        "logs": [{"stage": "races", "status": "ok", "rows": len(rows), "offset": int(offset), "limit": int(limit)}],
+    }
+
+
+def _source_race_to_api_race(row: Dict[str, Any]) -> Dict[str, Any]:
+    raw = row.get("raw")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = None
+    if isinstance(raw, dict) and raw.get("id"):
+        return raw
+    return {
+        "id": _clean(row.get("id")),
+        "name": _clean(row.get("name")),
+        "slug": _clean(row.get("slug")),
+        "date": _clean(row.get("date") or row.get("race_date")),
+        "organization": _clean(row.get("organization")),
+        "distance_category": _clean(row.get("distance_category")),
+        "tier": _clean(row.get("tier")),
+        "brand": _clean(row.get("brand")),
+        "circuit": _clean(row.get("circuit")),
+        "venue": _clean(row.get("venue")),
+        "country_name": _clean(row.get("country_name")),
+        "country_iso2": _clean(row.get("country_iso2")),
+        "strength_of_field": row.get("strength_of_field"),
+        "difficulty_score": row.get("difficulty_score"),
+        "has_results": row.get("has_results"),
+        "updated_at": _clean(row.get("updated_at")),
+    }
+
+
+def build_results_sync_for_races(
+    api_key: str,
+    race_rows: List[Dict[str, Any]],
+    result_limit_per_race: int = 1000,
+) -> Dict[str, Any]:
+    """Pull /results for an already-selected batch of race source rows."""
+    if not _clean(api_key):
+        raise ValueError("TriNews API key is required.")
+    logs: List[Dict[str, Any]] = []
+    races = [_source_race_to_api_race(r) for r in race_rows]
+    race_map: Dict[str, Dict[str, Any]] = {r.get("id"): r for r in races if _clean(r.get("id"))}
+    race_results_by_race: Dict[str, List[Dict[str, Any]]] = {}
+    all_results: List[Dict[str, Any]] = []
+    for race in races:
+        rid = _clean(race.get("id"))
+        if not rid:
+            continue
+        try:
+            rows = fetch_results_for_race(api_key, rid, limit=int(result_limit_per_race))
+            race_results_by_race[rid] = rows
+            all_results.extend(rows)
+            logs.append({"stage": "results", "status": "ok", "race_id": rid, "race_name": race.get("name"), "rows": len(rows)})
+        except Exception as e:
+            logs.append({"stage": "results", "status": "error", "race_id": rid, "race_name": race.get("name"), "error": str(e)[:500]})
+    computed_sof = {rid: computed_race_sof_from_results(rows) for rid, rows in race_results_by_race.items()}
+    athlete_ids = [_clean(r.get("athlete_id")) for r in all_results if _clean(r.get("athlete_id"))]
+    athlete_map = fetch_by_ids(api_key, "athletes", athlete_ids) if athlete_ids else {}
+    logs.append({"stage": "athletes_from_results", "status": "ok", "rows": len(athlete_map)})
+
+    app_result_rows: List[Dict[str, Any]] = []
+    source_result_rows: List[Dict[str, Any]] = []
+    for result in all_results:
+        rid = _clean(result.get("race_id"))
+        aid = _clean(result.get("athlete_id"))
+        race = dict(race_map.get(rid) or {})
+        if _as_float(race.get("strength_of_field")) is None and computed_sof.get(rid) is not None:
+            race["strength_of_field"] = computed_sof.get(rid)
+        athlete = athlete_map.get(aid)
+        app_row = result_to_pick_rows(result, race, athlete)
+        if _clean(app_row.get("athlete_name")) and _clean(app_row.get("race_name")):
+            app_result_rows.append(app_row)
+        source_result_rows.append(trinews_result_source_row(result, race, athlete))
+    athlete_rows = [athlete_master_row_from_api(a) for a in athlete_map.values()]
+    source_athletes = [trinews_athlete_source_row(a) for a in athlete_map.values()]
+    return {
+        "athletes": athlete_rows,
+        "athlete_results": app_result_rows,
+        "race_field_results": app_result_rows,
+        "trinews_results": source_result_rows,
+        "trinews_athletes": source_athletes,
+        "logs": logs,
+        "summary": {
+            "races_processed": len(races),
+            "results_returned": len(all_results),
+            "app_result_rows": len(app_result_rows),
+            "athletes_found": len(athlete_rows),
+            "rows_with_swim": sum(1 for r in app_result_rows if r.get("swim_seconds")),
+            "rows_with_bike": sum(1 for r in app_result_rows if r.get("bike_seconds")),
+            "rows_with_run": sum(1 for r in app_result_rows if r.get("run_seconds")),
+            "computed_sof_races": sum(1 for v in computed_sof.values() if v is not None),
+        },
+    }
+
+
+def build_start_lists_sync_page(
+    api_key: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    circuit: Optional[str] = None,
+    brand: Optional[str] = None,
+    max_races: int = 25,
+    row_limit_per_race: int = 500,
+) -> Dict[str, Any]:
+    return build_clean_start_list_sync(
+        api_key=api_key,
+        race_slugs=None,
+        start_date=start_date,
+        end_date=end_date,
+        circuit=circuit,
+        brand=brand,
+        max_races=int(max_races),
+        row_limit_per_race=int(row_limit_per_race),
+    )

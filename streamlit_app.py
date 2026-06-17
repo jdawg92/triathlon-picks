@@ -21,11 +21,23 @@ else:
     SCORE_ENGINE_IMPORT_ERROR = None
 
 try:
-    from trinews_api_refresh import build_clean_results_refresh, build_full_clean_api_rebuild, test_api_pulls
+    from trinews_api_refresh import (
+        build_clean_results_refresh,
+        build_full_clean_api_rebuild,
+        test_api_pulls,
+        build_athletes_sync_page,
+        build_races_sync_page,
+        build_results_sync_for_races,
+        build_start_lists_sync_page,
+    )
 except Exception as _trinews_api_import_error:
     build_clean_results_refresh = None
     build_full_clean_api_rebuild = None
     test_api_pulls = None
+    build_athletes_sync_page = None
+    build_races_sync_page = None
+    build_results_sync_for_races = None
+    build_start_lists_sync_page = None
     TRINEWS_API_IMPORT_ERROR = _trinews_api_import_error
 else:
     TRINEWS_API_IMPORT_ERROR = None
@@ -4297,7 +4309,6 @@ apply_dashboard_theme()
 
 NAV_GROUPS = [
     ("Main", [
-        ("📊 Command Center", "Command Center"),
         ("🏆 Race Dashboard", "Race Dashboard"),
         ("🥇 Athlete Rankings", "Athlete Rankings"),
     ]),
@@ -4315,7 +4326,7 @@ NAV_GROUPS = [
 PAGE_OPTIONS = {label: page_name for _, items in NAV_GROUPS for label, page_name in items}
 
 if "page_label" not in st.session_state or st.session_state["page_label"] not in PAGE_OPTIONS:
-    st.session_state["page_label"] = "📊 Command Center"
+    st.session_state["page_label"] = "🔄 API Sync"
 
 # ============================================================
 # Simplified scorecard predictor overrides
@@ -5447,11 +5458,48 @@ elif page == "Import CSVs":
     except Exception:
         default_trinews_key = ""
 
-    api_test_tab, sync_tab = st.tabs(["Test pulls", "Sync data"])
+    def source_table_ready(table_name: str) -> bool:
+        try:
+            supabase.table(table_name).select("id").limit(1).execute()
+            return True
+        except Exception:
+            return False
 
-    with api_test_tab:
+    def write_source_rows_safe(table_name: str, rows: List[Dict[str, Any]], conflict: str = "id") -> Tuple[bool, str]:
+        if not rows:
+            return True, "0 rows"
+        try:
+            upsert_chunks(table_name, rows, on_conflict=conflict)
+            return True, f"{len(rows):,} rows"
+        except Exception as e:
+            return False, str(e)[:500]
+
+    def load_trinews_race_batch(offset: int, limit: int, has_results_only: bool = True) -> List[Dict[str, Any]]:
+        q = supabase.table("trinews_races").select("*")
+        if has_results_only:
+            q = q.eq("has_results", True)
+        q = q.order("race_date", desc=True).range(int(offset), int(offset) + int(limit) - 1)
+        return q.execute().data or []
+
+    def delete_app_result_rows_for_race_urls(rows: List[Dict[str, Any]]) -> int:
+        race_urls = sorted({clean_str(r.get("race_url")) for r in rows if clean_str(r.get("race_url"))})
+        deleted = 0
+        for url in race_urls:
+            deleted += delete_rows_in_batches("athlete_results", [("race_url", url)])
+            deleted += delete_rows_in_batches("race_field_results", [("race_url", url)])
+        return deleted
+
+    def delete_start_rows_for_races(rows: List[Dict[str, Any]]) -> int:
+        keys = sorted({(clean_str(r.get("race_name")), clean_str(r.get("race_date"))) for r in rows if clean_str(r.get("race_name")) and clean_str(r.get("race_date"))})
+        deleted = 0
+        for race_name, race_date in keys:
+            deleted += delete_rows_in_batches("start_lists", [("race_name", race_name), ("race_date", race_date)])
+        return deleted
+
+    tabs = st.tabs(["Test pulls", "Sync athletes", "Sync races", "Sync results", "Sync start lists", "Coverage"])
+
+    with tabs[0]:
         section_title("🧪", "Test pulls")
-        st.caption("Read-only. Pulls a small sample from each API source.")
         api_key = st.text_input(
             "TriNews API key",
             value=default_trinews_key,
@@ -5466,26 +5514,19 @@ elif page == "Import CSVs":
 
         if st.button("Run test", type="primary", key="run_trinews_api_pull_test"):
             if test_api_pulls is None:
-                st.error(f"trinews_api_refresh.py could not be imported or is missing test_api_pulls: {TRINEWS_API_IMPORT_ERROR}")
+                st.error(f"trinews_api_refresh.py could not be imported: {TRINEWS_API_IMPORT_ERROR}")
             elif not api_key:
                 st.warning("Enter the TriNews API key or add TRINEWS_API_KEY to Streamlit secrets.")
             else:
                 loader = loading_card("Testing API pulls", "Fetching samples...")
                 try:
-                    test_payload = test_api_pulls(
-                        api_key=api_key,
-                        athlete_query=test_athlete,
-                        race_slug=test_race_slug,
-                        limit=int(sample_limit),
-                    )
+                    test_payload = test_api_pulls(api_key=api_key, athlete_query=test_athlete, race_slug=test_race_slug, limit=int(sample_limit))
                 finally:
                     loader.empty()
-
                 summary = pd.DataFrame(test_payload.get("summary", []) or [])
                 if not summary.empty:
                     st.subheader("Summary")
                     st.dataframe(summary, width="stretch", hide_index=True)
-
                 samples = test_payload.get("samples", {}) or {}
                 for label, rows in samples.items():
                     with st.expander(label, expanded=label in {"race_results", "athlete_results", "start_list_probe"}):
@@ -5493,7 +5534,6 @@ elif page == "Import CSVs":
                             st.dataframe(pd.DataFrame(rows).head(int(sample_limit)), width="stretch", hide_index=True)
                         else:
                             st.json(rows)
-
                 errors = test_payload.get("errors", []) or []
                 if errors:
                     st.warning("Some test pulls returned errors.")
@@ -5501,173 +5541,240 @@ elif page == "Import CSVs":
                 else:
                     st.success("Test complete.")
 
-    with sync_tab:
-        section_title("🔄", "Sync data")
-        api_key = st.text_input(
-            "TriNews API key",
-            value=default_trinews_key,
-            type="password",
-            key="trinews_fresh_rebuild_key",
-        )
-
-        mode = st.radio("Mode", ["Preview", "Write to Supabase"], horizontal=True, key="trinews_sync_mode")
-        preset = st.selectbox(
-            "Size",
-            ["Test - 10 races", "Recent season - 250 races", "Selected range", "Custom"],
-            index=0,
-            key="trinews_sync_preset",
-        )
-
-        r1, r2, r3, r4 = st.columns(4)
-        full_start_date = r1.date_input("Start date", value=date(2024, 1, 1), key="trinews_fresh_start_date")
-        full_end_date = r2.date_input("End date", value=date.today(), key="trinews_fresh_end_date")
-        full_circuit = r3.selectbox("Circuit", ["all", "long_course", "short_course"], index=0, key="trinews_fresh_circuit")
-        full_brand = r4.selectbox("Brand", ["all", "t100", "ironman", "world_triathlon", "pto"], index=0, key="trinews_fresh_brand")
-
-        default_max_races = 10
-        default_result_limit = 10
-        default_start_list_races = 10
-        if preset == "Recent season - 250 races":
-            default_max_races = 250
-            default_result_limit = 300
-            default_start_list_races = 50
-        elif preset == "Selected range":
-            default_max_races = 1500
-            default_result_limit = 500
-            default_start_list_races = 150
-        elif preset == "Custom":
-            default_max_races = 500
-            default_result_limit = 500
-            default_start_list_races = 100
-
-        rr1, rr2, rr3 = st.columns(3)
-        full_max_races = rr1.number_input("Max races", min_value=1, max_value=10000, value=default_max_races, step=10, key=f"trinews_fresh_max_races_{preset}")
-        full_result_limit = rr2.number_input("Max results per race", min_value=1, max_value=2000, value=default_result_limit, step=10, key=f"trinews_fresh_result_limit_{preset}")
-        max_start_list_races = rr3.number_input("Max start-list races", min_value=1, max_value=1000, value=default_start_list_races, step=10, key=f"trinews_fresh_max_start_list_races_{preset}")
-
-        o1, o2, o3 = st.columns(3)
-        sync_start_lists_api = o1.checkbox("Sync start lists", value=True, key="trinews_fresh_sync_start_lists")
-        replace_athletes_master = o2.checkbox("Replace athletes", value=True, key="trinews_fresh_replace_athletes")
-        replace_start_lists = o3.checkbox("Replace start_lists", value=True, key="trinews_fresh_replace_start_lists")
-        write_source_tables = st.checkbox("Write source-cache tables", value=False, help="Optional tables: trinews_athletes, trinews_races, trinews_results, trinews_start_lists.", key="trinews_fresh_write_source_tables")
-
-        confirm_rebuild = ""
-        if mode == "Write to Supabase":
-            st.warning("Write mode replaces imported API tables in Supabase.")
-            confirm_rebuild = st.text_input("Type REBUILD", value="", key="trinews_fresh_confirm")
-
-        action_label = "Preview sync" if mode == "Preview" else "Run sync"
-        if st.button(action_label, type="primary", key="trinews_fresh_build_btn"):
-            if build_full_clean_api_rebuild is None:
-                st.error("trinews_api_refresh.py does not include build_full_clean_api_rebuild. Upload the latest trinews_api_refresh.py file.")
+    with tabs[1]:
+        section_title("👤", "Sync athletes")
+        api_key = st.text_input("TriNews API key", value=default_trinews_key, type="password", key="trinews_athletes_key")
+        existing_source = count_rows("trinews_athletes") or 0
+        existing_app = count_rows("athletes") or 0
+        c1, c2 = st.columns(2)
+        c1.metric("Local source athletes", f"{existing_source:,}")
+        c2.metric("App athletes", f"{existing_app:,}")
+        a1, a2, a3 = st.columns(3)
+        athlete_offset = a1.number_input("Offset", min_value=0, value=int(existing_source), step=1000, key="trinews_athlete_offset")
+        athlete_limit = a2.number_input("Limit", min_value=10, max_value=5000, value=1000, step=100, key="trinews_athlete_limit")
+        pro_only = a3.checkbox("Pro athletes only", value=True, key="trinews_athlete_pro_only")
+        athlete_mode = st.radio("Mode", ["Preview", "Write to Supabase"], horizontal=True, key="trinews_athletes_mode")
+        if st.button("Sync athlete page", type="primary", key="sync_athlete_page"):
+            if build_athletes_sync_page is None:
+                st.error(f"Missing staged athlete sync helper. Upload the latest trinews_api_refresh.py. {TRINEWS_API_IMPORT_ERROR}")
             elif not api_key:
-                st.warning("Enter the TriNews API key or add TRINEWS_API_KEY to Streamlit secrets.")
-            elif mode == "Write to Supabase" and confirm_rebuild.strip() != "REBUILD":
-                st.error("Type REBUILD to run the sync.")
+                st.warning("Enter the TriNews API key.")
             else:
-                loader = loading_card("Syncing API data", "Fetching races, results, athletes, and start lists...")
+                loader = loading_card("Syncing athletes", f"Pulling {int(athlete_limit):,} rows from offset {int(athlete_offset):,}...")
                 try:
-                    full_payload = build_full_clean_api_rebuild(
-                        api_key=api_key,
-                        start_date=str(full_start_date),
-                        end_date=str(full_end_date),
-                        circuit=None if full_circuit == "all" else full_circuit,
-                        brand=None if full_brand == "all" else full_brand,
-                        max_races=int(full_max_races),
-                        race_result_limit=int(full_result_limit),
-                        sync_all_pro_athletes=False,
-                        max_athletes=0,
-                        sync_start_lists=bool(sync_start_lists_api),
-                        start_list_start_date=str(date.today()),
-                        start_list_end_date=str(date.today() + timedelta(days=180)),
-                        max_start_list_races=int(max_start_list_races),
+                    payload = build_athletes_sync_page(api_key, offset=int(athlete_offset), limit=int(athlete_limit), pro_only=bool(pro_only))
+                finally:
+                    loader.empty()
+                summary = payload.get("summary", {}) or {}
+                st.json(summary)
+                sample = pd.DataFrame(payload.get("athletes", [])[:25])
+                if not sample.empty:
+                    st.dataframe(sample, width="stretch", hide_index=True)
+                if athlete_mode == "Write to Supabase":
+                    ok, msg = write_source_rows_safe("trinews_athletes", payload.get("trinews_athletes", []) or [], "id")
+                    if not ok:
+                        st.warning(f"Source table write skipped or failed: {msg}")
+                    inserted, updated = upsert_athletes_preserve_gender(payload.get("athletes", []) or [])
+                    clear_cache()
+                    st.success(f"Athletes synced. App inserted/updated: {inserted:,} / {updated:,}. Source write: {msg}")
+                else:
+                    st.success("Preview complete. No data was written.")
+
+    with tabs[2]:
+        section_title("🏁", "Sync races")
+        api_key = st.text_input("TriNews API key", value=default_trinews_key, type="password", key="trinews_races_key")
+        race_count = count_rows("trinews_races") or 0
+        st.metric("Local source races", f"{race_count:,}")
+        r1, r2, r3, r4 = st.columns(4)
+        race_offset = r1.number_input("Offset", min_value=0, value=int(race_count), step=1000, key="trinews_race_offset")
+        race_limit = r2.number_input("Limit", min_value=10, max_value=5000, value=1000, step=100, key="trinews_race_limit")
+        race_start = r3.date_input("Start date", value=date(2020, 1, 1), key="trinews_race_start")
+        race_end = r4.date_input("End date", value=date.today(), key="trinews_race_end")
+        f1, f2, f3 = st.columns(3)
+        race_circuit = f1.selectbox("Circuit", ["all", "long_course", "short_course"], index=0, key="trinews_race_circuit")
+        race_brand = f2.selectbox("Brand", ["all", "t100", "ironman", "world_triathlon", "pto"], index=0, key="trinews_race_brand")
+        has_results_only = f3.checkbox("Races with results", value=True, key="trinews_race_has_results")
+        race_mode = st.radio("Mode", ["Preview", "Write to Supabase"], horizontal=True, key="trinews_races_mode")
+        if st.button("Sync race page", type="primary", key="sync_race_page"):
+            if build_races_sync_page is None:
+                st.error(f"Missing staged race sync helper. Upload the latest trinews_api_refresh.py. {TRINEWS_API_IMPORT_ERROR}")
+            elif not api_key:
+                st.warning("Enter the TriNews API key.")
+            else:
+                loader = loading_card("Syncing races", f"Pulling {int(race_limit):,} rows from offset {int(race_offset):,}...")
+                try:
+                    payload = build_races_sync_page(
+                        api_key,
+                        offset=int(race_offset),
+                        limit=int(race_limit),
+                        start_date=str(race_start),
+                        end_date=str(race_end),
+                        circuit=None if race_circuit == "all" else race_circuit,
+                        brand=None if race_brand == "all" else race_brand,
+                        has_results_only=bool(has_results_only),
                     )
                 finally:
                     loader.empty()
-
-                summary = full_payload.get("summary", {}) or {}
-                s1, s2, s3, s4, s5, s6 = st.columns(6)
-                s1.metric("Races", f"{summary.get('races', 0):,}")
-                s2.metric("Results", f"{summary.get('results', 0):,}")
-                s3.metric("Athletes", f"{summary.get('athletes', 0):,}")
-                s4.metric("Swim rows", f"{summary.get('rows_with_swim', 0):,}")
-                s5.metric("Start lists", f"{summary.get('start_list_rows', 0):,}")
-                s6.metric("SOF races", f"{summary.get('computed_sof_races', 0):,}")
-
-                logs_df = pd.DataFrame(full_payload.get("logs", []) or [])
-                if not logs_df.empty:
-                    with st.expander("Sync log", expanded=False):
-                        st.dataframe(logs_df, width="stretch", hide_index=True)
-
-                sample_rows = pd.DataFrame((full_payload.get("athlete_results", []) or [])[:25])
-                if not sample_rows.empty:
-                    st.subheader("Sample result rows")
-                    cols = [c for c in ["athlete_name", "gender", "race_date", "race_name", "race_type", "place", "sof", "ors", "swim_seconds", "bike_seconds", "run_seconds", "status"] if c in sample_rows.columns]
-                    st.dataframe(sample_rows[cols], width="stretch", hide_index=True)
-
-                sample_start_rows = pd.DataFrame((full_payload.get("start_lists", []) or [])[:25])
-                if not sample_start_rows.empty:
-                    st.subheader("Sample start-list rows")
-                    start_cols = [c for c in ["race_date", "race_name", "gender", "athlete_name", "athlete_url", "open_rank"] if c in sample_start_rows.columns]
-                    st.dataframe(sample_start_rows[start_cols], width="stretch", hide_index=True)
-
-                if mode == "Preview":
-                    st.success("Preview complete. No data was written.")
+                st.json(payload.get("summary", {}) or {})
+                sample = pd.DataFrame(payload.get("trinews_races", [])[:25])
+                if not sample.empty:
+                    cols = [c for c in ["name", "slug", "race_date", "distance_category", "tier", "brand", "circuit", "has_results"] if c in sample.columns]
+                    st.dataframe(sample[cols], width="stretch", hide_index=True)
+                if race_mode == "Write to Supabase":
+                    ok, msg = write_source_rows_safe("trinews_races", payload.get("trinews_races", []) or [], "id")
+                    if ok:
+                        clear_cache()
+                        st.success(f"Races synced. Source write: {msg}")
+                    else:
+                        st.error(f"Could not write trinews_races. Run the source-cache SQL first. Error: {msg}")
                 else:
-                    with st.spinner("Writing to Supabase..."):
-                        score_clear = clear_scorecard_tables_for_rebuild()
-                        if replace_athletes_master:
-                            delete_all("athletes")
-                        delete_all("athlete_results")
-                        delete_all("race_field_results")
-                        if replace_start_lists:
-                            delete_all("start_lists")
+                    st.success("Preview complete. No data was written.")
 
-                        athlete_rows = full_payload.get("athletes", []) or []
-                        a_inserted, a_updated = upsert_athletes_preserve_gender(athlete_rows)
-
-                        athlete_result_rows = dedupe_result_rows(full_payload.get("athlete_results", []) or [])
-                        race_field_rows = dedupe_result_rows(full_payload.get("race_field_results", []) or [])
-                        ar_rows, ar_ath_ins, ar_ath_upd, ar_prop = sync_athlete_master_import(athlete_result_rows, athlete_rows)
-                        rf_rows, rf_ath_ins, rf_ath_upd, rf_prop = sync_athlete_master_import(race_field_rows, athlete_rows)
+    with tabs[3]:
+        section_title("📈", "Sync results")
+        api_key = st.text_input("TriNews API key", value=default_trinews_key, type="password", key="trinews_results_key")
+        source_races_count = count_rows("trinews_races") or 0
+        source_results_count = count_rows("trinews_results") or 0
+        app_results_count = count_rows("athlete_results") or 0
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Source races", f"{source_races_count:,}")
+        m2.metric("Source results", f"{source_results_count:,}")
+        m3.metric("App results", f"{app_results_count:,}")
+        b1, b2, b3 = st.columns(3)
+        results_race_offset = b1.number_input("Race offset", min_value=0, value=0, step=50, key="trinews_results_race_offset")
+        results_race_limit = b2.number_input("Race batch size", min_value=1, max_value=500, value=50, step=10, key="trinews_results_race_batch")
+        result_limit_per_race = b3.number_input("Max results per race", min_value=10, max_value=2000, value=500, step=50, key="trinews_results_per_race")
+        results_mode = st.radio("Mode", ["Preview", "Write to Supabase"], horizontal=True, key="trinews_results_mode")
+        st.caption("This uses races already stored in trinews_races. Process races in batches so the app does not time out.")
+        if st.button("Sync results for race batch", type="primary", key="sync_results_page"):
+            if build_results_sync_for_races is None:
+                st.error(f"Missing staged results sync helper. Upload the latest trinews_api_refresh.py. {TRINEWS_API_IMPORT_ERROR}")
+            elif not api_key:
+                st.warning("Enter the TriNews API key.")
+            else:
+                try:
+                    race_batch = load_trinews_race_batch(int(results_race_offset), int(results_race_limit), has_results_only=True)
+                except Exception as e:
+                    st.error("Could not read trinews_races. Run the source-cache SQL, then sync races first.")
+                    st.exception(e)
+                    race_batch = []
+                if race_batch:
+                    loader = loading_card("Syncing results", f"Pulling results for {len(race_batch):,} races...")
+                    try:
+                        payload = build_results_sync_for_races(api_key, race_batch, result_limit_per_race=int(result_limit_per_race))
+                    finally:
+                        loader.empty()
+                    summary = payload.get("summary", {}) or {}
+                    st.json(summary)
+                    sample = pd.DataFrame(payload.get("athlete_results", [])[:25])
+                    if not sample.empty:
+                        cols = [c for c in ["athlete_name", "gender", "race_date", "race_name", "race_type", "place", "sof", "ors", "swim_seconds", "bike_seconds", "run_seconds", "status"] if c in sample.columns]
+                        st.dataframe(sample[cols], width="stretch", hide_index=True)
+                    if results_mode == "Write to Supabase":
+                        source_writes = []
+                        for table_name, key in [("trinews_athletes", "trinews_athletes"), ("trinews_results", "trinews_results")]:
+                            ok, msg = write_source_rows_safe(table_name, payload.get(key, []) or [], "id")
+                            source_writes.append(f"{table_name}: {msg if ok else 'error - ' + msg}")
+                        athlete_rows = payload.get("athletes", []) or []
+                        upsert_athletes_preserve_gender(athlete_rows)
+                        ar_rows = dedupe_result_rows(payload.get("athlete_results", []) or [])
+                        rf_rows = dedupe_result_rows(payload.get("race_field_results", []) or [])
+                        deleted = delete_app_result_rows_for_race_urls(ar_rows)
+                        ar_rows, ar_ath_ins, ar_ath_upd, ar_prop = sync_athlete_master_import(ar_rows, athlete_rows)
+                        rf_rows, rf_ath_ins, rf_ath_upd, rf_prop = sync_athlete_master_import(rf_rows, athlete_rows)
                         insert_chunks("athlete_results", ar_rows)
                         insert_chunks("race_field_results", rf_rows)
-
-                        start_rows = dedupe_start_list_rows(full_payload.get("start_lists", []) or [])
-                        sl_ath_ins = sl_ath_upd = 0
-                        if start_rows:
-                            start_rows, sl_ath_ins, sl_ath_upd, sl_prop = sync_athlete_master_import(start_rows, athlete_rows)
-                            insert_chunks("start_lists", start_rows)
-
-                        source_writes = {}
-                        if write_source_tables:
-                            for table_name, payload_key in [
-                                ("trinews_athletes", "trinews_athletes"),
-                                ("trinews_races", "trinews_races"),
-                                ("trinews_results", "trinews_results"),
-                                ("trinews_start_lists", "trinews_start_lists"),
-                            ]:
-                                rows_to_write = full_payload.get(payload_key, []) or []
-                                try:
-                                    delete_all(table_name)
-                                    upsert_chunks(table_name, rows_to_write, on_conflict="id")
-                                    source_writes[table_name] = f"{len(rows_to_write):,} rows"
-                                except Exception as e:
-                                    source_writes[table_name] = f"Skipped/error: {str(e)[:160]}"
                         clear_cache()
+                        st.success(f"Results synced. Deleted old app rows for these races: {deleted:,}. Inserted athlete_results: {len(ar_rows):,}. Race-field rows: {len(rf_rows):,}.")
+                        st.caption(" | ".join(source_writes))
+                    else:
+                        st.success("Preview complete. No data was written.")
 
-                    st.success(
-                        "Sync complete. "
-                        f"Athlete results: {len(ar_rows):,}. "
-                        f"Race-field results: {len(rf_rows):,}. "
-                        f"Start-list rows: {len(start_rows):,}. "
-                        f"Athletes inserted/updated: {a_inserted + ar_ath_ins + rf_ath_ins + sl_ath_ins:,} / {a_updated + ar_ath_upd + rf_ath_upd + sl_ath_upd:,}."
+    with tabs[4]:
+        section_title("📋", "Sync start lists")
+        api_key = st.text_input("TriNews API key", value=default_trinews_key, type="password", key="trinews_start_lists_key")
+        start_count = count_rows("start_lists") or 0
+        source_start_count = count_rows("trinews_start_lists") or 0
+        s1, s2 = st.columns(2)
+        s1.metric("App start-list rows", f"{start_count:,}")
+        s2.metric("Source start-list rows", f"{source_start_count:,}")
+        sl1, sl2, sl3 = st.columns(3)
+        sl_start = sl1.date_input("Start date", value=date.today(), key="trinews_sl_start")
+        sl_end = sl2.date_input("End date", value=date.today() + timedelta(days=180), key="trinews_sl_end")
+        sl_max_races = sl3.number_input("Max races", min_value=1, max_value=500, value=25, step=10, key="trinews_sl_max_races")
+        sl4, sl5, sl6 = st.columns(3)
+        sl_circuit = sl4.selectbox("Circuit", ["all", "long_course", "short_course"], index=0, key="trinews_sl_circuit")
+        sl_brand = sl5.selectbox("Brand", ["all", "t100", "ironman", "world_triathlon", "pto"], index=0, key="trinews_sl_brand")
+        sl_row_limit = sl6.number_input("Max athletes per race", min_value=10, max_value=1000, value=500, step=50, key="trinews_sl_row_limit")
+        sl_mode = st.radio("Mode", ["Preview", "Write to Supabase"], horizontal=True, key="trinews_sl_mode")
+        if st.button("Sync start lists", type="primary", key="sync_start_lists_page"):
+            if build_start_lists_sync_page is None:
+                st.error(f"Missing staged start-list sync helper. Upload the latest trinews_api_refresh.py. {TRINEWS_API_IMPORT_ERROR}")
+            elif not api_key:
+                st.warning("Enter the TriNews API key.")
+            else:
+                loader = loading_card("Syncing start lists", f"Checking up to {int(sl_max_races):,} races...")
+                try:
+                    payload = build_start_lists_sync_page(
+                        api_key=api_key,
+                        start_date=str(sl_start),
+                        end_date=str(sl_end),
+                        circuit=None if sl_circuit == "all" else sl_circuit,
+                        brand=None if sl_brand == "all" else sl_brand,
+                        max_races=int(sl_max_races),
+                        row_limit_per_race=int(sl_row_limit),
                     )
-                    st.caption(f"Scorecard clear method: {score_clear.get('method')}")
-                    if source_writes:
-                        with st.expander("Source table writes", expanded=False):
-                            st.json(source_writes)
-                    st.info("Next: rebuild athlete scorecards in Model Cache.")
+                finally:
+                    loader.empty()
+                st.json(payload.get("summary", {}) or {})
+                sample = pd.DataFrame(payload.get("start_lists", [])[:25])
+                if not sample.empty:
+                    cols = [c for c in ["race_date", "race_name", "gender", "athlete_name", "athlete_url", "open_rank"] if c in sample.columns]
+                    st.dataframe(sample[cols], width="stretch", hide_index=True)
+                logs_df = pd.DataFrame(payload.get("logs", []) or [])
+                if not logs_df.empty:
+                    with st.expander("Discovery log", expanded=False):
+                        st.dataframe(logs_df, width="stretch", hide_index=True)
+                if sl_mode == "Write to Supabase":
+                    ok, msg = write_source_rows_safe("trinews_start_lists", payload.get("trinews_start_lists", []) or [], "id")
+                    if not ok:
+                        st.warning(f"Source start-list write skipped or failed: {msg}")
+                    athlete_rows = payload.get("athletes", []) or []
+                    upsert_athletes_preserve_gender(athlete_rows)
+                    start_rows = dedupe_start_list_rows(payload.get("start_lists", []) or [])
+                    deleted = delete_start_rows_for_races(start_rows)
+                    if start_rows:
+                        start_rows, sl_ath_ins, sl_ath_upd, sl_prop = sync_athlete_master_import(start_rows, athlete_rows)
+                        insert_chunks("start_lists", start_rows)
+                    clear_cache()
+                    st.success(f"Start lists synced. Deleted old rows for these races: {deleted:,}. Inserted: {len(start_rows):,}. Source write: {msg}")
+                else:
+                    st.success("Preview complete. No data was written.")
+
+    with tabs[5]:
+        section_title("✅", "Coverage")
+        table_names = ["trinews_athletes", "trinews_races", "trinews_results", "trinews_start_lists", "athletes", "athlete_results", "race_field_results", "start_lists", "athlete_scorecards"]
+        rows = []
+        for table_name in table_names:
+            rows.append({"Table": table_name, "Rows": count_rows(table_name)})
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        try:
+            starts = fetch_all("start_lists", select="athlete_url,race_name,race_date", page_size=1000)
+            results = fetch_all("athlete_results", select="athlete_url", page_size=1000)
+            result_urls = {clean_str(r.get("athlete_url")) for r in results if clean_str(r.get("athlete_url"))}
+            start_urls = [clean_str(r.get("athlete_url")) for r in starts if clean_str(r.get("athlete_url"))]
+            linked = sum(1 for u in start_urls if u in result_urls)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Start-list athletes", f"{len(start_urls):,}")
+            c2.metric("Linked to result history", f"{linked:,}")
+            c3.metric("Unlinked", f"{max(len(start_urls)-linked,0):,}")
+            unlinked = [r for r in starts if clean_str(r.get("athlete_url")) and clean_str(r.get("athlete_url")) not in result_urls]
+            if unlinked:
+                with st.expander("Unlinked start-list athletes", expanded=False):
+                    st.dataframe(pd.DataFrame(unlinked).head(250), width="stretch", hide_index=True)
+        except Exception as e:
+            st.info("Coverage check will be more useful after start lists and results are synced.")
+            st.caption(str(e)[:300])
 
 elif page == "Start Lists":
     st.header("📋 Start Lists")
