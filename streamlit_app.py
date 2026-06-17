@@ -1343,6 +1343,7 @@ def fetch_all(table_name: str, select: str = "*", page_size: int = 1000) -> List
     return all_rows
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def count_rows(table_name: str) -> Optional[int]:
     """Return an exact Supabase table count when available."""
     try:
@@ -1451,7 +1452,15 @@ def load_start_lists_light() -> pd.DataFrame:
     The dashboard now reads saved athlete_scorecards, so it should not load
     38k+ raw result rows just to open a race.
     """
-    starts = load_table("start_lists")
+    select_cols = (
+        "athlete_url,athlete_name,gender,race_name,race_date,open_rank,"
+        "race_type,distance,source"
+    )
+    try:
+        starts = pd.DataFrame(fetch_all("start_lists", select=select_cols))
+    except Exception:
+        # Older deployments may not have every display helper column yet.
+        starts = load_table("start_lists")
     starts = canonicalize_athlete_url_column(starts)
     if not starts.empty:
         starts.columns = [str(c) for c in starts.columns]
@@ -7672,17 +7681,28 @@ elif page == "Database Viewer":
     limit_max = max(5000, min(100000, int(exact_count or 50000)))
     limit = st.slider("Rows to display", 10, limit_max, min(5000, limit_max))
     try:
-        all_rows = fetch_all(table, page_size=1000)
-        df_all = pd.DataFrame(all_rows)
-        st.write(f"Fetched {len(df_all):,} rows from Supabase. Showing first {min(limit, len(df_all)):,}.")
-        st.dataframe(df_all.head(limit), width="stretch")
-        if not df_all.empty:
+        preview_rows = supabase.table(table).select("*").range(0, int(limit) - 1).execute().data or []
+        df_preview = pd.DataFrame(preview_rows)
+        st.write(f"Fetched {len(df_preview):,} preview rows from Supabase.")
+        st.dataframe(df_preview, width="stretch")
+        if not df_preview.empty:
             st.download_button(
-                label=f"Download all {table} rows as CSV",
-                data=df_all.to_csv(index=False).encode("utf-8"),
-                file_name=f"{table}.csv",
+                label=f"Download displayed {table} rows as CSV",
+                data=df_preview.to_csv(index=False).encode("utf-8"),
+                file_name=f"{table}_preview.csv",
                 mime="text/csv",
             )
+        with st.expander("Export full table"):
+            st.caption("Full exports can be slow on large tables. Use this only when you really need every row.")
+            if st.button(f"Fetch all {table} rows for CSV", key=f"fetch_all_{table}_csv"):
+                all_rows = fetch_all(table, page_size=1000)
+                df_all = pd.DataFrame(all_rows)
+                st.download_button(
+                    label=f"Download all {len(df_all):,} {table} rows as CSV",
+                    data=df_all.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{table}.csv",
+                    mime="text/csv",
+                )
     except Exception as e:
         st.error("Could not load table.")
         st.exception(e)
