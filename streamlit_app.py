@@ -36,7 +36,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v2_fast_fix"
+MODEL_CACHE_VERSION = "score_engine_v3_fast_clear"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -1356,8 +1356,33 @@ def clear_cache():
     st.cache_data.clear()
 
 
+def delete_rows_in_batches(table_name: str, filters: Optional[List[Tuple[str, Any]]] = None, chunk_size: int = 500) -> int:
+    """Delete rows in small batches so Supabase/Postgres does not time out.
+
+    Large scorecard/evidence tables can exceed the PostgREST statement timeout
+    when deleted with one broad request. This helper repeatedly selects a small
+    batch of ids and deletes only those ids.
+    """
+    filters = filters or []
+    deleted = 0
+    while True:
+        q = supabase.table(table_name).select("id").limit(chunk_size)
+        for col, val in filters:
+            q = q.eq(col, val)
+        res = q.execute()
+        rows = res.data or []
+        ids = [r.get("id") for r in rows if r.get("id") is not None]
+        if not ids:
+            break
+        supabase.table(table_name).delete().in_("id", ids).execute()
+        deleted += len(ids)
+        if len(ids) < chunk_size:
+            break
+    return deleted
+
+
 def delete_all(table_name: str):
-    supabase.table(table_name).delete().gte("id", 0).execute()
+    return delete_rows_in_batches(table_name)
 
 
 def insert_chunks(table_name: str, rows: List[Dict[str, Any]], chunk_size: int = 500):
@@ -3715,7 +3740,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v2_fast_fix"
+MODEL_CACHE_VERSION = "score_engine_v3_fast_clear"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4257,7 +4282,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "score_engine_v2_fast_fix"
+MODEL_CACHE_VERSION = "score_engine_v3_fast_clear"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4620,6 +4645,28 @@ def ensure_scorecard_tables() -> None:
         )
 
 
+def clear_scorecard_tables_for_rebuild() -> Dict[str, Any]:
+    """Clear saved scorecards without hitting the API statement timeout.
+
+    Preferred path: call the optional Postgres RPC installed by
+    scorecard_clear_rpc.sql, which truncates both scorecard tables almost
+    instantly. Fallback path: batch-delete ids through Supabase if the RPC has
+    not been installed yet.
+    """
+    try:
+        supabase.rpc("clear_scorecard_tables").execute()
+        return {"method": "rpc_truncate", "scorecards_deleted": None, "evidence_deleted": None}
+    except Exception as rpc_error:
+        evidence_deleted = delete_rows_in_batches("athlete_scorecard_evidence", chunk_size=500)
+        scorecards_deleted = delete_rows_in_batches("athlete_scorecards", chunk_size=500)
+        return {
+            "method": "batched_delete",
+            "scorecards_deleted": scorecards_deleted,
+            "evidence_deleted": evidence_deleted,
+            "rpc_error": str(rpc_error),
+        }
+
+
 def _delete_scorecard_combo(gender: str, profile: str, discipline: str, as_of_ts: pd.Timestamp) -> None:
     as_of_label = iso_date(as_of_ts)
     for table_name in ["athlete_scorecard_evidence", "athlete_scorecards"]:
@@ -4851,11 +4898,11 @@ def rebuild_all_athlete_scorecards(results: pd.DataFrame, overrides: pd.DataFram
         top_n=TOP_SCORES_USED,
     )
 
-    progress.progress(0.65, text="Replacing saved scorecard tables...")
+    progress.progress(0.65, text="Clearing saved scorecard tables...")
     # Rebuild-all should be deterministic: clear old scorecards/evidence first,
-    # then save the fresh model version. This also removes old bad cached rows.
-    delete_all("athlete_scorecard_evidence")
-    delete_all("athlete_scorecards")
+    # then save the fresh model version. Use RPC truncate when available; fall
+    # back to batched deletes so large tables do not time out.
+    clear_info = clear_scorecard_tables_for_rebuild()
 
     progress.progress(0.78, text="Saving athlete scorecards...")
     scorecard_rows = cache_safe_rows(scorecards_df) if scorecards_df is not None and not scorecards_df.empty else []
@@ -4875,6 +4922,7 @@ def rebuild_all_athlete_scorecards(results: pd.DataFrame, overrides: pd.DataFram
         logs_df["Model Version"] = MODEL_CACHE_VERSION
         logs_df["Saved Scorecards"] = len(scorecard_rows)
         logs_df["Saved Evidence Rows"] = len(evidence_rows)
+        logs_df["Clear Method"] = clear_info.get("method")
     return logs_df
 
 
@@ -5920,10 +5968,9 @@ elif page == "Model Cache":
 
     if col_b.button("Clear scorecards", width="stretch"):
         try:
-            delete_all("athlete_scorecard_evidence")
-            delete_all("athlete_scorecards")
+            info = clear_scorecard_tables_for_rebuild()
             clear_cache()
-            st.success("Cleared scorecard tables.")
+            st.success(f"Cleared scorecard tables using {info.get('method', 'batch delete')}.")
         except Exception as e:
             st.error("Could not clear scorecard tables.")
             st.exception(e)
