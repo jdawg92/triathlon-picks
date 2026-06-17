@@ -5547,38 +5547,95 @@ elif page == "Import CSVs":
         existing_source = count_rows("trinews_athletes") or 0
         existing_app = count_rows("athletes") or 0
         c1, c2 = st.columns(2)
-        c1.metric("Local source athletes", f"{existing_source:,}")
+        c1.metric("Source athletes", f"{existing_source:,}")
         c2.metric("App athletes", f"{existing_app:,}")
-        a1, a2, a3 = st.columns(3)
+
+        st.caption("Syncs athletes from the TriNews API in pages. If a page returns the full limit, there are more pages after it.")
+        a1, a2, a3, a4 = st.columns(4)
         athlete_offset = a1.number_input("Offset", min_value=0, value=int(existing_source), step=1000, key="trinews_athlete_offset")
-        athlete_limit = a2.number_input("Limit", min_value=10, max_value=5000, value=1000, step=100, key="trinews_athlete_limit")
-        pro_only = a3.checkbox("Pro athletes only", value=True, key="trinews_athlete_pro_only")
+        athlete_limit = a2.number_input("Rows per page", min_value=10, max_value=5000, value=1000, step=100, key="trinews_athlete_limit")
+        athlete_pages = a3.number_input("Pages this run", min_value=1, max_value=10, value=1, step=1, key="trinews_athlete_pages")
+        pro_only = a4.checkbox("Pro only", value=True, key="trinews_athlete_pro_only")
         athlete_mode = st.radio("Mode", ["Preview", "Write to Supabase"], horizontal=True, key="trinews_athletes_mode")
-        if st.button("Sync athlete page", type="primary", key="sync_athlete_page"):
+
+        if st.button("Sync athletes", type="primary", key="sync_athlete_page"):
             if build_athletes_sync_page is None:
                 st.error(f"Missing staged athlete sync helper. Upload the latest trinews_api_refresh.py. {TRINEWS_API_IMPORT_ERROR}")
             elif not api_key:
                 st.warning("Enter the TriNews API key.")
             else:
-                loader = loading_card("Syncing athletes", f"Pulling {int(athlete_limit):,} rows from offset {int(athlete_offset):,}...")
+                start_offset = int(athlete_offset)
+                page_limit = int(athlete_limit)
+                pages_to_process = int(athlete_pages)
+                all_app_rows: List[Dict[str, Any]] = []
+                all_source_rows: List[Dict[str, Any]] = []
+                page_summaries: List[Dict[str, Any]] = []
+                last_next_offset = start_offset
+                done = False
+
+                progress = st.progress(0, text="Starting athlete sync...")
+                loader = loading_card("Syncing athletes", f"Pulling up to {pages_to_process:,} page(s) of {page_limit:,} rows...")
                 try:
-                    payload = build_athletes_sync_page(api_key, offset=int(athlete_offset), limit=int(athlete_limit), pro_only=bool(pro_only))
+                    current_offset = start_offset
+                    for page_idx in range(pages_to_process):
+                        progress.progress(page_idx / max(pages_to_process, 1), text=f"Pulling athletes at offset {current_offset:,}...")
+                        payload = build_athletes_sync_page(api_key, offset=current_offset, limit=page_limit, pro_only=bool(pro_only))
+                        summary = payload.get("summary", {}) or {}
+                        page_summaries.append(summary)
+                        all_app_rows.extend(payload.get("athletes", []) or [])
+                        all_source_rows.extend(payload.get("trinews_athletes", []) or [])
+                        last_next_offset = int(summary.get("next_offset") or (current_offset + len(payload.get("athletes", []) or [])))
+                        done = bool(summary.get("done"))
+                        if done:
+                            break
+                        current_offset = last_next_offset
+                    progress.progress(1.0, text="Athlete sync pull complete.")
                 finally:
                     loader.empty()
-                summary = payload.get("summary", {}) or {}
-                st.json(summary)
-                sample = pd.DataFrame(payload.get("athletes", [])[:25])
+
+                # Dedupe before writing/displaying. The API can expose the same
+                # person through aliases or repeated pages, so canonical URL/id wins.
+                deduped_app: Dict[str, Dict[str, Any]] = {}
+                for row in all_app_rows:
+                    key = clean_str(row.get("athlete_url")) or clean_str(row.get("athlete_name"))
+                    if key:
+                        deduped_app[key] = row
+                deduped_source: Dict[str, Dict[str, Any]] = {}
+                for row in all_source_rows:
+                    key = clean_str(row.get("id")) or clean_str(row.get("athlete_url"))
+                    if key:
+                        deduped_source[key] = row
+
+                total_returned = sum(int(x.get("athletes_returned") or 0) for x in page_summaries)
+                total_ready = len(deduped_app)
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Rows returned", f"{total_returned:,}")
+                m2.metric("Ready to import", f"{total_ready:,}")
+                m3.metric("Next offset", f"{last_next_offset:,}")
+                m4.metric("Done", "Yes" if done else "No")
+
+                if page_summaries:
+                    with st.expander("Page log", expanded=False):
+                        st.dataframe(pd.DataFrame(page_summaries), width="stretch", hide_index=True)
+
+                sample = pd.DataFrame(list(deduped_app.values())[:25])
                 if not sample.empty:
-                    st.dataframe(sample, width="stretch", hide_index=True)
+                    cols = [c for c in ["athlete_name", "gender", "athlete_url"] if c in sample.columns]
+                    st.dataframe(sample[cols], width="stretch", hide_index=True)
+
                 if athlete_mode == "Write to Supabase":
-                    ok, msg = write_source_rows_safe("trinews_athletes", payload.get("trinews_athletes", []) or [], "id")
+                    ok, msg = write_source_rows_safe("trinews_athletes", list(deduped_source.values()), "id")
                     if not ok:
                         st.warning(f"Source table write skipped or failed: {msg}")
-                    inserted, updated = upsert_athletes_preserve_gender(payload.get("athletes", []) or [])
+                    inserted, updated = upsert_athletes_preserve_gender(list(deduped_app.values()))
                     clear_cache()
-                    st.success(f"Athletes synced. App inserted/updated: {inserted:,} / {updated:,}. Source write: {msg}")
+                    st.success(f"Athletes synced. App inserted/updated: {inserted:,} / {updated:,}. Source write: {msg if ok else 'skipped'}. Next offset: {last_next_offset:,}.")
+                    if not done:
+                        st.info(f"More athletes are available. Run the next page starting at offset {last_next_offset:,}, or increase 'Pages this run'.")
                 else:
                     st.success("Preview complete. No data was written.")
+                    if not done:
+                        st.info(f"This was only the first page. Next offset would be {last_next_offset:,}.")
 
     with tabs[2]:
         section_title("🏁", "Sync races")
