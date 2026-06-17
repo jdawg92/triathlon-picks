@@ -5910,7 +5910,7 @@ elif page == "Import CSVs":
         st.caption("Copies rows from the cached TriNews results table into the app result tables used by rankings and scorecards.")
         pc1, pc2, pc3 = st.columns(3)
         publish_offset = pc1.number_input("Cached result offset", min_value=0, value=0, step=500, key="publish_cached_results_offset")
-        publish_limit = pc2.number_input("Rows this run", min_value=10, max_value=5000, value=500, step=250, key="publish_cached_results_limit")
+        publish_limit = pc2.number_input("Rows this run", min_value=10, max_value=10000, value=1000, step=1000, key="publish_cached_results_limit")
         publish_mode = pc3.radio("Mode", ["Preview", "Write"], horizontal=True, key="publish_cached_results_mode")
         fast_publish = st.checkbox(
             "Fast publish for fresh tables",
@@ -5924,7 +5924,7 @@ elif page == "Import CSVs":
             help="Leave off if you already synced athletes. Turning this on can make large batches slower.",
             key="update_athletes_during_publish",
         )
-        st.caption("For large imports, publish in batches. Start with 500–1,000 rows, then continue using the next offset shown after each successful write.")
+        st.caption("For large imports, publish in batches. Use up to 10,000 rows per run, then continue using the next offset shown after each successful write.")
 
         if st.button("Publish cached results to app tables", type="primary", key="publish_cached_results_to_app_tables"):
             try:
@@ -5964,8 +5964,8 @@ elif page == "Import CSVs":
 
                             if fast_publish:
                                 # Fresh-table path: fast direct inserts. Avoids the slow row-by-row merge that can hang on large batches.
-                                insert_chunks("athlete_results", app_rows, chunk_size=200)
-                                insert_chunks("race_field_results", race_field_rows, chunk_size=200)
+                                insert_chunks("athlete_results", app_rows, chunk_size=1000)
+                                insert_chunks("race_field_results", race_field_rows, chunk_size=1000)
                                 ar_inserted, ar_updated = len(app_rows), 0
                                 rf_inserted, rf_updated = len(race_field_rows), 0
                             else:
