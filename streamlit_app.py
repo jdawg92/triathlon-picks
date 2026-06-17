@@ -28,7 +28,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "openrank_shortcourse_scope_v1"
+MODEL_CACHE_VERSION = "openrank_703_split_scope_v2"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -826,6 +826,46 @@ def short_course_predictor_mask(df: pd.DataFrame) -> pd.Series:
     return (major_short_course | continental_olympic_quality | standalone_olympic) & ~long_course & ~(development_cup & sprint_distance)
 
 
+def long_course_predictor_mask(df: pd.DataFrame) -> pd.Series:
+    """Evidence scope for 70.3 / middle-distance predictions.
+
+    The 70.3 predictor should be driven by long-course proof first: 70.3,
+    T100/PTO, Challenge middle, and full-distance swim/bike evidence. Elite
+    Olympic-distance WTCS/Olympic/World Cup rows can still help for swim/run,
+    but development-cup Sprint/Super Sprint rows should not be used. Those tiny
+    low-SOF samples were pushing weak swimmers to the top of the fastest-split
+    boards.
+    """
+    if df is None or df.empty:
+        return pd.Series([], dtype=bool)
+
+    rt = df.get("race_type", pd.Series([None] * len(df), index=df.index)).map(lambda x: (clean_str(x) or "").lower())
+    race = df.get("race_name", pd.Series([None] * len(df), index=df.index)).map(lambda x: (clean_str(x) or "").lower())
+    dist = df.get("distance", pd.Series([None] * len(df), index=df.index)).map(lambda x: (clean_str(x) or "").lower())
+    txt = (rt + " " + race + " " + dist)
+    sof = pd.to_numeric(df.get("sof", pd.Series([np.nan] * len(df), index=df.index)), errors="coerce")
+
+    long_course = txt.str.contains("70.3|middle|challenge|t100|pto|full|140.6", regex=True, na=False)
+    full_ironman = (txt.str.contains("ironman", regex=True, na=False) & ~txt.str.contains("70.3", regex=True, na=False))
+
+    wtcs = txt.str.contains("wtcs|world triathlon championship series", regex=True, na=False)
+    olympic_games = txt.str.contains("olympic games|tokyo 2020|paris 2024", regex=True, na=False)
+    world_cup = txt.str.contains("world triathlon cup", regex=True, na=False)
+
+    development_cup = txt.str.contains(
+        "continental cup|europe triathlon cup|europe cup|americas triathlon cup|africa triathlon cup|asia triathlon cup|oceania triathlon cup",
+        regex=True,
+        na=False,
+    )
+    olympic_distance = dist.str.contains("olympic", regex=True, na=False) | rt.eq("olympic")
+    sprint_distance = dist.str.contains("sprint|super sprint", regex=True, na=False) | rt.eq("sprint")
+
+    # Keep elite short-course rows only when they are not development sprint rows.
+    elite_olympic_evidence = (wtcs | olympic_games | (world_cup & olympic_distance & (sof >= STRONG_SOF_THRESHOLD))) & ~sprint_distance
+
+    return (long_course | full_ironman | elite_olympic_evidence) & ~development_cup
+
+
 def ranking_scope_mask(df: pd.DataFrame, scope: str) -> pd.Series:
     """Return a boolean mask for the selected race-family ranking scope."""
     if df is None or df.empty:
@@ -874,14 +914,16 @@ def apply_prediction_scope(df: pd.DataFrame, scope: str) -> pd.DataFrame:
     WTCS, World Triathlon Cup, Olympic Games, and only high-SOF Olympic-distance
     continental/development races. Development Sprint / Super Sprint cup rows
     are excluded so tiny low-SOF samples do not distort fastest-split picks.
-    For 70.3/T100/full, we leave the broader two-year window available because
-    cross-family evidence can still be useful and is already weighted/capped by
-    the scoring model.
+    For 70.3, use long-course proof plus elite Olympic-distance evidence only.
+    Do not let development Sprint / Super Sprint cup rows drive 70.3 split picks.
+    T100/full keep their current broader evidence filters.
     """
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df
     if scope == "Short Course / WTCS":
         return df[ranking_scope_mask(df, "Short Course / WTCS")].copy()
+    if scope == "IRONMAN 70.3 / Middle":
+        return df[long_course_predictor_mask(df)].copy()
     return df.copy()
 
 
@@ -3346,8 +3388,11 @@ def score_splits_for_start_list(
         elif strong_count == 1:
             confidence = "Medium - 1 strong row"
         else:
-            final = min(final, 50)
-            confidence = "Low - weak/medium evidence"
+            # Weak-only evidence should never sit above proven 70.3/T100/full/WTCS swimmers.
+            # This especially prevents development sprint cup rows with tiny samples or missing
+            # SOF from topping a 70.3 fastest-split board.
+            final = min(final, 28)
+            confidence = "Low - no strong race proof"
 
         best_row = g.sort_values(["split_openrank_score", "race_date"], ascending=[False, False]).head(1)
         last_row = g.sort_values("race_date", ascending=False).head(1)
@@ -3639,7 +3684,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "openrank_shortcourse_scope_v1"
+MODEL_CACHE_VERSION = "openrank_703_split_scope_v2"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -5320,7 +5365,9 @@ elif page in {"Race Dashboard", "Split Audit"}:
         c4.metric("Overrides", len(overrides) if not overrides.empty else 0)
         c5.metric("Model", f"Top {TOP_SCORES_USED} · SOF {int(STRONG_SOF_THRESHOLD)}")
         if prediction_scope == "Short Course / WTCS":
-            st.info("Short-course / WTCS predictor now uses WTCS, World Triathlon Cup, Olympic Games, and only high-SOF Olympic-distance continental/development races. Sprint / Super Sprint Continental Cup rows are excluded; 70.3, T100, and full-distance rows are not used.")
+            st.info("Short-course / WTCS predictor uses WTCS, World Triathlon Cup, Olympic Games, and only high-SOF Olympic-distance continental/development races. Sprint / Super Sprint Continental Cup rows are excluded; 70.3, T100, and full-distance rows are not used.")
+        elif prediction_scope == "IRONMAN 70.3 / Middle":
+            st.info("70.3 predictor uses 70.3, T100/PTO, Challenge middle, full-distance swim/bike evidence, and elite Olympic-distance proof. Development Sprint / Super Sprint cup rows are excluded so weak short-course samples do not top the split boards.")
 
         with st.expander("Split data health", expanded=False):
             health = []
