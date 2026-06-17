@@ -1365,7 +1365,7 @@ MAX_SCORECARD_POOL_LOOKBACK_DAYS = ALL_PROFILE_SCORECARD_LOOKBACK_DAYS
 def fetch_scoring_pool_for_scorecards(
     as_of_date: Any,
     lookback_days: int = MAX_SCORECARD_POOL_LOOKBACK_DAYS,
-    page_size: int = 2000,
+    page_size: int = 1000,
 ) -> pd.DataFrame:
     """Load only the scoring-pool rows needed for scorecard rebuilds.
 
@@ -1380,7 +1380,7 @@ def fetch_scoring_pool_for_scorecards(
 
     all_rows: List[Dict[str, Any]] = []
     start = 0
-    page_size = max(500, min(int(page_size), 5000))
+    page_size = max(100, min(int(page_size), 1000))  # Supabase/PostgREST caps response pages at ~1000 rows
     while True:
         end = start + page_size - 1
         try:
@@ -5608,11 +5608,15 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    for section, items in NAV_GROUPS:
+    # Use a per-render key prefix so stale/hot-reloaded layouts cannot collide on nav keys.
+    # The selected page is persisted in st.session_state["page_label"], not in the button key.
+    nav_key_prefix = str(time.time_ns())
+    for section_idx, (section, items) in enumerate(NAV_GROUPS):
         st.markdown(f'<div class="tri-sidebar-section">{section}</div>', unsafe_allow_html=True)
-        for label, page_name in items:
+        for item_idx, (label, page_name) in enumerate(items):
             active = st.session_state["page_label"] == label
-            if st.button(label, key=f"nav_{page_name}", type="primary" if active else "secondary", width="stretch"):
+            nav_key = f"nav_{nav_key_prefix}_{section_idx}_{item_idx}_{page_name}"
+            if st.button(label, key=nav_key, type="primary" if active else "secondary", width="stretch"):
                 st.session_state["page_label"] = label
                 st.rerun()
 
