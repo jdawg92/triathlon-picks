@@ -4803,6 +4803,366 @@ def save_race_prediction_cache(
     return rows, meta, cache_key
 
 
+
+# ============================================================
+# Relational athlete scorecards
+# ============================================================
+SCORECARD_DISCIPLINES = ["overall", "swim", "bike", "run"]
+
+
+def scorecard_tables_ready() -> bool:
+    """Return True when the relational scorecard tables exist."""
+    try:
+        supabase.table("athlete_scorecards").select("id").limit(1).execute()
+        supabase.table("athlete_scorecard_evidence").select("id").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _delete_scorecard_combo(gender: str, profile: str, discipline: str, as_of_ts: pd.Timestamp) -> None:
+    as_of_label = format_date(as_of_ts)
+    for table_name in ["athlete_scorecard_evidence", "athlete_scorecards"]:
+        try:
+            (
+                supabase.table(table_name)
+                .delete()
+                .eq("model_version", MODEL_CACHE_VERSION)
+                .eq("as_of_date", as_of_label)
+                .eq("gender", normalize_gender(gender) or gender)
+                .eq("profile", profile)
+                .eq("discipline", discipline)
+                .execute()
+            )
+        except Exception:
+            # If the table does not exist, the caller will show the table-ready error.
+            pass
+
+
+def _parse_best_scores(value: Any) -> List[float]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        vals = value
+    else:
+        vals = str(value).replace("[", "").replace("]", "").split(",")
+    out = []
+    for v in vals:
+        fv = safe_float(v)
+        if fv is not None:
+            out.append(round(float(fv), 3))
+    return out
+
+
+def _evidence_list(value: Any) -> List[Dict[str, Any]]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    if isinstance(value, list):
+        return [x for x in value if isinstance(x, dict)]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [x for x in parsed if isinstance(x, dict)]
+        except Exception:
+            return []
+    return []
+
+
+def save_athlete_scorecard_combo(
+    results: pd.DataFrame,
+    overrides: pd.DataFrame,
+    gender: str,
+    profile: str,
+    as_of_ts: pd.Timestamp,
+    discipline: str,
+    top_n: int = TOP_SCORES_USED,
+) -> Tuple[int, int, Dict[str, Any]]:
+    """Build one profile/discipline/gender scorecard and store it in real tables."""
+    df, metrics = build_athlete_ranking_result(results, overrides, gender, profile, as_of_ts, top_n, discipline)
+    _delete_scorecard_combo(gender, profile, discipline, as_of_ts)
+    if df is None or df.empty:
+        return 0, 0, metrics
+
+    as_of_label = format_date(as_of_ts)
+    gender_norm = normalize_gender(gender) or gender
+    computed_source = f"{gender_norm} · {profile} · {discipline} · top {top_n} · {as_of_label}"
+    score_rows: List[Dict[str, Any]] = []
+    evidence_rows: List[Dict[str, Any]] = []
+
+    for _, r in df.iterrows():
+        row = json_safe_row(r)
+        athlete_url = canonical_athlete_url(row.get("Athlete URL")) or clean_str(row.get("Athlete URL"))
+        athlete_name = clean_str(row.get("Athlete"))
+        if not athlete_url and not athlete_name:
+            continue
+        score = safe_float(row.get("Score")) or 0.0
+        if discipline == "overall":
+            best_scores = _parse_best_scores(row.get("Best Scores Used"))
+            current_year_score = safe_float(row.get("Current Year ORS"))
+            current_year_races = parse_int(row.get("Current Year Races"))
+            current_year_scored = parse_int(row.get("Current Year Scored"))
+            evidence_count = parse_int(row.get("Recent Races Used")) or len([x for x in best_scores if x > 0])
+            confidence = ""
+            last_race_name = clean_str(row.get("Last Race"))
+            last_race_date = clean_str(row.get("Last Race Date"))
+        else:
+            best_scores = _parse_best_scores(row.get("Best Split Scores Used"))
+            current_year_score = None
+            current_year_races = None
+            current_year_scored = None
+            evidence_count = parse_int(row.get("Evidence Count")) or len([x for x in best_scores if x > 0])
+            confidence = clean_str(row.get("Confidence"))
+            last_race_name = clean_str(row.get("Last Race"))
+            last_race_date = clean_str(row.get("Last Race Date"))
+
+        rank_val = parse_int(row.get("Rank"))
+        score_rows.append({
+            "model_version": MODEL_CACHE_VERSION,
+            "as_of_date": as_of_label,
+            "profile": profile,
+            "discipline": discipline,
+            "gender": gender_norm,
+            "athlete_url": athlete_url,
+            "athlete_name": athlete_name,
+            "rank": rank_val,
+            "score": round(float(score), 4),
+            "best_scores": best_scores,
+            "evidence_count": int(evidence_count or 0),
+            "current_year_score": None if current_year_score is None else round(float(current_year_score), 4),
+            "current_year_races": current_year_races,
+            "current_year_scored": current_year_scored,
+            "confidence": confidence,
+            "last_race_name": last_race_name,
+            "last_race_date": last_race_date or None,
+            "computed_source": computed_source,
+            "raw": row,
+        })
+
+        ev_rows = _evidence_list(row.get("Score Evidence"))
+        for used_rank, ev in enumerate(ev_rows[:top_n], start=1):
+            ev_safe = json_safe_row(ev)
+            evidence_rows.append({
+                "model_version": MODEL_CACHE_VERSION,
+                "as_of_date": as_of_label,
+                "profile": profile,
+                "discipline": discipline,
+                "gender": gender_norm,
+                "athlete_url": athlete_url,
+                "athlete_name": athlete_name,
+                "used_rank": used_rank,
+                "race_date": clean_str(ev_safe.get("Date")) or None,
+                "race_name": clean_str(ev_safe.get("Race")),
+                "race_type": clean_str(ev_safe.get("Race Type")),
+                "place": clean_str(ev_safe.get("Place")),
+                "sof": safe_float(ev_safe.get("SOF")),
+                "ors": safe_float(ev_safe.get("ORS")),
+                "split_text": clean_str(ev_safe.get("Split")),
+                "split_rank": clean_str(ev_safe.get("Split Rank")),
+                "pct_behind_fastest": safe_float(ev_safe.get("% Behind Fastest")),
+                "evidence_score": safe_float(ev_safe.get("Evidence Score")) or safe_float(ev_safe.get("ORS")),
+                "raw": ev_safe,
+            })
+
+    if score_rows:
+        insert_chunks("athlete_scorecards", score_rows, chunk_size=500)
+    if evidence_rows:
+        insert_chunks("athlete_scorecard_evidence", evidence_rows, chunk_size=500)
+    clear_cache()
+    return len(score_rows), len(evidence_rows), metrics
+
+
+def rebuild_all_athlete_scorecards(results: pd.DataFrame, overrides: pd.DataFrame, as_of_ts: pd.Timestamp) -> pd.DataFrame:
+    """Rebuild every gender/profile/discipline scorecard into relational tables."""
+    logs = []
+    total = len(["Men", "Women"]) * len(RANKING_FAMILIES) * len(SCORECARD_DISCIPLINES)
+    progress = st.progress(0, text="Starting scorecard rebuild...")
+    done = 0
+    for gender in ["Men", "Women"]:
+        for profile in RANKING_FAMILIES:
+            for discipline in SCORECARD_DISCIPLINES:
+                try:
+                    rows, ev_rows, metrics = save_athlete_scorecard_combo(results, overrides, gender, profile, as_of_ts, discipline, TOP_SCORES_USED)
+                    status = "saved"
+                except Exception as e:
+                    rows, ev_rows, metrics, status = 0, 0, {}, f"error: {e}"
+                logs.append({
+                    "Gender": gender,
+                    "Profile": profile,
+                    "Discipline": discipline,
+                    "Scorecard Rows": rows,
+                    "Evidence Rows": ev_rows,
+                    "Status": status,
+                    **metrics,
+                })
+                done += 1
+                progress.progress(done / max(total, 1), text=f"Built {done}/{total}: {gender} · {profile} · {discipline}")
+    progress.empty()
+    return pd.DataFrame(logs)
+
+
+def _latest_scorecard_date(df: pd.DataFrame) -> Optional[str]:
+    if df is None or df.empty or "as_of_date" not in df.columns:
+        return None
+    vals = pd.to_datetime(df["as_of_date"], errors="coerce").dropna()
+    if vals.empty:
+        return None
+    return format_date(vals.max())
+
+
+def load_athlete_scorecard_view(gender: str, profile: str, discipline: str, as_of_ts: Optional[pd.Timestamp] = None) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """Load the latest relational scorecard for a gender/profile/discipline."""
+    try:
+        cards = load_table("athlete_scorecards")
+        ev = load_table("athlete_scorecard_evidence")
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame(), {}
+    if cards.empty:
+        return pd.DataFrame(), pd.DataFrame(), {}
+    gender_norm = normalize_gender(gender) or gender
+    cards = cards[
+        (cards.get("model_version", "") == MODEL_CACHE_VERSION)
+        & (cards.get("gender", "") == gender_norm)
+        & (cards.get("profile", "") == profile)
+        & (cards.get("discipline", "") == discipline)
+    ].copy()
+    if cards.empty:
+        return pd.DataFrame(), pd.DataFrame(), {}
+    if as_of_ts is not None and "as_of_date" in cards.columns:
+        target = format_date(as_of_ts)
+        exact = cards[cards["as_of_date"].astype(str) == target].copy()
+        if not exact.empty:
+            cards = exact
+        else:
+            latest_date = _latest_scorecard_date(cards)
+            if latest_date:
+                cards = cards[cards["as_of_date"].astype(str) == latest_date].copy()
+    else:
+        latest_date = _latest_scorecard_date(cards)
+        if latest_date:
+            cards = cards[cards["as_of_date"].astype(str) == latest_date].copy()
+    as_of_label = clean_str(cards["as_of_date"].iloc[0]) if "as_of_date" in cards.columns and not cards.empty else ""
+
+    if ev is None or ev.empty:
+        ev_filtered = pd.DataFrame()
+    else:
+        ev_filtered = ev[
+            (ev.get("model_version", "") == MODEL_CACHE_VERSION)
+            & (ev.get("gender", "") == gender_norm)
+            & (ev.get("profile", "") == profile)
+            & (ev.get("discipline", "") == discipline)
+            & (ev.get("as_of_date", "").astype(str) == as_of_label)
+        ].copy()
+    return cards, ev_filtered, {"as_of_date": as_of_label, "rows": len(cards), "evidence_rows": len(ev_filtered)}
+
+
+def _display_scorecards_from_tables(cards: pd.DataFrame, evidence: pd.DataFrame, discipline: str) -> pd.DataFrame:
+    if cards is None or cards.empty:
+        return pd.DataFrame()
+    evidence_by_url: Dict[str, List[Dict[str, Any]]] = {}
+    if evidence is not None and not evidence.empty:
+        evidence = evidence.sort_values(["athlete_url", "used_rank"], na_position="last").copy()
+        for url, g in evidence.groupby("athlete_url"):
+            rows = []
+            for _, ev in g.iterrows():
+                raw = ev.get("raw") if isinstance(ev.get("raw"), dict) else {}
+                if raw:
+                    rows.append(raw)
+                else:
+                    rows.append({
+                        "Date": format_date(ev.get("race_date")),
+                        "Race": clean_str(ev.get("race_name")),
+                        "Race Type": clean_str(ev.get("race_type")),
+                        "Place": clean_str(ev.get("place")),
+                        "SOF": ev.get("sof"),
+                        "ORS": ev.get("ors"),
+                        "Split": clean_str(ev.get("split_text")),
+                        "Split Rank": clean_str(ev.get("split_rank")),
+                        "% Behind Fastest": ev.get("pct_behind_fastest"),
+                        "Evidence Score": ev.get("evidence_score"),
+                    })
+            evidence_by_url[clean_str(url)] = rows
+    out_rows = []
+    for _, r in cards.sort_values("rank", na_position="last").iterrows():
+        url = canonical_athlete_url(r.get("athlete_url")) or clean_str(r.get("athlete_url"))
+        best_scores = r.get("best_scores")
+        if isinstance(best_scores, str):
+            try:
+                best_scores = json.loads(best_scores)
+            except Exception:
+                best_scores = _parse_best_scores(best_scores)
+        if not isinstance(best_scores, list):
+            best_scores = []
+        best_text = ", ".join([f"{safe_float(x):.1f}" for x in best_scores if safe_float(x) is not None])
+        raw = r.get("raw") if isinstance(r.get("raw"), dict) else {}
+        row = {
+            "Rank": parse_int(r.get("rank")),
+            "Athlete": clean_str(r.get("athlete_name")),
+            "Athlete URL": url,
+            "Score": round(float(safe_float(r.get("score")) or 0.0), 1),
+            "Best Scores Used": best_text if discipline == "overall" else None,
+            "Best Split Scores Used": best_text if discipline != "overall" else None,
+            "Score Evidence": evidence_by_url.get(url, []),
+            "Evidence Count": parse_int(r.get("evidence_count")) or 0,
+            "Confidence": clean_str(r.get("confidence")),
+            "Current Year ORS": r.get("current_year_score"),
+            "Current Year Races": r.get("current_year_races"),
+            "Current Year Scored": r.get("current_year_scored"),
+            "Last Race": clean_str(r.get("last_race_name")),
+            "Last Race Date": format_date(r.get("last_race_date")),
+            "Computed Source": clean_str(r.get("computed_source")),
+        }
+        # Preserve any extra high-value columns from the original scoring row.
+        for extra in [
+            "OpenRank Score", "OpenRank Split Score", "Best Recent ORS", "Strong Field ORS", "Recent Races Used",
+            "Premium Evidence Count", "Strong Evidence Count", "Last Rank", "Best Recent Split",
+            "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %",
+        ]:
+            if extra in raw and extra not in row:
+                row[extra] = raw.get(extra)
+        if discipline == "overall":
+            row["OpenRank Score"] = row.get("OpenRank Score") or row["Score"]
+        else:
+            row["OpenRank Split Score"] = row.get("OpenRank Split Score") or row["Score"]
+        out_rows.append(row)
+    out = pd.DataFrame(out_rows)
+    if not out.empty:
+        out = out.sort_values("Score", ascending=False).reset_index(drop=True)
+        out["Rank"] = range(1, len(out) + 1)
+    return out
+
+
+def load_athlete_scorecard_display(gender: str, profile: str, discipline: str, as_of_ts: Optional[pd.Timestamp] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    cards, ev, meta = load_athlete_scorecard_view(gender, profile, discipline, as_of_ts)
+    return _display_scorecards_from_tables(cards, ev, discipline), meta
+
+
+def build_race_prediction_from_scorecard_tables(starts: pd.DataFrame, selected_race: str, selected_date: pd.Timestamp, selected_gender: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if starts is None or starts.empty:
+        return pd.DataFrame(), {}
+    selected_date = pd.to_datetime(selected_date) if not pd.isna(selected_date) else pd.Timestamp.today().normalize()
+    profile = prediction_scope_from_race(selected_race, None, None)
+    start_athletes = starts[(starts["race_name"] == selected_race) & (starts["gender"] == selected_gender)].copy()
+    if "race_date" in start_athletes.columns:
+        start_athletes = start_athletes[start_athletes["race_date"] == selected_date]
+    imported_start_rows = len(start_athletes)
+    start_athletes = dedupe_start_athletes(start_athletes)
+    if start_athletes.empty:
+        return pd.DataFrame(), {"prediction_scope": profile, "start_list_athletes": 0}
+
+    combined = []
+    meta = {"prediction_scope": profile, "start_list_athletes": int(len(start_athletes)), "duplicate_start_rows": int(imported_start_rows - len(start_athletes)), "source": "athlete_scorecards"}
+    for discipline in SCORECARD_DISCIPLINES:
+        scorecard, smeta = load_athlete_scorecard_display(selected_gender, profile, discipline, None)
+        meta[f"{discipline}_scorecard_rows"] = int(len(scorecard)) if scorecard is not None else 0
+        if smeta.get("as_of_date"):
+            meta[f"{discipline}_as_of_date"] = smeta.get("as_of_date")
+        selected = filter_scorecard_to_startlist(scorecard, start_athletes, discipline)
+        for row in cache_safe_rows(selected.head(120)):
+            row["_section"] = discipline
+            combined.append(row)
+    return pd.DataFrame(combined), meta
+
 def render_score_evidence(scored: pd.DataFrame, title: str, limit: int = 5) -> None:
     if scored is None or scored.empty or "Score Evidence" not in scored.columns:
         return
@@ -4894,7 +5254,7 @@ if page == "Connection":
 
         st.subheader("Table counts")
         count_rows_data = []
-        for table_name in ["athletes", "athlete_results", "race_field_results", "start_lists", "race_overrides", "scoring_settings", "model_cache", "model_runs", "split_audit"]:
+        for table_name in ["athletes", "athlete_results", "race_field_results", "start_lists", "athlete_scorecards", "athlete_scorecard_evidence", "race_overrides", "scoring_settings", "model_cache", "model_runs", "split_audit"]:
             count_rows_data.append({"Table": table_name, "Rows in Supabase": count_rows(table_name)})
         st.dataframe(pd.DataFrame(count_rows_data), width="stretch", hide_index=True)
     except Exception as e:
@@ -5470,7 +5830,39 @@ elif page == "Model Cache":
         st.warning("No athlete results found. Import Athlete Results first.")
         st.stop()
 
-    tab_rankings, tab_races, tab_manage = st.tabs(["Athlete Rankings Cache", "Race Prediction Cache", "Manage Cache"])
+    tab_scorecards, tab_rankings, tab_races, tab_manage = st.tabs(["Athlete Scorecards", "Legacy JSON Rankings", "Race Prediction Cache", "Manage Cache"])
+
+    with tab_scorecards:
+        st.subheader("Relational Athlete Scorecards")
+        st.caption("This is the faster long-term model: one saved row per athlete/profile/discipline, plus a separate evidence table for the five races that created the score.")
+        if not scorecard_tables_ready():
+            st.error("Scorecard tables are missing. Run `athlete_scorecard_tables.sql` in Supabase SQL Editor first.")
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Profiles", len(RANKING_FAMILIES))
+            c2.metric("Disciplines", len(SCORECARD_DISCIPLINES))
+            c3.metric("Top scores used", TOP_SCORES_USED)
+            c4.metric("Strong SOF", int(STRONG_SOF_THRESHOLD))
+            rebuild_date = st.date_input("Scorecards as of", value=date.today(), key="scorecards_asof")
+            st.info("Rebuild scorecards after importing new results or fixing athlete genders. Start-list edits usually do not require rebuilding scorecards unless new athletes/results were also added.")
+            if st.button("Rebuild all athlete scorecards", type="primary", width="stretch"):
+                with st.spinner("Building athlete scorecards into Supabase tables..."):
+                    logs = rebuild_all_athlete_scorecards(results, overrides, pd.Timestamp(rebuild_date))
+                st.success("Finished rebuilding athlete scorecards.")
+                display_table(logs, ["Gender", "Profile", "Discipline", "Scorecard Rows", "Evidence Rows", "Status", "rows_after_gender", "rows_after_family", "athletes_ranked"], height=520)
+            try:
+                cards = load_table("athlete_scorecards")
+                ev = load_table("athlete_scorecard_evidence")
+            except Exception:
+                cards, ev = pd.DataFrame(), pd.DataFrame()
+            if not cards.empty:
+                latest = cards.sort_values("computed_at", ascending=False).head(200) if "computed_at" in cards.columns else cards.head(200)
+                display_table(latest, ["gender", "profile", "discipline", "rank", "athlete_name", "score", "evidence_count", "as_of_date", "computed_at"], height=420)
+                c1, c2 = st.columns(2)
+                c1.metric("Scorecard rows", f"{len(cards):,}")
+                c2.metric("Evidence rows", f"{len(ev):,}")
+            else:
+                st.info("No athlete_scorecards rows stored yet.")
 
     with tab_rankings:
         st.subheader("Athlete Rankings Cache")
@@ -5613,118 +6005,60 @@ elif page == "Model Cache":
 
 elif page == "Athlete Rankings":
     st.header("🥇 Athlete Rankings")
-    st.caption("Global rankings are now gender-strict and can be filtered by race family, so Men/Women and 70.3/T100 profiles do not get blended together.")
+    st.caption("Rankings now read from the relational athlete_scorecards table. Rebuild scorecards after importing new results or fixing athlete genders.")
     results, starts, athletes, overrides = prepare_dataframes()
-    if results.empty:
-        st.warning("No athlete results found. Import Athlete Results first.")
-        st.stop()
 
-    c1, c2, c3, c4 = st.columns([1.1, 1.3, 1.1, 1.1])
+    c1, c2, c3, c4 = st.columns([1.1, 1.4, 1.2, 1.0])
     ranking_gender = c1.selectbox("Gender", ["Men", "Women"], index=0)
-    ranking_scope = c2.selectbox(
-        "Scorecard profile",
-        RANKING_FAMILIES,
-        index=0,
-        help="Long Course combines 70.3, middle, Challenge, T100, and PTO. Short Course uses WTCS/elite Olympic-distance evidence. These same scorecards feed the predictor.",
-    )
-    as_of = c3.date_input("As of date", value=date.today())
-    top_n_rank = TOP_SCORES_USED
+    ranking_scope = c2.selectbox("Scorecard profile", RANKING_FAMILIES, index=0)
+    ranking_view = c3.radio("View", ["🏆 Overall", "🏊 Swim", "🚴 Bike", "🏃 Run"], horizontal=True, key="athlete_rankings_view")
     c4.metric("Top scores used", TOP_SCORES_USED)
-    as_of_ts = pd.Timestamp(as_of)
-    year = int(as_of_ts.year)
-    window_start_rank = pd.Timestamp(date(year - 2, 1, 1))
-
-    ranking_results = results[(results["race_date"].notna()) & (results["race_date"] >= window_start_rank) & (results["race_date"] <= as_of_ts)].copy()
-    pre_gender_count = len(ranking_results)
-    ranking_results = filter_rankings_by_gender(ranking_results, ranking_gender)
-    post_gender_count = len(ranking_results)
-    ranking_results = ranking_results[ranking_scope_mask(ranking_results, ranking_scope)].copy()
-
-    if ranking_results.empty:
-        st.warning("No rows match this gender/race-family filter. Check imported genders or choose a different race family.")
-        st.stop()
-
-    # Build an all-athlete candidate list from gender-clean imported rows for this window/family.
-    candidate_cols = ["athlete_url", "athlete_name", "gender"]
-    start_all = ranking_results[candidate_cols].drop_duplicates().dropna(subset=["athlete_name"]).copy()
-    start_all["race_name"] = f"Global Rankings — {ranking_scope}"
-    start_all["race_date"] = as_of_ts
-    start_all["open_rank"] = None
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Rows after gender filter", f"{post_gender_count:,}", help=f"Started with {pre_gender_count:,} rows in the date window. Known opposite-gender rows are excluded; unknown-gender rows are kept if the race name is compatible so older imports do not hide athletes with missing gender.")
-    m2.metric("Rows after race-family filter", f"{len(ranking_results):,}")
-    m3.metric("Athletes ranked", f"{start_all['athlete_name'].nunique():,}")
-
-    # Streamlit tabs eagerly execute every tab on every rerun. That made a simple
-    # filter change calculate Overall + Swim + Bike + Run every time. Use a
-    # segmented/radio selector so only the selected ranking view is computed.
-    ranking_view = st.radio(
-        "Ranking view",
-        ["🏆 Overall", "🏊 Swim", "🚴 Bike", "🏃 Run"],
-        horizontal=True,
-        key="athlete_rankings_view",
-    )
-
     view_kind = ranking_view_to_kind(ranking_view)
-    params = athlete_ranking_cache_params(ranking_gender, ranking_scope, as_of_ts, top_n_rank, view_kind)
-    cache_key = make_cache_key("athlete_ranking", params)
-    cached_rankings, cache_meta = load_model_cache_df("athlete_ranking", cache_key)
 
-    cc1, cc2 = st.columns([2, 1])
-    if cache_meta:
-        cc1.success(f"Using saved ranking cache · {clean_str(cache_meta.get('computed_at'))[:19]}")
-        if cc2.button("Rebuild this cache", width="stretch"):
-            with st.spinner("Rebuilding this ranking cache..."):
-                save_athlete_ranking_cache(results, overrides, ranking_gender, ranking_scope, as_of_ts, top_n_rank, view_kind)
-            clear_cache()
-            st.rerun()
-    else:
-        cc1.warning("No saved cache for this exact gender/race-family/view/date/top-score setup yet.")
-        if cc2.button("Build cache now", type="primary", width="stretch"):
-            with st.spinner("Building ranking cache..."):
-                save_athlete_ranking_cache(results, overrides, ranking_gender, ranking_scope, as_of_ts, top_n_rank, view_kind)
-            clear_cache()
-            st.rerun()
-
-    if cached_rankings is not None and not cached_rankings.empty:
-        if ranking_view == "🏆 Overall":
-            display_table(
-                cached_rankings.head(75),
-                ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"],
-                height=620,
-            )
-        else:
-            display_table(
-                cached_rankings.head(75),
-                ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"],
-                height=620,
-            )
+    if not scorecard_tables_ready():
+        st.error("The relational scorecard tables are not installed yet. Run `athlete_scorecard_tables.sql` in Supabase SQL Editor, then rebuild scorecards.")
         st.stop()
 
-    st.info("Showing live calculation because no cache exists yet. Use the button above or Model Cache page to save it for fast loading next time.")
-    if ranking_view == "🏆 Overall":
-        with st.spinner("Calculating overall rankings live..."):
-            overall_all = score_overall(ranking_results, start_all, overrides, as_of_ts, year, top_n_rank)
+    scorecard_df, score_meta = load_athlete_scorecard_display(ranking_gender, ranking_scope, view_kind, None)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Profile", ranking_scope)
+    m2.metric("Discipline", view_kind.title())
+    m3.metric("Rows", f"{len(scorecard_df):,}")
+    m4.metric("As of", score_meta.get("as_of_date", "—"))
+
+    b1, b2 = st.columns([1, 2])
+    if b1.button("Rebuild this scorecard", type="primary", width="stretch"):
+        if results.empty:
+            st.warning("No athlete results found. Import Athlete Results first.")
+        else:
+            with st.spinner("Rebuilding selected scorecard..."):
+                rows, ev_rows, metrics = save_athlete_scorecard_combo(results, overrides, ranking_gender, ranking_scope, pd.Timestamp(date.today()), view_kind, TOP_SCORES_USED)
+            st.success(f"Saved {rows:,} scorecard rows and {ev_rows:,} evidence rows.")
+            st.json(metrics)
+            st.rerun()
+    b2.caption("This page does not recalculate rankings on every filter change. It reads saved scorecards for speed.")
+
+    if scorecard_df.empty:
+        st.warning("No saved scorecard rows found for this gender/profile/view. Use Rebuild this scorecard or Model Cache → Scorecards → Rebuild all scorecards.")
+        st.stop()
+
+    if view_kind == "overall":
         display_table(
-            overall_all.head(75),
+            scorecard_df.head(100),
             ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"],
-            height=620,
+            height=650,
         )
     else:
-        disc = view_kind
-        with st.spinner(f"Calculating {disc} rankings live..."):
-            aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, ranking_gender, disc, min_field_size=5)
-            scored = score_splits_for_start_list(aud, start_all, as_of_ts, top_n_rank, strong_sof_threshold=STRONG_SOF_THRESHOLD)
         display_table(
-            scored.head(75),
-            ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"],
-            height=620,
+            scorecard_df.head(100),
+            ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"],
+            height=650,
         )
+    render_score_evidence(scorecard_df.head(10), f"{view_kind.title()} score evidence", limit=10)
 
 elif page == "Database Viewer":
     st.header("🗄️ Database Viewer")
-    table = st.selectbox("Table", ["athletes", "athlete_results", "race_field_results", "start_lists", "race_overrides", "scoring_settings", "model_cache", "model_runs", "split_audit"])
+    table = st.selectbox("Table", ["athletes", "athlete_results", "race_field_results", "start_lists", "athlete_scorecards", "athlete_scorecard_evidence", "race_overrides", "scoring_settings", "model_cache", "model_runs", "split_audit"])
     exact_count = count_rows(table)
     if exact_count is not None:
         st.metric("Rows in Supabase", f"{exact_count:,}")
@@ -5801,6 +6135,13 @@ elif page in {"Race Dashboard", "Split Audit"}:
 
 
     if page == "Race Dashboard" and use_model_cache:
+        table_prediction, table_meta = build_race_prediction_from_scorecard_tables(starts, selected_race, selected_date, selected_gender)
+        if table_prediction is not None and not table_prediction.empty:
+            st.success("Loaded prediction from relational athlete_scorecards table.")
+            display_cached_race_prediction(table_prediction, {"params": table_meta, "computed_at": max([v for k, v in table_meta.items() if k.endswith("_as_of_date")], default="")})
+            st.stop()
+        elif scorecard_tables_ready():
+            st.info("No relational scorecard prediction found yet for this race/profile. Falling back to legacy cache or live calculation. Rebuild athlete scorecards to use the faster path.")
         cache_prediction_scope = prediction_scope_from_race(selected_race, None, None)
         cached_prediction, cached_meta, cache_match, cache_diffs = load_race_prediction_cache_best_match(
             selected_race,
