@@ -1173,6 +1173,171 @@ def upsert_athletes_preserve_gender(rows: List[Dict[str, Any]]) -> Tuple[int, in
     return len(to_insert), updated
 
 
+
+def build_athlete_master_maps() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Return athlete-master lookup maps by canonical URL and unique lower-name.
+
+    The athletes table is treated as the master identity table. Result rows and
+    start-list rows should point back to this table by canonical athlete_url.
+    Name matching is only used when a name is unique in the athletes table.
+    """
+    athletes_df = load_table("athletes")
+    url_map: Dict[str, Dict[str, Any]] = {}
+    name_buckets: Dict[str, List[Dict[str, Any]]] = {}
+    if athletes_df is None or athletes_df.empty:
+        return url_map, {}
+    for _, r in athletes_df.iterrows():
+        rec = r.to_dict()
+        url = canonical_athlete_url(rec.get("athlete_url"))
+        name = clean_str(rec.get("athlete_name"))
+        if url:
+            rec["athlete_url"] = url
+            if url not in url_map:
+                url_map[url] = rec
+        if name:
+            name_buckets.setdefault(name.lower(), []).append(rec)
+    unique_name_map = {name: vals[0] for name, vals in name_buckets.items() if len(vals) == 1}
+    return url_map, unique_name_map
+
+
+def fill_row_from_athlete_master(row: Dict[str, Any], default_gender: Any = None) -> Dict[str, Any]:
+    """Fill an import row from the athletes master record when possible.
+
+    Priority:
+    1. Canonical athlete_url match.
+    2. Unique athlete_name match when URL is blank.
+    3. Imported row values.
+    4. Default gender from selected start list, when provided.
+    """
+    url_map, name_map = build_athlete_master_maps()
+    out = dict(row or {})
+    url = canonical_athlete_url(out.get("athlete_url"))
+    name = clean_str(out.get("athlete_name"))
+    master = url_map.get(url) if url else None
+    if master is None and not url and name:
+        master = name_map.get(name.lower())
+        if master:
+            url = canonical_athlete_url(master.get("athlete_url"))
+
+    if url:
+        out["athlete_url"] = url
+    if master:
+        if not clean_str(out.get("athlete_name")):
+            out["athlete_name"] = clean_str(master.get("athlete_name"))
+        master_gender = normalize_gender(master.get("gender"))
+        if master_gender in ["Men", "Women"] and normalize_gender(out.get("gender")) not in ["Men", "Women"]:
+            out["gender"] = master_gender
+    default_g = normalize_gender(default_gender)
+    if default_g in ["Men", "Women"] and normalize_gender(out.get("gender")) not in ["Men", "Women"]:
+        out["gender"] = default_g
+    return out
+
+
+def fill_rows_from_athlete_master(rows: List[Dict[str, Any]], default_gender: Any = None) -> List[Dict[str, Any]]:
+    return [fill_row_from_athlete_master(row, default_gender=default_gender) for row in (rows or [])]
+
+
+def athlete_rows_from_import_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build athlete master rows from any imported rows that contain athlete data."""
+    best: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        url = canonical_athlete_url(row.get("athlete_url"))
+        name = clean_str(row.get("athlete_name"))
+        gender = normalize_gender(row.get("gender"))
+        if not url:
+            continue
+        current = best.get(url, {"athlete_url": url})
+        if name and not clean_str(current.get("athlete_name")):
+            current["athlete_name"] = name
+        if gender in ["Men", "Women"] and normalize_gender(current.get("gender")) not in ["Men", "Women"]:
+            current["gender"] = gender
+        best[url] = current
+    return list(best.values())
+
+
+def sync_athlete_master_import(rows: List[Dict[str, Any]], athlete_rows: List[Dict[str, Any]] = None, default_gender: Any = None) -> Tuple[List[Dict[str, Any]], int, int, int]:
+    """Treat athletes as the master table for every import.
+
+    This does four things:
+    - canonicalizes athlete URLs before anything is inserted;
+    - fills row gender/name from an existing athletes master record;
+    - creates missing athletes when a new URL is imported;
+    - propagates known Men/Women gender to related result/start-list rows.
+
+    Returns: enriched_rows, athlete_inserted, athlete_updated, gender_propagated
+    """
+    enriched_rows = fill_rows_from_athlete_master(rows or [], default_gender=default_gender)
+    master_rows = []
+    if athlete_rows:
+        master_rows.extend(fill_rows_from_athlete_master(athlete_rows, default_gender=default_gender))
+    master_rows.extend(athlete_rows_from_import_rows(enriched_rows))
+    athlete_inserted, athlete_updated = upsert_athletes_preserve_gender(master_rows)
+    # Reload master after insert/update so newly learned gender can be applied back to rows.
+    clear_cache()
+    enriched_rows = fill_rows_from_athlete_master(enriched_rows, default_gender=default_gender)
+    gender_propagated = apply_gender_updates_from_rows(enriched_rows)
+    return enriched_rows, athlete_inserted, athlete_updated, gender_propagated
+
+
+def repair_related_rows_from_athlete_master() -> pd.DataFrame:
+    """Backfill related tables from the athletes master table.
+
+    This is a maintenance tool for older imports. It fills missing related-table
+    gender from athletes.gender and canonicalizes related athlete URLs.
+    """
+    athletes_df = load_table("athletes")
+    if athletes_df is None or athletes_df.empty or "athlete_url" not in athletes_df.columns:
+        return pd.DataFrame()
+    url_map: Dict[str, Dict[str, Any]] = {}
+    for _, r in athletes_df.iterrows():
+        url = canonical_athlete_url(r.get("athlete_url"))
+        if not url:
+            continue
+        url_map[url] = {
+            "athlete_url": url,
+            "athlete_name": clean_str(r.get("athlete_name")),
+            "gender": normalize_gender(r.get("gender")),
+        }
+
+    logs = []
+    for table in ["athlete_results", "race_field_results", "start_lists"]:
+        df = load_table(table)
+        if df is None or df.empty or "athlete_url" not in df.columns:
+            logs.append({"Table": table, "Rows Checked": 0, "Rows Updated": 0})
+            continue
+        updated = 0
+        checked = 0
+        for _, r in df.iterrows():
+            checked += 1
+            row_id = r.get("id")
+            old_url = clean_str(r.get("athlete_url"))
+            url = canonical_athlete_url(old_url)
+            if not url:
+                continue
+            master = url_map.get(url)
+            payload: Dict[str, Any] = {}
+            if old_url and old_url != url:
+                payload["athlete_url"] = url
+            if master:
+                if normalize_gender(r.get("gender")) not in ["Men", "Women"] and master.get("gender") in ["Men", "Women"]:
+                    payload["gender"] = master.get("gender")
+                if not clean_str(r.get("athlete_name")) and master.get("athlete_name"):
+                    payload["athlete_name"] = master.get("athlete_name")
+            if payload:
+                try:
+                    if row_id is not None and not (isinstance(row_id, float) and math.isnan(row_id)):
+                        supabase.table(table).update(payload).eq("id", int(row_id)).execute()
+                    else:
+                        q = supabase.table(table).update(payload).eq("athlete_url", old_url)
+                        q.execute()
+                    updated += 1
+                except Exception:
+                    pass
+        logs.append({"Table": table, "Rows Checked": checked, "Rows Updated": updated})
+    clear_cache()
+    return pd.DataFrame(logs)
+
+
 def start_list_import_key(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
     """Stable key for one athlete in one race/gender start list."""
     race_name = (clean_str(row.get("race_name")) or "").strip().lower()
@@ -2266,7 +2431,7 @@ def recency_weight(race_date: Any, target_date: pd.Timestamp) -> float:
     return 0.65
 
 
-def is_premium_split_evidence(row: pd.Series, discipline: str, strong_sof_threshold: float = 70.0) -> bool:
+def is_premium_split_evidence(row: pd.Series, discipline: str, strong_sof_threshold: float = STRONG_SOF_THRESHOLD) -> bool:
     """Return whether this row is true top-tier evidence for a 70.3 split pick.
 
     This is deliberately stricter than strong evidence. The top of the split
@@ -2314,7 +2479,7 @@ def is_premium_split_evidence(row: pd.Series, discipline: str, strong_sof_thresh
     return False
 
 
-def is_strong_split_evidence(row: pd.Series, discipline: str, strong_sof_threshold: float = 70.0) -> bool:
+def is_strong_split_evidence(row: pd.Series, discipline: str, strong_sof_threshold: float = STRONG_SOF_THRESHOLD) -> bool:
     """Return whether this split row is usable strong evidence.
 
     Strong evidence can support the rating, but premium evidence is what should
@@ -2348,7 +2513,7 @@ def is_strong_split_evidence(row: pd.Series, discipline: str, strong_sof_thresho
     return False
 
 
-def evidence_quality_label(row: pd.Series, discipline: str, strong_sof_threshold: float = 70.0) -> str:
+def evidence_quality_label(row: pd.Series, discipline: str, strong_sof_threshold: float = STRONG_SOF_THRESHOLD) -> str:
     rt = (clean_str(row.get("race_type")) or "").lower()
     sof = safe_float(row.get("sof"))
     if is_premium_split_evidence(row, discipline, strong_sof_threshold):
@@ -3419,7 +3584,10 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "openrank_topx_cache_v1"
+MODEL_CACHE_VERSION = "openrank_fixed_settings_v2"
+TOP_SCORES_USED = 5
+LOW_SAMPLE_WARNING_THRESHOLD = 5
+STRONG_SOF_THRESHOLD = 65.0
 RANKING_FAMILIES = ["All", "IRONMAN 70.3 / Middle", "T100 / PTO", "Full IRONMAN", "Short Course / WTCS"]
 RANKING_VIEW_LABELS = ["🏆 Overall", "🏊 Swim", "🚴 Bike", "🏃 Run"]
 
@@ -3561,6 +3729,8 @@ def load_race_prediction_cache_best_match(
 
     for row in candidates:
         params = _json_dict(row.get("params"))
+        if clean_str(params.get("version")) != MODEL_CACHE_VERSION:
+            continue
         row_race = clean_str(params.get("race_name"))
         row_date = clean_str(params.get("race_date"))
         row_gender = normalize_gender(params.get("gender")) or clean_str(params.get("gender"))
@@ -3573,10 +3743,12 @@ def load_race_prediction_cache_best_match(
         cached_df = cache_rows_to_df(row.get("rows"))
         if cached_df is None or cached_df.empty:
             continue
+        if cached_section(cached_df, "overall").empty and cached_section(cached_df, "swim").empty and cached_section(cached_df, "bike").empty and cached_section(cached_df, "run").empty:
+            continue
         diffs = []
         labels = {
             "top_n": "Top scores used",
-            "min_field_size": "Low-sample warning",
+            "min_field_size": "Minimum split sample",
             "strong_sof_threshold": "Strong SOF",
             "prediction_scope": "Prediction profile",
         }
@@ -3688,7 +3860,7 @@ def build_athlete_ranking_result(
         out = score_overall(ranking_results, start_all, overrides, as_of_ts, year, top_n)
     else:
         aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, normalize_gender(gender) or gender, view_kind, min_field_size=5)
-        out = score_splits_for_start_list(aud, start_all, as_of_ts, top_n, strong_sof_threshold=70)
+        out = score_splits_for_start_list(aud, start_all, as_of_ts, top_n, strong_sof_threshold=STRONG_SOF_THRESHOLD)
     if not out.empty:
         out["Cache View"] = view_kind
         out["Gender"] = gender
@@ -3812,6 +3984,22 @@ def save_race_prediction_cache(
     return rows, meta, cache_key
 
 
+def cached_section(cached_df: pd.DataFrame, section: str) -> pd.DataFrame:
+    """Return rows for a cached race-prediction section.
+
+    Older cache rows may have a different section-column name. This keeps a
+    saved cache from displaying empty tables just because the section marker was
+    named slightly differently in a previous version.
+    """
+    if cached_df is None or cached_df.empty:
+        return pd.DataFrame()
+    for col in ["_section", "section", "Section", "cache_section"]:
+        if col in cached_df.columns:
+            vals = cached_df[col].astype(str).str.strip().str.lower()
+            return cached_df[vals == str(section).strip().lower()].copy()
+    return pd.DataFrame()
+
+
 def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional[Dict[str, Any]] = None) -> None:
     if cached_df is None or cached_df.empty:
         st.info("No cached prediction rows found.")
@@ -3826,7 +4014,7 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
     st.info("Fast mode: showing saved model output. Use Model Cache → Rebuild selected race, or turn off cache in the sidebar, to recalculate live evidence.")
 
     section_title("🏆", "Overall Picks")
-    overall = cached_df[cached_df.get("_section") == "overall"].copy() if "_section" in cached_df.columns else pd.DataFrame()
+    overall = cached_section(cached_df, "overall")
     display_table(overall.head(15), ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "OpenRank", "Last Race", "Last Race Date"])
 
     st.divider()
@@ -3834,7 +4022,7 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
     for tab, disc, title in zip(tabs, ["swim", "bike", "run"], ["Fastest Swim", "Fastest Bike", "Fastest Run"]):
         with tab:
             section_title("🏊" if disc == "swim" else "🚴" if disc == "bike" else "🏃", title)
-            scored = cached_df[cached_df.get("_section") == disc].copy() if "_section" in cached_df.columns else pd.DataFrame()
+            scored = cached_section(cached_df, disc)
             display_table(
                 scored.head(12),
                 ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
@@ -4069,9 +4257,13 @@ def add_start_list_athlete(race_name: str, race_date: Any, gender: str, athlete_
         "athlete_name": athlete_name,
         "open_rank": parse_int(open_rank),
     }
+    rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(
+        [row],
+        [{"athlete_url": athlete_url, "athlete_name": athlete_name, "gender": gender}],
+        default_gender=gender,
+    )
+    row = rows[0] if rows else row
     inserted, skipped = merge_start_list_rows([row])
-    upsert_athletes_preserve_gender([{"athlete_url": athlete_url, "athlete_name": athlete_name, "gender": gender}])
-    apply_gender_updates_from_rows([row])
     clear_cache()
     if inserted:
         return True, "Athlete added to start list."
@@ -4197,30 +4389,36 @@ elif page == "Import CSVs":
             try:
                 if table_choice == "Athlete Results":
                     rows, athlete_rows = normalize_athlete_results(df)
+                    rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows)
                     before_count = count_rows("athlete_results")
                     if replace:
                         delete_all("athlete_results")
                     insert_chunks("athlete_results", rows)
-                    athlete_inserted, athlete_updated = upsert_athletes_preserve_gender(athlete_rows)
                     clear_cache()
                     after_count = count_rows("athlete_results")
-                    st.success(f"Imported {len(rows):,} athlete result rows. Athletes merged: {athlete_inserted:,} new, {athlete_updated:,} updated.")
+                    st.success(f"Imported {len(rows):,} athlete result rows. Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
                     st.info(f"Supabase athlete_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
 
                 elif table_choice == "Race Field Results":
                     rows, athlete_rows = normalize_race_field_results(df)
+                    rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows)
                     before_count = count_rows("race_field_results")
                     if replace:
                         delete_all("race_field_results")
                     insert_chunks("race_field_results", rows)
-                    athlete_inserted, athlete_updated = upsert_athletes_preserve_gender(athlete_rows)
                     clear_cache()
                     after_count = count_rows("race_field_results")
-                    st.success(f"Imported {len(rows):,} race-field result rows. Athletes merged: {athlete_inserted:,} new, {athlete_updated:,} updated.")
+                    st.success(f"Imported {len(rows):,} race-field result rows. Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
                     st.info(f"Supabase race_field_results count: before {before_count if before_count is not None else 'unknown'} → after {after_count if after_count is not None else 'unknown'}")
 
                 elif table_choice == "Start Lists":
                     rows, athlete_rows = normalize_start_lists(df)
+                    rows = dedupe_start_list_rows(rows)
+                    default_gender = None
+                    start_genders = {normalize_gender(r.get("gender")) for r in rows if normalize_gender(r.get("gender")) in ["Men", "Women"]}
+                    if len(start_genders) == 1:
+                        default_gender = next(iter(start_genders))
+                    rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows, default_gender=default_gender)
                     rows = dedupe_start_list_rows(rows)
                     inserted = len(rows)
                     skipped = 0
@@ -4230,13 +4428,11 @@ elif page == "Import CSVs":
                         insert_chunks("start_lists", rows)
                     else:
                         inserted, skipped = merge_start_list_rows(rows)
-                    athlete_inserted, athlete_updated = upsert_athletes_preserve_gender(athlete_rows)
-                    propagated = apply_gender_updates_from_rows(rows)
                     clear_cache()
                     st.success(f"Imported {inserted:,} new start-list rows and skipped {skipped:,} duplicate rows.")
                     if replace:
                         st.info(f"Replace mode deleted existing rows for {replaced_groups:,} matching race/date/gender group(s), not the entire start_lists table.")
-                    st.info(f"Merged athletes by canonical URL: {athlete_inserted:,} new, {athlete_updated:,} updated. Auto-propagated gender for {propagated:,} athletes from this start list import.")
+                    st.info(f"Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Auto-propagated gender for {propagated:,} athletes from this start list import.")
 
                 elif table_choice == "Race Overrides":
                     rows = normalize_race_overrides(df)
@@ -4418,6 +4614,8 @@ elif page == "Start Lists":
             if st.button("Apply start-list upload", type="primary"):
                 try:
                     rows, athlete_rows = normalize_start_list_upload_for_group(up_df, race_name, race_date, gender)
+                    rows, athlete_inserted, athlete_updated, propagated = sync_athlete_master_import(rows, athlete_rows, default_gender=gender)
+                    rows = dedupe_start_list_rows(rows)
                     if upload_mode == "Replace selected start list":
                         delete_matching_start_lists([{"race_name": race_name, "race_date": format_date(race_date), "gender": gender}])
                         insert_chunks("start_lists", rows)
@@ -4425,10 +4623,8 @@ elif page == "Start Lists":
                         skipped = 0
                     else:
                         inserted, skipped = merge_start_list_rows(rows)
-                    athlete_inserted, athlete_updated = upsert_athletes_preserve_gender(athlete_rows)
-                    propagated = apply_gender_updates_from_rows(rows)
                     clear_cache()
-                    st.success(f"Start list updated. Inserted {inserted:,}; skipped {skipped:,}. Athletes merged: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
+                    st.success(f"Start list updated. Inserted {inserted:,}; skipped {skipped:,}. Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Gender propagated for {propagated:,} athletes.")
                     st.info("Rebuild the model cache for this race after start-list edits.")
                     st.rerun()
                 except Exception as e:
@@ -4446,6 +4642,7 @@ elif page == "Start Lists":
 
 elif page == "Athletes":
     st.header("👤 Athletes")
+    st.caption("This is the athlete master view. The app links start-list rows and race-result rows back to athletes by canonical athlete URL.")
     results, starts, athletes, overrides = prepare_dataframes()
     if results.empty:
         st.warning("No athlete results found. Import Athlete Results first.")
@@ -4540,6 +4737,17 @@ elif page == "Gender Tools":
                 file_name="athlete_url_merge_log.csv",
                 mime="text/csv",
             )
+
+    st.markdown("---")
+    st.subheader("Athlete master sync")
+    st.caption("Use this after older imports. It treats the athletes table as the master identity table, canonicalizes related athlete URLs, and fills missing related-table gender/name from athletes.gender and athletes.athlete_name.")
+    if st.button("Sync related rows from athlete master"):
+        sync_log = repair_related_rows_from_athlete_master()
+        if sync_log.empty:
+            st.info("No athlete master rows were available to sync.")
+        else:
+            st.success("Athlete master sync complete.")
+            display_table(sync_log, list(sync_log.columns), height=180)
 
     st.markdown("---")
     suggestions = build_gender_suggestions(raw_athletes, raw_starts, combined_results)
@@ -4687,7 +4895,8 @@ elif page == "Model Cache":
         cache_gender = c1.selectbox("Gender", ["Men", "Women"], key="cache_rank_gender")
         cache_family = c2.selectbox("Race family", RANKING_FAMILIES, index=1, key="cache_rank_family")
         cache_as_of = c3.date_input("As of date", value=date.today(), key="cache_rank_asof")
-        cache_top_n = c4.slider("Top scores used", 3, 8, 4, key="cache_rank_topn")
+        cache_top_n = TOP_SCORES_USED
+        c4.metric("Top scores used", TOP_SCORES_USED)
         cache_view = st.radio("Ranking view", RANKING_VIEW_LABELS, horizontal=True, key="cache_rank_view")
         view_kind = ranking_view_to_kind(cache_view)
         if st.button("Rebuild selected ranking cache", type="primary", width="stretch"):
@@ -4729,9 +4938,12 @@ elif page == "Model Cache":
             if labels:
                 selected_cache_label = st.selectbox("Race / Gender", labels, index=max(0, len(labels) - 1), key="cache_race_label")
                 c1, c2, c3 = st.columns(3)
-                race_top_n = c1.slider("Top scores used", 3, 8, 4, key="cache_race_topn")
-                race_min_field = c2.slider("Low-sample warning threshold", 3, 15, 5, key="cache_race_minfield")
-                race_sof = c3.slider("Strong-field SOF threshold", 55, 90, 70, key="cache_race_sof")
+                race_top_n = TOP_SCORES_USED
+                race_min_field = LOW_SAMPLE_WARNING_THRESHOLD
+                race_sof = STRONG_SOF_THRESHOLD
+                c1.metric("Top scores used", TOP_SCORES_USED)
+                c2.metric("Minimum split sample", LOW_SAMPLE_WARNING_THRESHOLD)
+                c3.metric("Strong SOF", int(STRONG_SOF_THRESHOLD))
                 selected_meta = race_options_df[race_options_df["label"] == selected_cache_label].iloc[0]
                 selected_race = selected_meta["race_name"]
                 selected_gender = selected_meta["gender"]
@@ -4753,9 +4965,12 @@ elif page == "Model Cache":
             st.warning("This rebuilds all athlete ranking caches and all imported start-list race prediction caches. It can take several minutes on large data sets.")
             b1, b2, b3, b4 = st.columns(4)
             all_as_of = b1.date_input("As of date", value=date.today(), key="cache_all_asof")
-            all_top_n = b2.slider("Top scores used", 3, 8, 4, key="cache_all_topn")
-            all_min_field = b3.slider("Low-sample warning", 3, 15, 5, key="cache_all_minfield")
-            all_sof = b4.slider("Strong SOF", 55, 90, 70, key="cache_all_sof")
+            all_top_n = TOP_SCORES_USED
+            all_min_field = LOW_SAMPLE_WARNING_THRESHOLD
+            all_sof = STRONG_SOF_THRESHOLD
+            b2.metric("Top scores used", TOP_SCORES_USED)
+            b3.metric("Minimum split sample", LOW_SAMPLE_WARNING_THRESHOLD)
+            b4.metric("Strong SOF", int(STRONG_SOF_THRESHOLD))
             race_rebuilds = distinct_start_list_races(starts)
             ranking_total = len(["Men", "Women"]) * len(RANKING_FAMILIES) * len(["overall", "swim", "bike", "run"])
             race_total = len(race_rebuilds)
@@ -4830,7 +5045,8 @@ elif page == "Athlete Rankings":
         help="Use 70.3/Middle for normal 70.3-style rankings, or T100/PTO for that race family only.",
     )
     as_of = c3.date_input("As of date", value=date.today())
-    top_n_rank = c4.slider("Top scores used", 3, 8, 4, key="rank_top_n", help="OpenRank-style scoring uses the best X valid scores in the trailing 52 weeks. Missing scores are padded as zero.")
+    top_n_rank = TOP_SCORES_USED
+    c4.metric("Top scores used", TOP_SCORES_USED)
     as_of_ts = pd.Timestamp(as_of)
     year = int(as_of_ts.year)
     window_start_rank = pd.Timestamp(date(year - 2, 1, 1))
@@ -4916,7 +5132,7 @@ elif page == "Athlete Rankings":
         disc = view_kind
         with st.spinner(f"Calculating {disc} rankings live..."):
             aud = build_split_audit(ranking_results, start_all, overrides, as_of_ts, ranking_gender, disc, min_field_size=5)
-            scored = score_splits_for_start_list(aud, start_all, as_of_ts, top_n_rank, strong_sof_threshold=70)
+            scored = score_splits_for_start_list(aud, start_all, as_of_ts, top_n_rank, strong_sof_threshold=STRONG_SOF_THRESHOLD)
         display_table(
             scored.head(75),
             ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"],
@@ -4967,9 +5183,10 @@ elif page in {"Race Dashboard", "Split Audit"}:
 
     with st.sidebar:
         selected_label = st.selectbox("Race / Gender", labels, index=max(0, len(labels) - 1))
-        top_n = st.slider("Top scores used", 3, 8, 4, help="OpenRank-style scoring uses the best X valid scores in the trailing 52 weeks. Missing scores are padded as zero.")
-        min_field_size = st.slider("Low-sample warning threshold", 3, 15, 5)
-        strong_sof_threshold = st.slider("Strong-field SOF threshold", 55, 90, 70)
+        top_n = TOP_SCORES_USED
+        min_field_size = LOW_SAMPLE_WARNING_THRESHOLD
+        strong_sof_threshold = STRONG_SOF_THRESHOLD
+        st.caption(f"Model settings: top {TOP_SCORES_USED} scores · strong SOF {int(STRONG_SOF_THRESHOLD)}")
         use_model_cache = st.checkbox("Use saved model cache", value=True, help="Fast mode: load saved predictions when available instead of recalculating everything live.")
 
     selected_meta = race_options_df[race_options_df["label"] == selected_label].iloc[0]
@@ -5046,7 +5263,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
         c2.metric("Prediction profile", prediction_scope)
         c3.metric("Rows used", len(results_window), delta=(f"from {len(results_window_all):,}" if len(results_window_all) != len(results_window) else None))
         c4.metric("Overrides", len(overrides) if not overrides.empty else 0)
-        c5.metric("Low-sample warning", min_field_size)
+        c5.metric("Model", f"Top {TOP_SCORES_USED} · SOF {int(STRONG_SOF_THRESHOLD)}")
         if prediction_scope == "Short Course / WTCS":
             st.info("Short-course / WTCS predictor is restricted to Olympic, Sprint, WTCS, World Triathlon Cup, and Continental Cup evidence. 70.3 and full-distance rows are not used for this selected start list.")
 
