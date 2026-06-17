@@ -44,11 +44,12 @@ PROFILES = [
 ]
 DISCIPLINES = ["overall", "swim", "bike", "run"]
 
-MODEL_ENGINE_VERSION = "score_engine_v6_reliability_prior"
+MODEL_ENGINE_VERSION = "score_engine_v7_openrank_distance_weighted"
 
 DEFAULT_LOOKBACK_DAYS = 365
 FULL_IM_LOOKBACK_DAYS = 730
 ALL_LOOKBACK_DAYS = 730
+OPENRANK_BEST_SCORES_USED = 4
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +404,53 @@ def _profile_mask(df: pd.DataFrame, profile: str) -> pd.Series:
     return pd.Series([True] * len(df), index=df.index)
 
 
+def _distance_family_from_text(text: str) -> str:
+    txt = (text or "").lower()
+    is_full = bool(re.search(r"\b140\.6\b|full ironman|\bfull\b", txt)) or (
+        "ironman" in txt and "70.3" not in txt and "t100" not in txt and "pto" not in txt
+    )
+    if is_full:
+        return "full"
+    if re.search(r"70\.3|middle|challenge|t100|pto|100k", txt):
+        return "long_middle"
+    if re.search(r"wtcs|world triathlon|olympic|sprint|continental cup|triathlon cup", txt):
+        return "short"
+    return "unknown"
+
+
+def _distance_transfer_weight_series(rows: pd.DataFrame, profile: str, discipline: str) -> pd.Series:
+    """How much a result transfers into the requested ranking profile."""
+    if rows is None or rows.empty:
+        return pd.Series([], dtype=float)
+    families = _race_text(rows).map(_distance_family_from_text)
+    weights = pd.Series(1.0, index=rows.index, dtype="float64")
+    if profile == "All":
+        return weights
+
+    if profile == "Full IRONMAN":
+        weights = families.map({
+            "full": 1.00,
+            "long_middle": 0.78 if discipline in {"overall", "swim", "bike"} else 0.66,
+            "short": 0.38 if discipline in {"overall", "swim", "run"} else 0.25,
+            "unknown": 0.55,
+        }).astype("float64")
+    elif profile == "Long Course / 70.3 + T100":
+        weights = families.map({
+            "long_middle": 1.00,
+            "full": 0.80 if discipline in {"overall", "swim", "bike"} else 0.68,
+            "short": 0.50 if discipline in {"overall", "swim", "run"} else 0.30,
+            "unknown": 0.60,
+        }).astype("float64")
+    elif profile == "Short Course / WTCS":
+        weights = families.map({
+            "short": 1.00,
+            "long_middle": 0.55 if discipline in {"overall", "swim", "run"} else 0.25,
+            "full": 0.42 if discipline in {"overall", "swim"} else 0.22,
+            "unknown": 0.50,
+        }).astype("float64")
+    return weights.fillna(0.50).clip(lower=0.0, upper=1.0)
+
+
 def _lookback_days(profile: str) -> int:
     if profile == "Full IRONMAN":
         return FULL_IM_LOOKBACK_DAYS
@@ -484,28 +532,6 @@ def _confidence(evidence_count: int, premium_count: int, strong_count: int) -> s
     return f"Medium - {evidence_count} races"
 
 
-def _reliability_weight(evidence_count: int, premium_count: int, strong_count: int, prior_available: bool = False) -> float:
-    """How much the ranking should trust the recent/profile-specific score.
-
-    A single great race should keep a high performance ceiling, but the ranking
-    score should be blended with a prior unless the athlete has repeated proof.
-    Strong/premium evidence earns a small bump; a usable prior lets elite
-    short-course or historical evidence support a thin recent long-course sample.
-    """
-    n = max(0, int(evidence_count or 0))
-    if n <= 0:
-        return 0.0
-    base = {1: 0.55, 2: 0.72, 3: 0.88, 4: 0.96}.get(n, 1.00)
-    if strong_count >= 1:
-        base += 0.04
-    if premium_count >= 1:
-        base += 0.03
-    if prior_available and n <= 2:
-        # A real prior gives us confidence that a small sample is not random.
-        base += 0.04
-    return float(max(0.0, min(base, 1.0)))
-
-
 def _baseline_prior_score(discipline: str, profile: str) -> float:
     """Conservative prior used when no cross-profile or historical proof exists."""
     if discipline == "run":
@@ -548,25 +574,25 @@ def _quality_flags(rows: pd.DataFrame, profile: str, discipline: str) -> Tuple[p
 # ---------------------------------------------------------------------------
 
 def _overall_score_rows(df: pd.DataFrame, profile: str, as_of: pd.Timestamp) -> pd.DataFrame:
-    """Return scored overall rows before athlete grouping."""
+    """Return scored overall rows before athlete grouping.
+
+    ORS already includes position, SOF, and time components. For profile
+    rankings, apply only distance-transfer weighting so cross-distance evidence
+    helps without overwhelming same-distance results.
+    """
     if df.empty or "ors" not in df.columns:
         return pd.DataFrame()
     work = df[df["ors"].notna() & (df["ors"] > 0) & (~df["bad_status"])].copy()
     if work.empty:
         return pd.DataFrame()
 
-    race_txt = _race_text(work)
-    recency_vals = work["race_date"].map(lambda rd: _recency_factor(rd, as_of))
-    relevance_vals = pd.Series(
-        [_race_relevance_factor(txt, _safe_float(sof)) for txt, sof in zip(race_txt, work["sof"])],
-        index=work.index,
-    )
+    transfer_vals = _distance_transfer_weight_series(work, profile, "overall")
+    adjusted = (work["ors"].astype(float) * transfer_vals).clip(upper=100)
 
-    adjusted = (work["ors"].astype(float) * recency_vals * relevance_vals).clip(upper=100)
-
-    work["score_value"]      = adjusted.round(4)
-    work["recency_factor"]   = recency_vals.round(3)
-    work["relevance_factor"] = relevance_vals.round(3)
+    work["score_value"] = adjusted.round(4)
+    work["recency_factor"] = 1.0
+    work["relevance_factor"] = transfer_vals.round(3)
+    work["distance_transfer_weight"] = transfer_vals.round(3)
 
     premium, strong = _quality_flags(work, profile, "overall")
     work["premium_evidence"] = premium
@@ -583,7 +609,7 @@ def _build_overall_cards(
     top_n: int,
     prior_scores: Optional[Dict[str, Tuple[float, int]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Overall scorecard: ORS adjusted by recency and race relevance."""
+    """Overall scorecard: ORS with profile-specific distance transfer weighting."""
     work = _overall_score_rows(df, profile, as_of)
     if work.empty:
         return [], []
@@ -622,17 +648,12 @@ def _split_score_rows(
     sof_score      = pd.to_numeric(work["sof"], errors="coerce").fillna(0).clip(lower=0, upper=100)
     time_score     = (100 - work["pct_behind_fastest"].fillna(0) * 8).clip(lower=0, upper=100)
 
-    # Base: split performance (40%) + time closeness (30%) + field strength (30%)
-    base_score = 0.40 * position_score + 0.30 * time_score + 0.30 * sof_score
+    # OpenRank-style blend: position + SOF + time. Splits use split rank/time
+    # as the discipline-specific version of position/time.
+    base_score = 0.35 * position_score + 0.35 * sof_score + 0.30 * time_score
 
-    # Apply recency decay and race-relevance bonus
-    race_txt = _race_text(work)
-    recency_vals = work["race_date"].map(lambda rd: _recency_factor(rd, as_of))
-    relevance_vals = pd.Series(
-        [_race_relevance_factor(txt, _safe_float(sof)) for txt, sof in zip(race_txt, work["sof"])],
-        index=work.index,
-    )
-    score = (base_score * recency_vals * relevance_vals).clip(upper=100)
+    transfer_vals = _distance_transfer_weight_series(work, profile, discipline)
+    score = (base_score * transfer_vals).clip(upper=100)
 
     # Guardrails: prevent weak-field / no-SOF results from dominating
     missing_sof = pd.to_numeric(work["sof"], errors="coerce").isna() | (pd.to_numeric(work["sof"], errors="coerce") <= 0)
@@ -643,8 +664,9 @@ def _split_score_rows(
     work["premium_evidence"]  = premium
     work["strong_evidence"]   = strong
     work["score_value"]       = score.round(4)
-    work["recency_factor"]    = recency_vals.round(3)
-    work["relevance_factor"]  = relevance_vals.round(3)
+    work["recency_factor"]    = 1.0
+    work["relevance_factor"]  = transfer_vals.round(3)
+    work["distance_transfer_weight"] = transfer_vals.round(3)
     work["split_text"]        = work[split_col].map(_format_time)
     work["split_rank_display"] = (
         work["split_rank_num"].fillna(0).astype(int).astype(str)
@@ -683,19 +705,23 @@ def _group_top_scores(
     evidence_rows: List[Dict[str, Any]] = []
     as_of_label  = as_of.strftime("%Y-%m-%d")
     current_year = int(as_of.year)
+    ranking_slots = OPENRANK_BEST_SCORES_USED
 
     for _, g in work.sort_values(
         ["athlete_key", "score_value", "race_date"], ascending=[True, False, False]
     ).groupby("athlete_key", sort=False):
 
-        top = g.sort_values(["score_value", "race_date"], ascending=[False, False]).head(top_n).copy()
+        top = g.sort_values(["score_value", "race_date"], ascending=[False, False]).head(max(int(top_n), ranking_slots)).copy()
         if top.empty:
             continue
-        scores = [float(x) for x in pd.to_numeric(top["score_value"], errors="coerce").dropna() if float(x) > 0]
+        scores = [float(x) for x in pd.to_numeric(top["score_value"], errors="coerce").dropna().head(ranking_slots) if float(x) > 0]
         if not scores:
             continue
 
-        performance_score = float(np.mean(scores))
+        ranking_scores = scores[:ranking_slots]
+        padded_scores = ranking_scores + [0.0] * max(0, ranking_slots - len(ranking_scores))
+        performance_score = float(np.mean(ranking_scores))
+        score = float(max(0.0, min(sum(padded_scores) / ranking_slots, 100.0)))
         athlete_key  = str(top["athlete_key"].iloc[0])
         athlete_url  = _canonical_url(top["athlete_url"].dropna().iloc[0]) if top["athlete_url"].dropna().size else ""
         athlete_name = (_clean(top["athlete_name"].dropna().iloc[0]) if top["athlete_name"].dropna().size
@@ -720,33 +746,28 @@ def _group_top_scores(
             prior_available = True
         if prior_score is None:
             prior_score = _baseline_prior_score(discipline, profile)
-        reliability_weight = _reliability_weight(len(scores), premium_count, strong_count, prior_available)
-        # The saved score is now the ranking score. The raw payload keeps the
-        # unadjusted performance/ceiling score for explanation.
-        score = (performance_score * reliability_weight) + (float(prior_score) * (1.0 - reliability_weight))
-        score = float(max(0.0, min(score, 100.0)))
-
         # Build the raw explainability payload
         raw: Dict[str, Any] = {
             "best_scores_used":       [round(x, 2) for x in scores],
+            "best_scores_padded":     [round(x, 2) for x in padded_scores],
             "performance_score":       round(performance_score, 4),
             "ranking_score":           round(score, 4),
             "prior_score":             round(float(prior_score), 4),
             "prior_available":         bool(prior_available),
             "prior_evidence_count":    int(prior_evidence_count),
-            "reliability_weight":      round(float(reliability_weight), 4),
             "premium_evidence_count": premium_count,
             "strong_evidence_count":  strong_count,
             "evidence_count":         len(scores),
-            "ranking_method": "performance_score × reliability_weight + prior_score × (1 - reliability_weight)",
+            "ranking_slots":          int(ranking_slots),
+            "ranking_method": "sum(best 4 distance-weighted race scores) / 4; missing scores count as 0",
         }
         if discipline != "overall":
             raw.update({
                 "OpenRank Split Score":   round(score, 2),
                 "Performance Split Score": round(performance_score, 2),
                 "Prior Score":            round(float(prior_score), 2),
-                "Reliability Weight":     round(float(reliability_weight), 2),
                 "Best Split Scores Used": ", ".join(f"{x:.1f}" for x in scores),
+                "Best Split Scores Padded": ", ".join(f"{x:.1f}" for x in padded_scores),
                 "Premium Evidence Count": premium_count,
                 "Strong Evidence Count":  strong_count,
                 "Evidence Count":         len(scores),
@@ -759,8 +780,8 @@ def _group_top_scores(
                 "OpenRank Score":          round(score, 2),
                 "Performance Score":       round(performance_score, 2),
                 "Prior Score":             round(float(prior_score), 2),
-                "Reliability Weight":      round(float(reliability_weight), 2),
                 "Best Scores Used":        ", ".join(f"{x:.1f}" for x in scores),
+                "Best Scores Padded":      ", ".join(f"{x:.1f}" for x in padded_scores),
                 "Prior Evidence Count":    int(prior_evidence_count),
             })
 
@@ -774,19 +795,19 @@ def _group_top_scores(
             "athlete_name":        athlete_name,
             "rank":                None,           # filled after sorting
             "score":               round(score, 4),
-            "best_scores":         [round(x, 4) for x in scores],
+            "best_scores":         [round(x, 4) for x in padded_scores],
             "evidence_count":      len(scores),
-            "current_year_score":  round(float(np.mean(sorted(cy_scores, reverse=True)[:top_n])), 4) if cy_scores else None,
+            "current_year_score":  round(float(sum((sorted(cy_scores, reverse=True)[:ranking_slots] + [0.0] * ranking_slots)[:ranking_slots]) / ranking_slots), 4) if cy_scores else None,
             "current_year_races":  int(len(cy)) if cy is not None else 0,
             "current_year_scored": int(len([x for x in cy_scores if x > 0])) if cy_scores else 0,
             "confidence":          confidence,
             "last_race_name":      _clean(last.get("race_name")),
             "last_race_date":      last_race_date,
-            "computed_source":     f"score_engine_v6 · reliability-prior · {gender} · {profile} · {discipline} · top {top_n}",
+            "computed_source":     f"score_engine_v7 - openrank-best4-distance-weighted - {gender} - {profile} - {discipline}",
             "raw":                 _json_row(raw),
         })
 
-        for used_rank, (_, ev) in enumerate(top.iterrows(), start=1):
+        for used_rank, (_, ev) in enumerate(top.head(ranking_slots).iterrows(), start=1):
             ev_score  = _safe_float(ev.get("score_value"))
             ev_rec    = _safe_float(ev.get("recency_factor"))
             ev_rel    = _safe_float(ev.get("relevance_factor"))
@@ -822,6 +843,7 @@ def _group_top_scores(
                     "Evidence Score":     ev_score,
                     "Recency Factor":     ev_rec,
                     "Relevance Factor":   ev_rel,
+                    "Distance Transfer Weight": _safe_float(ev.get("distance_transfer_weight")),
                     "Premium Evidence":   bool(ev.get("premium_evidence", False)),
                     "Strong Evidence":    bool(ev.get("strong_evidence", False)),
                 }),
@@ -850,7 +872,7 @@ def build_scorecard_slice(
     discipline: str,
     as_of_date: Any,
     model_version: str,
-    top_n: int = 5,
+    top_n: int = OPENRANK_BEST_SCORES_USED,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     """Build one gender × profile × discipline scorecard slice.
 
@@ -930,7 +952,7 @@ def build_all_scorecards(
     results: pd.DataFrame,
     as_of_date: Any,
     model_version: str,
-    top_n: int = 5,
+    top_n: int = OPENRANK_BEST_SCORES_USED,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Build every gender × profile × discipline scorecard in one pass.
 
@@ -956,3 +978,4 @@ def build_all_scorecards(
                 logs.append(log)
 
     return pd.DataFrame(cards), pd.DataFrame(evidence), pd.DataFrame(logs)
+

@@ -8,9 +8,9 @@ read-only: it loads Supabase data, builds scorecards locally, and writes CSV
 outputs for review without saving anything back to Supabase.
 """
 
-MODEL_VERSION = "score_engine_v6_reliability_prior"
+MODEL_VERSION = "score_engine_v7_openrank_distance_weighted"
 DEFAULT_AS_OF_DATE = "2026-06-17"
-DEFAULT_TOP_N_EVIDENCE = 5
+DEFAULT_TOP_N_EVIDENCE = 4
 
 # Fast default test slice. Override from CLI when needed.
 DEFAULT_GENDER = "Men"
@@ -51,3 +51,5 @@ SAMPLE_RACE_QUERIES = [
     "World Triathlon",
     "IRONMAN 70.3",
 ]
+
+

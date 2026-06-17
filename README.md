@@ -332,46 +332,23 @@ race relevance
 recency
 ```
 
-For overall score, the model uses ORS/OpenRank when available, then applies recency and race relevance.
+For the All profile, the model uses ORS/OpenRank race scores directly. For Full IRONMAN, 70.3/T100, and short-course profiles, same-distance results receive full weight and cross-distance results receive partial transfer weight.
 
-## Reliability-adjusted rankings
+## OpenRank-style rankings
 
-The rankings should not be driven only by one outstanding result.
-
-The model should distinguish between:
-
-- A proven athlete with repeated strong evidence.
-- A short-course athlete with one strong long-course result and strong transfer potential.
-- An injured/inactive athlete with one recent race but strong historical proof.
-- A one-race athlete with no supporting evidence.
-- A proven elite athlete who had one bad race.
-
-The current desired ranking concept is:
+The ranking score follows the public OpenRank concept of best race scores in a rolling window with missing slots counting as zero:
 
 ```text
-ranking_score =
-performance_score × reliability_weight
-+ prior_score × (1 - reliability_weight)
+ranking_score = sum(best 4 distance-weighted race scores) / 4
 ```
 
-Where:
-
-```text
-performance_score   = what the recent evidence shows
-reliability_weight  = how much we trust the recent sample
-prior_score         = backup ability from older/same-profile/all-profile/cross-profile evidence
-```
-
-A one-race athlete can still show a high ceiling, but should not automatically outrank a proven athlete with multiple elite results.
-
-A proven athlete with one bad race should not be buried if their broader evidence remains strong.
+This means one outstanding race still shows as high ceiling evidence, but it no longer automatically outranks athletes with repeated elite results. Full-distance rankings favor full-distance evidence, while still allowing strong 70.3/T100 performances to transfer at reduced weight. The same distance-transfer and best-4 denominator logic applies to swim, bike, and run split rankings.
 
 ## Model version
-
 Use the current scorecard model version consistently across app, engine, scorecards, evidence, and dashboard filters:
 
 ```text
-score_engine_v6_reliability_prior
+score_engine_v7_openrank_distance_weighted
 ```
 
 If this changes, rebuild all scorecards and ensure dashboard filters are updated to the same version.
@@ -494,7 +471,7 @@ If it loads around 1,000 rows, pagination is broken or the deployed file is stal
 Make sure all references use the same version:
 
 ```text
-score_engine_v6_reliability_prior
+score_engine_v7_openrank_distance_weighted
 ```
 
 Check:
@@ -560,3 +537,5 @@ When editing the app:
 - Keep old manual/CSV tables out of the new scoring model path.
 - Prefer stable IDs over names.
 - Make scorecard rankings explainable through evidence rows.
+
+

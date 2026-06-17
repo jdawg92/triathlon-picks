@@ -74,9 +74,9 @@ except Exception:
     DEFAULT_AS_OF_DATE = "2026-06-17"
     DEFAULT_GENDER = "Men"
     DEFAULT_PROFILE = "Long Course / 70.3 + T100"
-    DEFAULT_TOP_N_EVIDENCE = 5
+    DEFAULT_TOP_N_EVIDENCE = 4
     DEFAULT_TOP_ROWS = 40
-    MODEL_VERSION = "score_engine_v6_reliability_prior"
+    MODEL_VERSION = "score_engine_v7_openrank_distance_weighted"
     WATCHLIST = []
     EXPECTATIONS = {}
 
@@ -417,11 +417,12 @@ def flatten_raw_columns(cards: pd.DataFrame) -> pd.DataFrame:
         "prior_score",
         "prior_available",
         "prior_evidence_count",
-        "reliability_weight",
         "evidence_count",
         "premium_evidence_count",
         "strong_evidence_count",
         "best_scores_used",
+        "best_scores_padded",
+        "ranking_slots",
         "ranking_method",
     ]:
         out[key] = raw_series.map(lambda x, k=key: x.get(k))
@@ -671,7 +672,7 @@ def main() -> int:
                 f"Global top {args.top}: {discipline}",
                 _display_cols(view, [
                     "rank", "athlete_name", "gender", "profile", "discipline",
-                    "score", "performance_score", "prior_score", "reliability_weight",
+                    "score", "performance_score", "prior_score", "best_scores_padded",
                     "evidence_count", "prior_evidence_count", "confidence",
                     "last_race_name", "last_race_date",
                 ]),
@@ -686,7 +687,7 @@ def main() -> int:
             _display_cols(watchlist_df, [
                 "watchlist_name", "found", "athlete_name", "gender", "profile",
                 "discipline", "rank", "score", "performance_score", "prior_score",
-                "reliability_weight", "evidence_count", "prior_evidence_count",
+                "best_scores_padded", "evidence_count", "prior_evidence_count",
                 "confidence", "expectation",
             ]),
             max_rows=200,
@@ -727,7 +728,7 @@ def main() -> int:
                         "score",
                         "performance_score",
                         "prior_score",
-                        "reliability_weight",
+                        "best_scores_padded",
                         "evidence_count",
                         "prior_evidence_count",
                         "confidence",
@@ -751,3 +752,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

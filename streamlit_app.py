@@ -83,8 +83,8 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v6_reliability_prior"
-TOP_SCORES_USED = 5
+MODEL_CACHE_VERSION = "score_engine_v7_openrank_distance_weighted"
+TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
 DEFAULT_SCORECARD_LOOKBACK_DAYS = 365
@@ -3923,8 +3923,8 @@ def add_split_openrank_scores(audit: pd.DataFrame) -> pd.DataFrame:
     """Add OpenRank-like split score columns to the audit table.
 
     Split score = 35% position + 35% SOF + 30% split-time quality.
-    Athlete ranking uses up to the top configured split scores in the rolling 52-week window.
-    Missing evidence is not padded with zero; confidence/evidence_count carries the sample-size warning.
+    Athlete ranking uses best 4 split scores in the rolling window.
+    Missing evidence slots are padded with zero in the final ranking score.
     """
     if audit is None or audit.empty:
         return pd.DataFrame() if audit is None else audit
@@ -3985,17 +3985,13 @@ def add_split_openrank_scores(audit: pd.DataFrame) -> pd.DataFrame:
 
 
 def best4_openrank_average(values: Iterable[Any], divisor: int = 4) -> Tuple[float, List[float]]:
-    """Return the average of the available top scores, without padding missing slots.
-
-    `divisor` is now a max-count, not a forced denominator. If an athlete has
-    only 3 eligible races, we average those 3 and carry the lower sample size in
-    Evidence Count / Confidence instead of inserting 0.0 placeholder races.
-    """
+    """Return OpenRank-style best scores divided by a fixed denominator."""
     vals = [float(v) for v in values if safe_float(v) is not None and float(v) > 0]
     vals = sorted(vals, reverse=True)[:divisor]
     if not vals:
         return 0.0, []
-    return sum(vals) / len(vals), vals
+    padded = vals + [0.0] * max(0, int(divisor) - len(vals))
+    return sum(padded[:divisor]) / int(divisor), padded[:divisor]
 
 
 # Override previous split scoring with OpenRank-aligned split scoring.
@@ -4193,8 +4189,8 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v6_reliability_prior"
-TOP_SCORES_USED = 5
+MODEL_CACHE_VERSION = "score_engine_v7_openrank_distance_weighted"
+TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
 RANKING_FAMILIES = ["Long Course / 70.3 + T100", "Short Course / WTCS", "Full IRONMAN", "All"]
@@ -4730,8 +4726,8 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "score_engine_v6_reliability_prior"
-TOP_SCORES_USED = 5
+MODEL_CACHE_VERSION = "score_engine_v7_openrank_distance_weighted"
+TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
 # Full-distance athletes race less often, so Full IRONMAN scorecards use a longer
@@ -5783,6 +5779,7 @@ def _display_scorecards_from_tables(cards: pd.DataFrame, evidence: pd.DataFrame,
             "OpenRank Score", "OpenRank Split Score", "Best Recent ORS", "Strong Field ORS", "Recent Races Used",
             "Premium Evidence Count", "Strong Evidence Count", "Last Rank", "Best Recent Split",
             "Premium Field Score", "Strong Field Score", "Premium Avg Behind %", "Strong Avg Behind %", "Recent Avg Behind %",
+            "Best Scores Padded", "Best Split Scores Padded", "Distance Transfer Weight",
         ]:
             if extra in raw and extra not in row:
                 row[extra] = raw.get(extra)
@@ -5842,7 +5839,7 @@ def build_race_prediction_from_scorecard_tables(starts: pd.DataFrame, selected_r
 def render_score_evidence(scored: pd.DataFrame, title: str, limit: int = 5) -> None:
     if scored is None or scored.empty or "Score Evidence" not in scored.columns:
         return
-    st.caption(f"Open an athlete to see the up to {TOP_SCORES_USED} race rows feeding the displayed score. Missing slots are not padded with 0.0.")
+    st.caption(f"Open an athlete to see the up to {TOP_SCORES_USED} race rows feeding the displayed score. Rankings use best 4 with missing slots padded as 0.0.")
     for _, r in scored.head(limit).iterrows():
         athlete = clean_str(r.get("Athlete")) or "Athlete"
         score = r.get("Score")
@@ -5891,7 +5888,7 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
 
     section_title("🏆", "Overall Picks")
     overall = _positive_score_rows(cached_section(cached_df, "overall"))
-    display_table(overall.head(20), ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date"])
+    display_table(overall.head(20), ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Best Scores Padded", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date"])
     render_score_evidence(overall, "Overall score evidence", limit=8)
     _render_missing_scorecards(params, "overall")
 
@@ -5903,7 +5900,7 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
             scored = _positive_score_rows(cached_section(cached_df, disc))
             display_table(
                 scored.head(20),
-                ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
+                ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Best Split Scores Padded", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split"],
                 height=360,
             )
             render_score_evidence(scored, f"{title} evidence", limit=8)
@@ -8081,13 +8078,13 @@ elif page == "Athlete Rankings":
     if view_kind == "overall":
         display_table(
             scorecard_df.head(100),
-            ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"],
+            ["Rank", "Athlete", "Score", "OpenRank Score", "Best Scores Used", "Best Scores Padded", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date", "Athlete URL"],
             height=650,
         )
     else:
         display_table(
             scorecard_df.head(100),
-            ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"],
+            ["Rank", "Athlete", "Score", "OpenRank Split Score", "Best Split Scores Used", "Best Split Scores Padded", "Confidence", "Premium Evidence Count", "Strong Evidence Count", "Evidence Count", "Last Race", "Last Race Date", "Last Rank", "Best Recent Split", "Athlete URL"],
             height=650,
         )
     render_score_evidence(scorecard_df.head(10), f"{view_kind.title()} score evidence", limit=10)
@@ -8484,4 +8481,5 @@ elif page in {"Race Dashboard", "Split Audit"}:
                             ["race_date", "race_name", "race_type", "distance", "place", "status", "gender", "sof", "sof_source", "ors", f"{disc}_split", "Has Split", "Profile Eligible", "Inside 52 Weeks", "Gender Compatible", "Why Not Used", "swim_seconds", "bike_seconds", "run_seconds"],
                             height=420,
                         )
+
 
