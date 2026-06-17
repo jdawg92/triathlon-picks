@@ -1909,6 +1909,51 @@ def dedupe_result_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(best.values())
 
 
+def dedupe_db_result_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Dedupe rows by the exact Supabase unique key before a bulk upsert.
+
+    The app tables enforce athlete_url + race_date + race_name + race_type.
+    Large cached publishes can include repeat rows from the source API or from a
+    previous partial publish. Upsert handles existing database rows, but each
+    request must still contain only one row per conflict key.
+    """
+    best: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    for row in rows or []:
+        r = dict(row)
+        r["athlete_url"] = canonical_athlete_url(r.get("athlete_url")) or r.get("athlete_url")
+        key = (
+            clean_str(r.get("athlete_url")),
+            iso_date(r.get("race_date")),
+            clean_str(r.get("race_name")),
+            clean_str(r.get("race_type")),
+        )
+        if not key[0] or not key[1] or not key[2] or not key[3]:
+            key = (key[0] or f"missing-athlete-{len(best)}", key[1] or "missing-date", key[2] or f"missing-race-{len(best)}", key[3] or f"missing-type-{len(best)}")
+        current = best.get(key)
+        if current is None or result_row_quality(r) > result_row_quality(current):
+            best[key] = r
+    return list(best.values())
+
+
+def upsert_result_rows_fast(table_name: str, rows: List[Dict[str, Any]], chunk_size: int = 500) -> Tuple[int, int]:
+    """Fast publisher for fresh or partially written result tables.
+
+    Uses the existing unique constraint instead of blind inserts, so rerunning
+    the same cached-result offset is safe after an interrupted publish.
+    Returns inserted_or_upserted_count, updated_count_display.
+    """
+    rows = dedupe_db_result_rows(rows)
+    if not rows:
+        return 0, 0
+    upsert_chunks(
+        table_name,
+        rows,
+        on_conflict="athlete_url,race_date,race_name,race_type",
+        chunk_size=chunk_size,
+    )
+    return len(rows), 0
+
+
 def build_existing_result_map(table_name: str) -> Dict[Tuple[str, str, str, str], Dict[str, Any]]:
     """Map existing DB result rows by the same key used for imports."""
     existing = load_table(table_name)
@@ -5963,11 +6008,10 @@ elif page == "Import CSVs":
                                 gender_propagated += rf_gp
 
                             if fast_publish:
-                                # Fresh-table path: fast direct inserts. Avoids the slow row-by-row merge that can hang on large batches.
-                                insert_chunks("athlete_results", app_rows, chunk_size=1000)
-                                insert_chunks("race_field_results", race_field_rows, chunk_size=1000)
-                                ar_inserted, ar_updated = len(app_rows), 0
-                                rf_inserted, rf_updated = len(race_field_rows), 0
+                                # Fast path: use bulk upsert on the result unique key.
+                                # This is safe after a partial/failed publish because existing rows are updated instead of duplicated.
+                                ar_inserted, ar_updated = upsert_result_rows_fast("athlete_results", app_rows, chunk_size=500)
+                                rf_inserted, rf_updated = upsert_result_rows_fast("race_field_results", race_field_rows, chunk_size=500)
                             else:
                                 # Repair/import path: slower but tries to update matching existing rows instead of adding duplicates.
                                 ar_inserted, ar_skipped, ar_updated = merge_result_rows("athlete_results", app_rows)
