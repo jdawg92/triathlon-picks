@@ -5982,6 +5982,55 @@ def _render_missing_scorecards(params: Dict[str, Any], discipline: str) -> None:
             display_table(pd.DataFrame(missing), ["Athlete", "Discipline", "Reason", "Athlete URL"], height=280)
 
 
+def build_keep_an_eye_table(cached_df: pd.DataFrame) -> pd.DataFrame:
+    """Surface limited-sample or improving athletes who may outrun ranking score."""
+    if cached_df is None or cached_df.empty:
+        return pd.DataFrame()
+    rows: List[Dict[str, Any]] = []
+    labels = {
+        "overall": "Overall",
+        "swim": "Swim",
+        "bike": "Bike",
+        "run": "Run",
+    }
+    for section, label in labels.items():
+        section_df = _positive_score_rows(cached_section(cached_df, section))
+        if section_df.empty:
+            continue
+        for _, r in section_df.iterrows():
+            evidence_count = parse_int(r.get("Evidence Count")) or 0
+            race_pick = safe_float(r.get("Race Pick Score")) or 0.0
+            ranking_score = safe_float(r.get("Score")) or 0.0
+            perf_score = safe_float(r.get("Performance Score" if section == "overall" else "Performance Split Score")) or race_pick
+            premium = parse_int(r.get("Premium Evidence Count")) or 0
+            strong = parse_int(r.get("Strong Evidence Count")) or 0
+            reasons = []
+            if evidence_count <= 2 and perf_score >= 78:
+                reasons.append("limited sample, high ceiling")
+            if race_pick - ranking_score >= 12 and race_pick >= 65:
+                reasons.append("race score above ranking")
+            if section in {"run", "bike", "swim"} and evidence_count <= 3 and (premium >= 1 or strong >= 1) and perf_score >= 72:
+                reasons.append("fast recent split signal")
+            if not reasons:
+                continue
+            rows.append({
+                "Athlete": clean_str(r.get("Athlete")),
+                "Signal": label,
+                "Watch Score": round(race_pick, 1),
+                "Performance": round(perf_score, 1),
+                "Ranking": round(ranking_score, 1),
+                "Evidence": evidence_count,
+                "Reason": "; ".join(reasons),
+                "Last Race": clean_str(r.get("Last Race")),
+                "Last Race Date": clean_str(r.get("Last Race Date")),
+            })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values(["Watch Score", "Performance"], ascending=[False, False]).drop_duplicates(subset=["Athlete", "Signal"], keep="first")
+    return out.reset_index(drop=True)
+
+
 def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional[Dict[str, Any]] = None) -> None:
     params = (cache_meta or {}).get("params", {}) if isinstance(cache_meta, dict) else {}
     computed_at = (cache_meta or {}).get("computed_at") if isinstance(cache_meta, dict) else None
@@ -5997,6 +6046,15 @@ def display_cached_race_prediction(cached_df: pd.DataFrame, cache_meta: Optional
     display_table(overall.head(20), ["Rank", "Athlete", "Race Pick Score", "Race Evidence Score", "Race Performance Score", "Race Evidence Scores", "Score", "Performance Score", "OpenRank Score", "Best Scores Used", "Best Scores Padded", "Current Year ORS", "Current Year Races", "Current Year Scored", "Best Recent ORS", "Strong Field ORS", "Recent Races Used", "Last Race", "Last Race Date"])
     render_score_evidence(overall, "Overall score evidence", limit=8)
     _render_missing_scorecards(params, "overall")
+
+    watch = build_keep_an_eye_table(cached_df)
+    if not watch.empty:
+        with st.expander(f"Keep an eye on ({len(watch)})", expanded=False):
+            display_table(
+                watch.head(30),
+                ["Athlete", "Signal", "Watch Score", "Performance", "Ranking", "Evidence", "Reason", "Last Race", "Last Race Date"],
+                height=360,
+            )
 
     st.divider()
     tabs = st.tabs(["🏊 Fastest Swim", "🚴 Fastest Bike", "🏃 Fastest Run"])
