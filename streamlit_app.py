@@ -77,7 +77,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v4_scoring_pool"
+MODEL_CACHE_VERSION = "score_engine_v5_recency_relevance"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -1357,7 +1357,7 @@ def load_table(table_name: str) -> pd.DataFrame:
 
 SCORING_POOL_SCORECARD_COLUMNS = (
     "athlete_url,athlete_name,gender,race_name,race_type,distance,race_date,"
-    "place,status,bad_status,sof,ors,swim_seconds,bike_seconds,run_seconds"
+    "place,status,bad_status,sof,ors,swim_seconds,bike_seconds,run_seconds,raw"
 )
 MAX_SCORECARD_POOL_LOOKBACK_DAYS = ALL_PROFILE_SCORECARD_LOOKBACK_DAYS
 

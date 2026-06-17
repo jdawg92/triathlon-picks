@@ -1,17 +1,37 @@
 """Fast athlete scorecard build engine.
 
-This module keeps the heavy scorecard rebuild out of streamlit_app.py.
-It builds all athlete/profile/discipline scorecards in a small number of grouped
-operations, then returns rows ready for Supabase inserts.
+HOW SCORING WORKS
+-----------------
+Every eligible result is assigned an adjusted score before the athlete's
+top-N evidence races are averaged into a final scorecard number.
+
+For split disciplines (swim / bike / run):
+
+    base_score  = 0.40 × position_score          # how you ranked in the field
+                + 0.30 × time_score               # how close to the fastest split
+                + 0.30 × sof_score                # how strong the field was
+    × recency   = decay so recent races matter more than old ones
+    × relevance = bonus for championship / premium-circuit races
+    = adjusted_score  (capped at 100)
+
+For overall (OpenRank / ORS):
+
+    adjusted_score = ORS × recency × relevance    (capped at 100)
+
+ORS already encodes field quality, so the multipliers add recency and
+format context on top.
+
+Guardrails prevent weak-field or no-SOF results from dominating:
+  - Missing SOF → score capped at 55
+  - Field size < 3 → score capped at 45
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-
+import json
 import math
 import re
+from datetime import date, datetime
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -29,7 +49,10 @@ FULL_IM_LOOKBACK_DAYS = 730
 ALL_LOOKBACK_DAYS = 730
 
 
-# ---------- small normalization helpers ----------
+# ---------------------------------------------------------------------------
+# Normalisation helpers
+# ---------------------------------------------------------------------------
+
 def _clean(value: Any) -> str:
     if value is None:
         return ""
@@ -133,10 +156,7 @@ def _format_time(seconds: Any) -> str:
     return f"{m}:{s:02d}"
 
 
-
-
 def _parse_raw_payload(value: Any) -> Dict[str, Any]:
-    """Return raw JSON payload as a dict when available."""
     if value is None:
         return {}
     if isinstance(value, dict):
@@ -146,7 +166,6 @@ def _parse_raw_payload(value: Any) -> Dict[str, Any]:
         if not text:
             return {}
         try:
-            import json
             obj = json.loads(text)
             return obj if isinstance(obj, dict) else {}
         except Exception:
@@ -164,6 +183,10 @@ def _first_from_mapping(mapping: Dict[str, Any], aliases: Iterable[str]) -> Any:
             return mapping[normalized[key]]
     return None
 
+
+# ---------------------------------------------------------------------------
+# Split validation helpers
+# ---------------------------------------------------------------------------
 
 def _validate_split_seconds(seconds: Optional[int], discipline: str, race_context: str) -> Optional[int]:
     if seconds is None:
@@ -197,12 +220,6 @@ def _validate_split_seconds(seconds: Optional[int], discipline: str, race_contex
 
 
 def _parse_split_seconds(value: Any, discipline: str, race_context: str = "") -> Optional[int]:
-    """Parse split strings like 23:33, 2:05:41, or numeric seconds.
-
-    Older CSVs sometimes kept splits in raw JSON or display columns instead of
-    normalized *_seconds columns. The score engine needs to recover those so
-    athletes with visible race history do not end up missing split scorecards.
-    """
     if value is None:
         return None
     try:
@@ -211,8 +228,7 @@ def _parse_split_seconds(value: Any, discipline: str, race_context: str = "") ->
     except Exception:
         pass
     if isinstance(value, (int, np.integer)):
-        sec = int(value)
-        return _validate_split_seconds(sec, discipline, race_context)
+        return _validate_split_seconds(int(value), discipline, race_context)
     if isinstance(value, (float, np.floating)):
         if math.isnan(float(value)):
             return None
@@ -240,7 +256,6 @@ def _parse_split_seconds(value: Any, discipline: str, race_context: str = "") ->
             if discipline == "swim":
                 seconds = a * 60 + b
             elif discipline == "bike":
-                # Bikes in long-course rows are usually h:mm; short course can be mm:ss.
                 if any(x in rt for x in ["sprint", "olympic", "world triathlon", "continental", "wtcs"]):
                     seconds = a * 60 + b if a < 90 else a * 3600 + b * 60
                 else:
@@ -264,11 +279,10 @@ def _recover_split_from_row(row: pd.Series, discipline: str) -> Optional[int]:
     aliases = {
         "swim": ["swim_seconds", "Swim Seconds", "Swim", "Swim Split", "Swim Time", "swim", "swim_split", "swim_time"],
         "bike": ["bike_seconds", "Bike Seconds", "Bike", "Bike Split", "Bike Time", "bike", "bike_split", "bike_time"],
-        "run": ["run_seconds", "Run Seconds", "Run", "Run Split", "Run Time", "run", "run_split", "run_time"],
+        "run":  ["run_seconds",  "Run Seconds",  "Run", "Run Split",  "Run Time",  "run", "run_split",  "run_time"],
     }[discipline]
     race_context = " ".join([_clean(row.get(c)) for c in ["race_name", "race_type", "distance"]])
 
-    # 1) Check dataframe columns by alias.
     col_map = {str(c).strip().lower().replace("_", " "): c for c in row.index}
     for alias in aliases:
         key = str(alias).strip().lower().replace("_", " ")
@@ -277,11 +291,69 @@ def _recover_split_from_row(row: pd.Series, discipline: str) -> Optional[int]:
             if sec is not None:
                 return sec
 
-    # 2) Check original raw CSV payload if present.
     raw = _parse_raw_payload(row.get("raw"))
     val = _first_from_mapping(raw, aliases)
     return _parse_split_seconds(val, discipline, race_context)
 
+
+# ---------------------------------------------------------------------------
+# Scoring context multipliers
+# ---------------------------------------------------------------------------
+
+def _recency_factor(race_date: Any, as_of: pd.Timestamp) -> float:
+    """Decay multiplier: more recent results carry more weight in the scorecard."""
+    try:
+        rd = pd.to_datetime(race_date)
+        if pd.isna(rd):
+            return 0.70
+        days_ago = max(0, (as_of - rd).days)
+    except Exception:
+        return 0.70
+    if days_ago <= 90:
+        return 1.00
+    if days_ago <= 180:
+        return 0.93
+    if days_ago <= 270:
+        return 0.86
+    if days_ago <= 365:
+        return 0.78
+    if days_ago <= 540:
+        return 0.67
+    return 0.57
+
+
+def _race_relevance_factor(race_text: str, sof: Optional[float]) -> float:
+    """Bonus multiplier for high-relevance race formats and strong fields.
+
+    Championship and premium-series races earn a bonus so a world-championship
+    result counts more than the same raw performance in a minor race.
+    """
+    txt = (race_text or "").lower()
+    # Pinnacle events
+    if any(x in txt for x in [
+        "world championship", "olympic games", "ironman world",
+        "t100 world", "championship final", "wtcs final",
+        "kona", "st george", "nice",
+    ]):
+        return 1.18
+    # Strong series / majors
+    if any(x in txt for x in [
+        "wtcs", "t100", "pto", "ironman 70.3 world",
+        "championship series", "world series",
+    ]):
+        return 1.10
+    # High-SOF field even if unlabelled as a major
+    sof_v = _safe_float(sof) or 0.0
+    if sof_v >= 80:
+        return 1.08
+    if sof_v >= 65:
+        return 1.04
+    return 1.00
+
+
+# ---------------------------------------------------------------------------
+# Profile / lookback helpers
+# ---------------------------------------------------------------------------
 
 def _race_text(df: pd.DataFrame) -> pd.Series:
     parts = []
@@ -300,18 +372,21 @@ def _profile_mask(df: pd.DataFrame, profile: str) -> pd.Series:
     sof = pd.to_numeric(df.get("sof", pd.Series([np.nan] * len(df), index=df.index)), errors="coerce")
 
     is_full = txt.str.contains(r"\b140\.6\b|full ironman|\bfull\b", regex=True, na=False) | (
-        txt.str.contains("ironman", na=False) & ~txt.str.contains("70.3", na=False) & ~txt.str.contains("t100|pto", regex=True, na=False)
+        txt.str.contains("ironman", na=False)
+        & ~txt.str.contains("70.3", na=False)
+        & ~txt.str.contains("t100|pto", regex=True, na=False)
     )
     is_long = txt.str.contains("70.3|middle|challenge|t100|pto|100k", regex=True, na=False) & ~is_full
 
-    is_wtcs = txt.str.contains("wtcs|world triathlon championship series|world triathlon championships", regex=True, na=False)
-    is_world_cup = txt.str.contains("world triathlon cup", regex=True, na=False)
-    is_olympic = txt.str.contains("olympic|olympics|olympic games", regex=True, na=False)
-    is_sprint = txt.str.contains("sprint|super sprint", regex=True, na=False)
-    is_conti = txt.str.contains("continental cup|europe triathlon cup|africa triathlon cup|americas triathlon cup|asia triathlon cup|oceania triathlon cup", regex=True, na=False)
+    is_wtcs       = txt.str.contains("wtcs|world triathlon championship series|world triathlon championships", regex=True, na=False)
+    is_world_cup  = txt.str.contains("world triathlon cup", regex=True, na=False)
+    is_olympic    = txt.str.contains("olympic|olympics|olympic games", regex=True, na=False)
+    is_conti      = txt.str.contains(
+        "continental cup|europe triathlon cup|africa triathlon cup|"
+        "americas triathlon cup|asia triathlon cup|oceania triathlon cup",
+        regex=True, na=False,
+    )
 
-    # For short course, permit true WTCS/World Cup sprint rows, but keep low-tier
-    # continental sprint rows out unless they are Olympic-distance and have strong SOF.
     short = is_wtcs | is_world_cup | is_olympic | ((is_conti & is_olympic) & (sof >= 65))
     short = short & ~txt.str.contains("super sprint", regex=True, na=False)
 
@@ -333,6 +408,10 @@ def _lookback_days(profile: str) -> int:
         return ALL_LOOKBACK_DAYS
     return DEFAULT_LOOKBACK_DAYS
 
+
+# ---------------------------------------------------------------------------
+# Result normalisation
+# ---------------------------------------------------------------------------
 
 def _prep_results(results: pd.DataFrame) -> pd.DataFrame:
     df = results.copy()
@@ -356,8 +435,6 @@ def _prep_results(results: pd.DataFrame) -> pd.DataFrame:
         else:
             df[col] = np.nan
 
-    # Normalize/recover split seconds. Some imports have display columns like
-    # Swim/Bike/Run or only the original raw CSV JSON, so recover here too.
     for disc in ["swim", "bike", "run"]:
         col = f"{disc}_seconds"
         if col not in df.columns:
@@ -375,11 +452,17 @@ def _prep_results(results: pd.DataFrame) -> pd.DataFrame:
         bad = df["status"].fillna("").astype(str).str.upper().str.contains("DNF|DNS|DSQ|DQ|CANCEL", regex=True, na=False)
         df["bad_status"] = bad
 
-    # Prefer URL as grouping key; fallback to lower name for rows with missing URL.
-    df["athlete_key"] = df["athlete_url"].where(df["athlete_url"].astype(str).str.len() > 0, df["athlete_name"].str.lower())
+    df["athlete_key"] = df["athlete_url"].where(
+        df["athlete_url"].astype(str).str.len() > 0,
+        df["athlete_name"].str.lower(),
+    )
     df = df[df["athlete_key"].astype(str).str.len() > 0].copy()
     return df
 
+
+# ---------------------------------------------------------------------------
+# Confidence / quality helpers
+# ---------------------------------------------------------------------------
 
 def _confidence(evidence_count: int, premium_count: int, strong_count: int) -> str:
     if evidence_count <= 0:
@@ -400,26 +483,59 @@ def _quality_flags(rows: pd.DataFrame, profile: str, discipline: str) -> Tuple[p
     sof = pd.to_numeric(rows.get("sof", pd.Series([np.nan] * len(rows), index=rows.index)), errors="coerce").fillna(0)
     premium = txt.str.contains("world championship|championship final|t100|pto|olympic games|wtcs", regex=True, na=False)
     if profile == "Full IRONMAN":
-        premium = premium | txt.str.contains("ironman texas|ironman world championship|ironman new zealand|ironman south africa", regex=True, na=False)
+        premium = premium | txt.str.contains(
+            "ironman texas|ironman world championship|ironman new zealand|ironman south africa",
+            regex=True, na=False,
+        )
     strong = (sof >= 65) | premium
     return premium.fillna(False), strong.fillna(False)
 
 
-# ---------- scorecard builders ----------
-def _build_overall_cards(df: pd.DataFrame, gender: str, profile: str, as_of: pd.Timestamp, model_version: str, top_n: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+# ---------------------------------------------------------------------------
+# Scorecard builders
+# ---------------------------------------------------------------------------
+
+def _build_overall_cards(
+    df: pd.DataFrame,
+    gender: str,
+    profile: str,
+    as_of: pd.Timestamp,
+    model_version: str,
+    top_n: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Overall scorecard: ORS adjusted by recency and race relevance."""
     if df.empty or "ors" not in df.columns:
         return [], []
     work = df[df["ors"].notna() & (df["ors"] > 0) & (~df["bad_status"])].copy()
     if work.empty:
         return [], []
-    work["score_value"] = work["ors"].astype(float)
+
+    race_txt = _race_text(work)
+    recency_vals = work["race_date"].map(lambda rd: _recency_factor(rd, as_of))
+    relevance_vals = pd.Series(
+        [_race_relevance_factor(txt, _safe_float(sof)) for txt, sof in zip(race_txt, work["sof"])],
+        index=work.index,
+    )
+
+    adjusted = (work["ors"].astype(float) * recency_vals * relevance_vals).clip(upper=100)
+
+    work["score_value"]     = adjusted.round(4)
+    work["recency_factor"]  = recency_vals.round(3)
+    work["relevance_factor"] = relevance_vals.round(3)
+
     premium, strong = _quality_flags(work, profile, "overall")
     work["premium_evidence"] = premium
-    work["strong_evidence"] = strong
+    work["strong_evidence"]  = strong
     return _group_top_scores(work, gender, profile, "overall", as_of, model_version, top_n)
 
 
-def _split_score_rows(df: pd.DataFrame, discipline: str, profile: str) -> pd.DataFrame:
+def _split_score_rows(
+    df: pd.DataFrame,
+    discipline: str,
+    profile: str,
+    as_of: pd.Timestamp,
+) -> pd.DataFrame:
+    """Score each split result; apply recency and relevance multipliers."""
     split_col = f"{discipline}_seconds"
     if df.empty or split_col not in df.columns:
         return pd.DataFrame()
@@ -428,158 +544,209 @@ def _split_score_rows(df: pd.DataFrame, discipline: str, profile: str) -> pd.Dat
         return pd.DataFrame()
 
     work["race_key"] = (
-        work["race_date"].dt.strftime("%Y-%m-%d").fillna("") + "|" +
-        work["race_name"].fillna("").astype(str) + "|" +
-        work["gender"].fillna("").astype(str)
+        work["race_date"].dt.strftime("%Y-%m-%d").fillna("") + "|"
+        + work["race_name"].fillna("").astype(str) + "|"
+        + work["gender"].fillna("").astype(str)
     )
-    work["sample_size"] = work.groupby("race_key")[split_col].transform("count")
-    work["split_rank_num"] = work.groupby("race_key")[split_col].rank(method="min", ascending=True)
-    work["fastest_split"] = work.groupby("race_key")[split_col].transform("min")
-    work["pct_behind_fastest"] = ((work[split_col] - work["fastest_split"]) / work["fastest_split"] * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
+    work["sample_size"]     = work.groupby("race_key")[split_col].transform("count")
+    work["split_rank_num"]  = work.groupby("race_key")[split_col].rank(method="min", ascending=True)
+    work["fastest_split"]   = work.groupby("race_key")[split_col].transform("min")
+    work["pct_behind_fastest"] = (
+        (work[split_col] - work["fastest_split"]) / work["fastest_split"] * 100
+    ).replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    sample = work["sample_size"].clip(lower=1)
-    rank = work["split_rank_num"].fillna(sample)
+    sample         = work["sample_size"].clip(lower=1)
+    rank           = work["split_rank_num"].fillna(sample)
     position_score = 100 * (sample - rank + 1) / sample
-    sof_score = pd.to_numeric(work["sof"], errors="coerce").fillna(0).clip(lower=0, upper=100)
-    time_score = (100 - work["pct_behind_fastest"].fillna(0) * 8).clip(lower=0, upper=100)
-    score = 0.35 * position_score + 0.35 * sof_score + 0.30 * time_score
+    sof_score      = pd.to_numeric(work["sof"], errors="coerce").fillna(0).clip(lower=0, upper=100)
+    time_score     = (100 - work["pct_behind_fastest"].fillna(0) * 8).clip(lower=0, upper=100)
 
-    # Guardrails for tiny / missing-SOF samples. This prevents development-cup rows
-    # with 3 athletes and no SOF from beating championship / T100 evidence.
+    # Base: split performance (40%) + time closeness (30%) + field strength (30%)
+    base_score = 0.40 * position_score + 0.30 * time_score + 0.30 * sof_score
+
+    # Apply recency decay and race-relevance bonus
+    race_txt = _race_text(work)
+    recency_vals = work["race_date"].map(lambda rd: _recency_factor(rd, as_of))
+    relevance_vals = pd.Series(
+        [_race_relevance_factor(txt, _safe_float(sof)) for txt, sof in zip(race_txt, work["sof"])],
+        index=work.index,
+    )
+    score = (base_score * recency_vals * relevance_vals).clip(upper=100)
+
+    # Guardrails: prevent weak-field / no-SOF results from dominating
     missing_sof = pd.to_numeric(work["sof"], errors="coerce").isna() | (pd.to_numeric(work["sof"], errors="coerce") <= 0)
     score = score.mask(missing_sof, np.minimum(score, 55))
     score = score.mask(work["sample_size"] < 3, np.minimum(score, 45))
 
     premium, strong = _quality_flags(work, profile, discipline)
-    work["premium_evidence"] = premium
-    work["strong_evidence"] = strong
-    work["score_value"] = score.round(4)
-    work["split_text"] = work[split_col].map(_format_time)
-    work["split_rank_display"] = work["split_rank_num"].fillna(0).astype(int).astype(str) + "/" + work["sample_size"].fillna(0).astype(int).astype(str)
+    work["premium_evidence"]  = premium
+    work["strong_evidence"]   = strong
+    work["score_value"]       = score.round(4)
+    work["recency_factor"]    = recency_vals.round(3)
+    work["relevance_factor"]  = relevance_vals.round(3)
+    work["split_text"]        = work[split_col].map(_format_time)
+    work["split_rank_display"] = (
+        work["split_rank_num"].fillna(0).astype(int).astype(str)
+        + "/" + work["sample_size"].fillna(0).astype(int).astype(str)
+    )
     return work[work["score_value"] > 0].copy()
 
 
-def _build_split_cards(df: pd.DataFrame, gender: str, profile: str, discipline: str, as_of: pd.Timestamp, model_version: str, top_n: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    work = _split_score_rows(df, discipline, profile)
+def _build_split_cards(
+    df: pd.DataFrame,
+    gender: str,
+    profile: str,
+    discipline: str,
+    as_of: pd.Timestamp,
+    model_version: str,
+    top_n: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    work = _split_score_rows(df, discipline, profile, as_of)
     if work.empty:
         return [], []
     return _group_top_scores(work, gender, profile, discipline, as_of, model_version, top_n)
 
 
-def _group_top_scores(work: pd.DataFrame, gender: str, profile: str, discipline: str, as_of: pd.Timestamp, model_version: str, top_n: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _group_top_scores(
+    work: pd.DataFrame,
+    gender: str,
+    profile: str,
+    discipline: str,
+    as_of: pd.Timestamp,
+    model_version: str,
+    top_n: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     score_rows: List[Dict[str, Any]] = []
     evidence_rows: List[Dict[str, Any]] = []
-    as_of_label = as_of.strftime("%Y-%m-%d")
+    as_of_label  = as_of.strftime("%Y-%m-%d")
     current_year = int(as_of.year)
 
-    for _, g in work.sort_values(["athlete_key", "score_value", "race_date"], ascending=[True, False, False]).groupby("athlete_key", sort=False):
+    for _, g in work.sort_values(
+        ["athlete_key", "score_value", "race_date"], ascending=[True, False, False]
+    ).groupby("athlete_key", sort=False):
+
         top = g.sort_values(["score_value", "race_date"], ascending=[False, False]).head(top_n).copy()
         if top.empty:
             continue
-        scores = [float(x) for x in pd.to_numeric(top["score_value"], errors="coerce").dropna().tolist() if float(x) > 0]
+        scores = [float(x) for x in pd.to_numeric(top["score_value"], errors="coerce").dropna() if float(x) > 0]
         if not scores:
             continue
-        score = float(np.mean(scores))
-        athlete_url = _canonical_url(top["athlete_url"].dropna().iloc[0]) if top["athlete_url"].dropna().size else ""
-        athlete_name = _clean(top["athlete_name"].dropna().iloc[0]) if top["athlete_name"].dropna().size else _clean(top["athlete_key"].iloc[0])
-        last = top.sort_values("race_date", ascending=False).iloc[0]
-        cy = g[g["race_date"].dt.year == current_year]
+
+        score        = float(np.mean(scores))
+        athlete_url  = _canonical_url(top["athlete_url"].dropna().iloc[0]) if top["athlete_url"].dropna().size else ""
+        athlete_name = (_clean(top["athlete_name"].dropna().iloc[0]) if top["athlete_name"].dropna().size
+                        else _clean(top["athlete_key"].iloc[0]))
+
+        last     = top.sort_values("race_date", ascending=False).iloc[0]
+        cy       = g[g["race_date"].dt.year == current_year]
         cy_scores = pd.to_numeric(cy["score_value"], errors="coerce").dropna().tolist() if not cy.empty else []
-        premium_count = int(top.get("premium_evidence", pd.Series([False] * len(top), index=top.index)).fillna(False).astype(bool).sum())
-        strong_count = int(top.get("strong_evidence", pd.Series([False] * len(top), index=top.index)).fillna(False).astype(bool).sum())
-        confidence = _confidence(len(scores), premium_count, strong_count)
+
+        prem_col  = top.get("premium_evidence", pd.Series([False] * len(top), index=top.index))
+        str_col   = top.get("strong_evidence",  pd.Series([False] * len(top), index=top.index))
+        premium_count = int(prem_col.fillna(False).astype(bool).sum())
+        strong_count  = int(str_col.fillna(False).astype(bool).sum())
+        confidence    = _confidence(len(scores), premium_count, strong_count)
         last_race_date = _iso_date(last.get("race_date"))
 
-        raw = {
-            "best_scores_used": [round(x, 2) for x in scores],
+        # Build the raw explainability payload
+        raw: Dict[str, Any] = {
+            "best_scores_used":       [round(x, 2) for x in scores],
             "premium_evidence_count": premium_count,
-            "strong_evidence_count": strong_count,
-            "evidence_count": len(scores),
+            "strong_evidence_count":  strong_count,
+            "evidence_count":         len(scores),
         }
         if discipline != "overall":
             raw.update({
-                "OpenRank Split Score": round(score, 2),
+                "OpenRank Split Score":   round(score, 2),
                 "Best Split Scores Used": ", ".join(f"{x:.1f}" for x in scores),
                 "Premium Evidence Count": premium_count,
-                "Strong Evidence Count": strong_count,
-                "Evidence Count": len(scores),
-                "Last Rank": _clean(last.get("split_rank_display")),
-                "Best Recent Split": _clean(last.get("split_text")),
+                "Strong Evidence Count":  strong_count,
+                "Evidence Count":         len(scores),
+                "Last Rank":              _clean(last.get("split_rank_display")),
+                "Best Recent Split":      _clean(last.get("split_text")),
             })
         else:
             raw.update({
-                "OpenRank Score": round(score, 2),
+                "OpenRank Score":   round(score, 2),
                 "Best Scores Used": ", ".join(f"{x:.1f}" for x in scores),
             })
 
         score_rows.append({
-            "model_version": model_version,
-            "as_of_date": as_of_label,
-            "profile": profile,
-            "discipline": discipline,
-            "gender": gender,
-            "athlete_url": athlete_url,
-            "athlete_name": athlete_name,
-            "rank": None,  # filled after sorting
-            "score": round(score, 4),
-            "best_scores": [round(x, 4) for x in scores],
-            "evidence_count": len(scores),
-            "current_year_score": round(float(np.mean(sorted(cy_scores, reverse=True)[:top_n])), 4) if cy_scores else None,
-            "current_year_races": int(len(cy)) if cy is not None else 0,
+            "model_version":       model_version,
+            "as_of_date":          as_of_label,
+            "profile":             profile,
+            "discipline":          discipline,
+            "gender":              gender,
+            "athlete_url":         athlete_url,
+            "athlete_name":        athlete_name,
+            "rank":                None,           # filled after sorting
+            "score":               round(score, 4),
+            "best_scores":         [round(x, 4) for x in scores],
+            "evidence_count":      len(scores),
+            "current_year_score":  round(float(np.mean(sorted(cy_scores, reverse=True)[:top_n])), 4) if cy_scores else None,
+            "current_year_races":  int(len(cy)) if cy is not None else 0,
             "current_year_scored": int(len([x for x in cy_scores if x > 0])) if cy_scores else 0,
-            "confidence": confidence,
-            "last_race_name": _clean(last.get("race_name")),
-            "last_race_date": last_race_date,
-            "computed_source": f"fast_score_engine · {gender} · {profile} · {discipline} · top {top_n}",
-            "raw": _json_row(raw),
+            "confidence":          confidence,
+            "last_race_name":      _clean(last.get("race_name")),
+            "last_race_date":      last_race_date,
+            "computed_source":     f"score_engine_v5 · {gender} · {profile} · {discipline} · top {top_n}",
+            "raw":                 _json_row(raw),
         })
 
         for used_rank, (_, ev) in enumerate(top.iterrows(), start=1):
-            ev_score = _safe_float(ev.get("score_value"))
+            ev_score  = _safe_float(ev.get("score_value"))
+            ev_rec    = _safe_float(ev.get("recency_factor"))
+            ev_rel    = _safe_float(ev.get("relevance_factor"))
             evidence_rows.append({
-                "model_version": model_version,
-                "as_of_date": as_of_label,
-                "profile": profile,
-                "discipline": discipline,
-                "gender": gender,
-                "athlete_url": athlete_url,
-                "athlete_name": athlete_name,
-                "used_rank": used_rank,
-                "race_date": _iso_date(ev.get("race_date")),
-                "race_name": _clean(ev.get("race_name")),
-                "race_type": _clean(ev.get("race_type")),
-                "place": _clean(ev.get("place")),
-                "sof": _safe_float(ev.get("sof")),
-                "ors": _safe_float(ev.get("ors")),
-                "split_text": _clean(ev.get("split_text")) if discipline != "overall" else "",
-                "split_rank": _clean(ev.get("split_rank_display")) if discipline != "overall" else "",
+                "model_version":    model_version,
+                "as_of_date":       as_of_label,
+                "profile":          profile,
+                "discipline":       discipline,
+                "gender":           gender,
+                "athlete_url":      athlete_url,
+                "athlete_name":     athlete_name,
+                "used_rank":        used_rank,
+                "race_date":        _iso_date(ev.get("race_date")),
+                "race_name":        _clean(ev.get("race_name")),
+                "race_type":        _clean(ev.get("race_type")),
+                "place":            _clean(ev.get("place")),
+                "sof":              _safe_float(ev.get("sof")),
+                "ors":              _safe_float(ev.get("ors")),
+                "split_text":       _clean(ev.get("split_text")) if discipline != "overall" else "",
+                "split_rank":       _clean(ev.get("split_rank_display")) if discipline != "overall" else "",
                 "pct_behind_fastest": _safe_float(ev.get("pct_behind_fastest")) if discipline != "overall" else None,
-                "evidence_score": round(ev_score, 4) if ev_score is not None else None,
+                "evidence_score":   round(ev_score, 4) if ev_score is not None else None,
                 "raw": _json_row({
-                    "Date": _iso_date(ev.get("race_date")),
-                    "Race": _clean(ev.get("race_name")),
-                    "Race Type": _clean(ev.get("race_type")),
-                    "Place": _clean(ev.get("place")),
-                    "SOF": _safe_float(ev.get("sof")),
-                    "ORS": _safe_float(ev.get("ors")),
-                    "Split": _clean(ev.get("split_text")),
-                    "Split Rank": _clean(ev.get("split_rank_display")),
-                    "% Behind Fastest": _safe_float(ev.get("pct_behind_fastest")),
-                    "Evidence Score": ev_score,
-                    "Premium Evidence": bool(ev.get("premium_evidence", False)),
-                    "Strong Evidence": bool(ev.get("strong_evidence", False)),
+                    "Date":               _iso_date(ev.get("race_date")),
+                    "Race":               _clean(ev.get("race_name")),
+                    "Race Type":          _clean(ev.get("race_type")),
+                    "Place":              _clean(ev.get("place")),
+                    "SOF":                _safe_float(ev.get("sof")),
+                    "ORS":                _safe_float(ev.get("ors")),
+                    "Split":              _clean(ev.get("split_text")),
+                    "Split Rank":         _clean(ev.get("split_rank_display")),
+                    "% Behind Fastest":   _safe_float(ev.get("pct_behind_fastest")),
+                    "Evidence Score":     ev_score,
+                    "Recency Factor":     ev_rec,
+                    "Relevance Factor":   ev_rel,
+                    "Premium Evidence":   bool(ev.get("premium_evidence", False)),
+                    "Strong Evidence":    bool(ev.get("strong_evidence", False)),
                 }),
             })
 
-    # rank inside slice
+    # Assign final rank within this slice
     score_rows.sort(key=lambda r: (-float(r.get("score") or 0), str(r.get("athlete_name") or "")))
     for i, row in enumerate(score_rows, start=1):
         row["rank"] = i
     return score_rows, evidence_rows
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def prep_results(results: pd.DataFrame) -> pd.DataFrame:
-    """Public wrapper used by the app for one-time normalization before batched saves."""
+    """Normalise a raw results DataFrame once before passing to the slice builder."""
     return _prep_results(results)
 
 
@@ -592,35 +759,31 @@ def build_scorecard_slice(
     model_version: str,
     top_n: int = 5,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    """Build one gender/profile/discipline scorecard slice.
+    """Build one gender × profile × discipline scorecard slice.
 
-    The app can call this repeatedly and save each slice separately so Supabase
-    never has to run one giant scorecard transaction.
+    The app calls this for each of the 32 slices and saves the results
+    separately so no single Supabase request covers the full rebuild.
     """
     as_of = pd.to_datetime(as_of_date, errors="coerce")
     if pd.isna(as_of):
         as_of = pd.Timestamp.today().normalize()
+
     if prep_df is None or prep_df.empty:
         return [], [], {
-            "Gender": gender,
-            "Profile": profile,
-            "Discipline": discipline,
-            "Rows After Profile": 0,
-            "Candidate Score Rows": 0,
-            "Scorecard Rows": 0,
-            "Evidence Rows": 0,
-            "Lookback Days": _lookback_days(profile),
-            "Status": "empty results",
+            "Gender": gender, "Profile": profile, "Discipline": discipline,
+            "Rows After Profile": 0, "Candidate Score Rows": 0,
+            "Scorecard Rows": 0, "Evidence Rows": 0,
+            "Lookback Days": _lookback_days(profile), "Status": "empty results",
         }
 
-    lookback = _lookback_days(profile)
+    lookback     = _lookback_days(profile)
     window_start = as_of - pd.Timedelta(days=lookback)
-    gdf_base = prep_df[prep_df["gender"] == gender].copy()
+    gdf_base     = prep_df[prep_df["gender"] == gender].copy()
     pdf = gdf_base[
-        (gdf_base["race_date"].notna()) &
-        (gdf_base["race_date"] >= window_start) &
-        (gdf_base["race_date"] <= as_of) &
-        (_profile_mask(gdf_base, profile))
+        gdf_base["race_date"].notna()
+        & (gdf_base["race_date"] >= window_start)
+        & (gdf_base["race_date"] <= as_of)
+        & _profile_mask(gdf_base, profile)
     ].copy()
 
     try:
@@ -628,25 +791,25 @@ def build_scorecard_slice(
             candidate_rows = int(pd.to_numeric(pdf.get("ors", pd.Series(dtype=object)), errors="coerce").gt(0).sum())
             cards, evidence = _build_overall_cards(pdf, gender, profile, as_of, model_version, top_n)
         else:
-            split_col = f"{discipline}_seconds"
+            split_col      = f"{discipline}_seconds"
             candidate_rows = int(pd.to_numeric(pdf.get(split_col, pd.Series(dtype=object)), errors="coerce").gt(0).sum())
             cards, evidence = _build_split_cards(pdf, gender, profile, discipline, as_of, model_version, top_n)
-        status = "saved"
+        status = "ok"
     except Exception as exc:
-        candidate_rows = 0
+        candidate_rows  = 0
         cards, evidence = [], []
-        status = f"error: {exc}"
+        status          = f"error: {exc}"
 
     return cards, evidence, {
-        "Gender": gender,
-        "Profile": profile,
-        "Discipline": discipline,
-        "Rows After Profile": int(len(pdf)),
+        "Gender":               gender,
+        "Profile":              profile,
+        "Discipline":           discipline,
+        "Rows After Profile":   int(len(pdf)),
         "Candidate Score Rows": int(candidate_rows),
-        "Scorecard Rows": int(len(cards)),
-        "Evidence Rows": int(len(evidence)),
-        "Lookback Days": int(lookback),
-        "Status": status,
+        "Scorecard Rows":       int(len(cards)),
+        "Evidence Rows":        int(len(evidence)),
+        "Lookback Days":        int(lookback),
+        "Status":               status,
     }
 
 
@@ -656,10 +819,9 @@ def build_all_scorecards(
     model_version: str,
     top_n: int = 5,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Return (scorecards, evidence, log) for all genders/profiles/disciplines.
+    """Build every gender × profile × discipline scorecard in one pass.
 
-    This is intentionally one engine call: the app should load/normalize once, call
-    this once, then bulk-save the returned rows.
+    Returns (scorecards_df, evidence_df, log_df).
     """
     as_of = pd.to_datetime(as_of_date, errors="coerce")
     if pd.isna(as_of):
@@ -668,9 +830,9 @@ def build_all_scorecards(
     if df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame([{"Status": "empty results"}])
 
-    cards: List[Dict[str, Any]] = []
+    cards:    List[Dict[str, Any]] = []
     evidence: List[Dict[str, Any]] = []
-    logs: List[Dict[str, Any]] = []
+    logs:     List[Dict[str, Any]] = []
 
     for gender in ["Men", "Women"]:
         for profile in PROFILES:
