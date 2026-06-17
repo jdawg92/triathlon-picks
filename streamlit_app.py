@@ -6167,21 +6167,25 @@ elif page == "Import CSVs":
                         cols = [c for c in ["athlete_name", "gender", "race_date", "race_name", "race_type", "place", "sof", "ors", "swim_seconds", "bike_seconds", "run_seconds", "status"] if c in sample.columns]
                         st.dataframe(sample[cols], width="stretch", hide_index=True)
                     if results_mode == "Write to Supabase":
+                        # Source-only workflow: keep the full API cache in trinews_* tables.
+                        # Scorecards now build from scoring_result_pool, which is built from trinews_results.
+                        # Do NOT write to athlete_results / race_field_results here; those legacy app tables
+                        # have older unique constraints and are no longer required for the scoring-pool flow.
                         source_writes = []
                         for table_name, key in [("trinews_athletes", "trinews_athletes"), ("trinews_results", "trinews_results")]:
                             ok, msg = write_source_rows_safe(table_name, payload.get(key, []) or [], "id")
                             source_writes.append(f"{table_name}: {msg if ok else 'error - ' + msg}")
+
                         athlete_rows = payload.get("athletes", []) or []
-                        upsert_athletes_preserve_gender(athlete_rows)
-                        ar_rows = dedupe_result_rows(payload.get("athlete_results", []) or [])
-                        rf_rows = dedupe_result_rows(payload.get("race_field_results", []) or [])
-                        deleted = delete_app_result_rows_for_race_urls(ar_rows)
-                        ar_rows, ar_ath_ins, ar_ath_upd, ar_prop = sync_athlete_master_import(ar_rows, athlete_rows)
-                        rf_rows, rf_ath_ins, rf_ath_upd, rf_prop = sync_athlete_master_import(rf_rows, athlete_rows)
-                        insert_chunks("athlete_results", ar_rows)
-                        insert_chunks("race_field_results", rf_rows)
+                        if athlete_rows:
+                            upsert_athletes_preserve_gender(athlete_rows)
+
                         clear_cache()
-                        st.success(f"Results synced. Deleted old app rows for these races: {deleted:,}. Inserted athlete_results: {len(ar_rows):,}. Race-field rows: {len(rf_rows):,}.")
+                        st.success(
+                            "Results synced to API cache. "
+                            f"Cached result rows pulled: {len(payload.get('trinews_results', []) or []):,}. "
+                            "Next: Build scoring pool, then build scorecards."
+                        )
                         st.caption(" | ".join(source_writes))
                     else:
                         st.success("Preview complete. No data was written.")
