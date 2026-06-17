@@ -44,11 +44,11 @@ PROFILES = [
 ]
 DISCIPLINES = ["overall", "swim", "bike", "run"]
 
-MODEL_ENGINE_VERSION = "score_engine_v7_openrank_distance_weighted"
+MODEL_ENGINE_VERSION = "score_engine_v8_split_longcourse_52w"
 
 DEFAULT_LOOKBACK_DAYS = 365
-FULL_IM_LOOKBACK_DAYS = 730
-ALL_LOOKBACK_DAYS = 730
+FULL_IM_LOOKBACK_DAYS = 365
+ALL_LOOKBACK_DAYS = 365
 OPENRANK_BEST_SCORES_USED = 4
 
 
@@ -404,6 +404,22 @@ def _profile_mask(df: pd.DataFrame, profile: str) -> pd.Series:
     return pd.Series([True] * len(df), index=df.index)
 
 
+def _split_evidence_mask(df: pd.DataFrame, profile: str, discipline: str) -> pd.Series:
+    """Eligible evidence rows for split rankings.
+
+    Long-course swim/bike transfer very directly between 70.3/T100 and Full IM,
+    and run transfers partially through distance weights. Overall rankings keep
+    the stricter profile mask; this broader mask is only for splits.
+    """
+    if df.empty:
+        return pd.Series([], dtype=bool, index=df.index)
+    if profile in {"Long Course / 70.3 + T100", "Full IRONMAN"} and discipline in {"swim", "bike", "run"}:
+        txt = _race_text(df)
+        families = txt.map(_distance_family_from_text)
+        return families.isin({"long_middle", "full"})
+    return _profile_mask(df, profile)
+
+
 def _distance_family_from_text(text: str) -> str:
     txt = (text or "").lower()
     is_full = bool(re.search(r"\b140\.6\b|full ironman|\bfull\b", txt)) or (
@@ -430,14 +446,14 @@ def _distance_transfer_weight_series(rows: pd.DataFrame, profile: str, disciplin
     if profile == "Full IRONMAN":
         weights = families.map({
             "full": 1.00,
-            "long_middle": 0.78 if discipline in {"overall", "swim", "bike"} else 0.66,
+            "long_middle": 1.00 if discipline in {"swim", "bike"} else 0.78 if discipline == "run" else 0.78,
             "short": 0.38 if discipline in {"overall", "swim", "run"} else 0.25,
             "unknown": 0.55,
         }).astype("float64")
     elif profile == "Long Course / 70.3 + T100":
         weights = families.map({
             "long_middle": 1.00,
-            "full": 0.80 if discipline in {"overall", "swim", "bike"} else 0.68,
+            "full": 1.00 if discipline in {"swim", "bike"} else 0.95 if discipline == "run" else 0.80,
             "short": 0.50 if discipline in {"overall", "swim", "run"} else 0.30,
             "unknown": 0.60,
         }).astype("float64")
@@ -803,7 +819,7 @@ def _group_top_scores(
             "confidence":          confidence,
             "last_race_name":      _clean(last.get("race_name")),
             "last_race_date":      last_race_date,
-            "computed_source":     f"score_engine_v7 - openrank-best4-distance-weighted - {gender} - {profile} - {discipline}",
+            "computed_source":     f"score_engine_v8 - split-longcourse-52w - {gender} - {profile} - {discipline}",
             "raw":                 _json_row(raw),
         })
 
@@ -894,11 +910,12 @@ def build_scorecard_slice(
     lookback     = _lookback_days(profile)
     window_start = as_of - pd.Timedelta(days=lookback)
     gdf_base     = prep_df[prep_df["gender"] == gender].copy()
+    evidence_mask = _profile_mask(gdf_base, profile) if discipline == "overall" else _split_evidence_mask(gdf_base, profile, discipline)
     pdf = gdf_base[
         gdf_base["race_date"].notna()
         & (gdf_base["race_date"] >= window_start)
         & (gdf_base["race_date"] <= as_of)
-        & _profile_mask(gdf_base, profile)
+        & evidence_mask
     ].copy()
 
     prior_scores: Dict[str, Tuple[float, int]] = {}
@@ -978,4 +995,5 @@ def build_all_scorecards(
                 logs.append(log)
 
     return pd.DataFrame(cards), pd.DataFrame(evidence), pd.DataFrame(logs)
+
 

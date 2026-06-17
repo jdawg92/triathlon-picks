@@ -336,19 +336,19 @@ For the All profile, the model uses ORS/OpenRank race scores directly. For Full 
 
 ## OpenRank-style rankings
 
-The ranking score follows the public OpenRank concept of best race scores in a rolling window with missing slots counting as zero:
+The ranking score follows the public OpenRank concept of best race scores in a 52-week rolling window with missing slots counting as zero:
 
 ```text
 ranking_score = sum(best 4 distance-weighted race scores) / 4
 ```
 
-This means one outstanding race still shows as high ceiling evidence, but it no longer automatically outranks athletes with repeated elite results. Full-distance rankings favor full-distance evidence, while still allowing strong 70.3/T100 performances to transfer at reduced weight. The same distance-transfer and best-4 denominator logic applies to swim, bike, and run split rankings.
+This means one outstanding race still shows as high ceiling evidence, but it no longer automatically outranks athletes with repeated elite results. For long-course splits, swim and bike evidence transfers equally between 70.3/T100 and Full IRONMAN. Run evidence transfers with distance-specific weighting because 70.3/T100 and Full IM run performance do not always map perfectly.
 
 ## Model version
 Use the current scorecard model version consistently across app, engine, scorecards, evidence, and dashboard filters:
 
 ```text
-score_engine_v7_openrank_distance_weighted
+score_engine_v8_split_longcourse_52w
 ```
 
 If this changes, rebuild all scorecards and ensure dashboard filters are updated to the same version.
@@ -471,7 +471,7 @@ If it loads around 1,000 rows, pagination is broken or the deployed file is stal
 Make sure all references use the same version:
 
 ```text
-score_engine_v7_openrank_distance_weighted
+score_engine_v8_split_longcourse_52w
 ```
 
 Check:
@@ -537,5 +537,6 @@ When editing the app:
 - Keep old manual/CSV tables out of the new scoring model path.
 - Prefer stable IDs over names.
 - Make scorecard rankings explainable through evidence rows.
+
 
 

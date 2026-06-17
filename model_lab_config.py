@@ -8,7 +8,7 @@ read-only: it loads Supabase data, builds scorecards locally, and writes CSV
 outputs for review without saving anything back to Supabase.
 """
 
-MODEL_VERSION = "score_engine_v7_openrank_distance_weighted"
+MODEL_VERSION = "score_engine_v8_split_longcourse_52w"
 DEFAULT_AS_OF_DATE = "2026-06-17"
 DEFAULT_TOP_N_EVIDENCE = 4
 
@@ -51,5 +51,6 @@ SAMPLE_RACE_QUERIES = [
     "World Triathlon",
     "IRONMAN 70.3",
 ]
+
 
 

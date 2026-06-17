@@ -83,13 +83,13 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v7_openrank_distance_weighted"
+MODEL_CACHE_VERSION = "score_engine_v8_split_longcourse_52w"
 TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
 DEFAULT_SCORECARD_LOOKBACK_DAYS = 365
-FULL_IM_SCORECARD_LOOKBACK_DAYS = 730
-ALL_PROFILE_SCORECARD_LOOKBACK_DAYS = 730
+FULL_IM_SCORECARD_LOOKBACK_DAYS = 365
+ALL_PROFILE_SCORECARD_LOOKBACK_DAYS = 365
 
 
 # ============================================================
@@ -3315,7 +3315,7 @@ def filter_results_to_startlist_races(
 ) -> pd.DataFrame:
     """Keep only race rows needed to score one start list discipline.
 
-    The slow path was building split audits across every race in the 2-year
+    The slow path was building split audits across every race in the scoring
     window. For a selected start list, we only need the races where one of the
     selected athletes has a valid split, plus the other imported/full-field rows
     from those same races so rank and % behind fastest can be calculated.
@@ -4189,7 +4189,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "score_engine_v7_openrank_distance_weighted"
+MODEL_CACHE_VERSION = "score_engine_v8_split_longcourse_52w"
 TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4726,7 +4726,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "score_engine_v7_openrank_distance_weighted"
+MODEL_CACHE_VERSION = "score_engine_v8_split_longcourse_52w"
 TOP_SCORES_USED = 4
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -4734,8 +4734,8 @@ STRONG_SOF_THRESHOLD = 65.0
 # evidence window than 70.3/T100 or short course. Top scores used still means
 # "up to 5 best eligible scores"; missing slots are never padded with 0.0.
 DEFAULT_SCORECARD_LOOKBACK_DAYS = 365
-FULL_IM_SCORECARD_LOOKBACK_DAYS = 730
-ALL_PROFILE_SCORECARD_LOOKBACK_DAYS = 730
+FULL_IM_SCORECARD_LOOKBACK_DAYS = 365
+ALL_PROFILE_SCORECARD_LOOKBACK_DAYS = 365
 RANKING_FAMILIES = ["Long Course / 70.3 + T100", "Short Course / WTCS", "Full IRONMAN", "All"]
 
 
@@ -6701,17 +6701,17 @@ elif page == "Import CSVs":
         return app_rows, list(app_rows), athlete_rows, stats
 
 
-    def build_scoring_pool_rows_from_app_rows(app_rows: List[Dict[str, Any]], as_of_date: Any, lookback_days: int = 730) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    def build_scoring_pool_rows_from_app_rows(app_rows: List[Dict[str, Any]], as_of_date: Any, lookback_days: int = 365) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """Convert normalized app result rows into the lean scoring pool.
 
         trinews_results remains the raw/API cache. scoring_result_pool is the
-        two-year working set the score engine reads, so scorecard rebuilds do not
+        52-week working set the score engine reads, so scorecard rebuilds do not
         scan every raw historical row.
         """
         as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
         if pd.isna(as_of_ts):
             as_of_ts = pd.Timestamp.today().normalize()
-        cutoff = as_of_ts - pd.Timedelta(days=int(lookback_days or 730))
+        cutoff = as_of_ts - pd.Timedelta(days=int(lookback_days or 365))
 
         def _pool_int(value: Any) -> Optional[int]:
             try:
@@ -7389,18 +7389,18 @@ elif page == "Import CSVs":
 
     with tabs[5]:
         section_title("🏗️", "Build scoring pool")
-        st.caption("Creates the two-year scoring-ready table used by the scorecard engine. Raw API results stay in trinews_results.")
+        st.caption("Creates the 52-week scoring-ready table used by the scorecard engine. Raw API results stay in trinews_results.")
         p1, p2, p3, p4 = st.columns(4)
         p1.metric("Cached API results", f"{count_rows('trinews_results') or 0:,}")
         p2.metric("Scoring pool rows", f"{count_rows('scoring_result_pool') or 0:,}")
-        p3.metric("Lookback days", "730")
+        p3.metric("Lookback days", "365")
         p4.metric("Score source", "scoring_result_pool")
 
         sp1, sp2, sp3, sp4 = st.columns(4)
         pool_offset = sp1.number_input("Cached result offset", min_value=0, value=0, step=10000, key="scoring_pool_offset")
         pool_limit = sp2.number_input("Rows this run", min_value=10, max_value=50000, value=10000, step=5000, key="scoring_pool_limit")
         pool_as_of = sp3.date_input("As of date", value=date.today(), key="scoring_pool_asof")
-        pool_lookback = sp4.number_input("Lookback days", min_value=365, max_value=1095, value=730, step=30, key="scoring_pool_lookback_days")
+        pool_lookback = sp4.number_input("Lookback days", min_value=365, max_value=1095, value=365, step=30, key="scoring_pool_lookback_days")
         pool_mode = st.radio("Mode", ["Preview", "Write"], horizontal=True, key="scoring_pool_mode")
         clear_pool_first = st.checkbox(
             "Clear scoring pool before this write",
@@ -7979,7 +7979,7 @@ elif page == "Model Cache":
     py_cols = st.columns([2, 1])
     with py_cols[0]:
         if st.button("Rebuild scorecards", type="primary", width="stretch", key="rebuild_scorecards_python"):
-            loader = loading_card("Loading scoring pool", "Fetching only the last 730 days of scoring_result_pool...")
+            loader = loading_card("Loading scoring pool", "Fetching only the last 365 days of scoring_result_pool...")
             try:
                 results = fetch_scoring_pool_for_scorecards(rebuild_date, lookback_days=MAX_SCORECARD_POOL_LOOKBACK_DAYS)
             finally:
@@ -8328,7 +8328,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
     results_window = apply_prediction_scope(results_window_all, prediction_scope)
 
     # Performance: build each split audit only from races relevant to the
-    # selected start-list athletes, not from every result row in the 2-year
+    # selected start-list athletes, not from every result row in the scoring
     # window. This is the main speed fix for switching start lists.
     audit_source_by_disc = {
         disc: filter_results_to_startlist_races(results_window, start_athletes, disc)
@@ -8486,7 +8486,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
 
             if athlete_filter != "All":
                 with st.expander(f"Raw imported career rows for {athlete_filter}", expanded=False):
-                    # Show ALL imported rows in the two-year analysis window, not only rows that passed the
+                    # Show ALL imported rows in the scoring analysis window, not only rows that passed the
                     # selected prediction profile. This is the fastest way to see whether a missing scorecard is
                     # caused by missing imports, missing split seconds, wrong gender, outside the 52-week scoring
                     # window, or a race-family filter.
@@ -8512,11 +8512,12 @@ elif page in {"Race Dashboard", "Split Audit"}:
                             axis=1,
                         )
                         raw_all = raw_all.sort_values("race_date", ascending=False)
-                        st.caption("This shows every imported row for the athlete in the full two-year analysis window. If only one row appears here, the app only has one imported result for that athlete. If rows appear but are not used, check the 'Why Not Used' column.")
+                        st.caption("This shows every imported row for the athlete in the scoring analysis window. If only one row appears here, the app only has one imported result for that athlete. If rows appear but are not used, check the 'Why Not Used' column.")
                         display_table(
                             raw_all,
                             ["race_date", "race_name", "race_type", "distance", "place", "status", "gender", "sof", "sof_source", "ors", f"{disc}_split", "Has Split", "Profile Eligible", "Inside 52 Weeks", "Gender Compatible", "Why Not Used", "swim_seconds", "bike_seconds", "run_seconds"],
                             height=420,
                         )
+
 
 
