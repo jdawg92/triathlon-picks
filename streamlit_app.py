@@ -5428,9 +5428,9 @@ elif page == "Import CSVs":
         unsafe_allow_html=True,
     )
 
-    import_tabs = st.tabs(["🏁 Results", "📋 Start Lists", "🧬 Gender Fixes", "⚙️ Settings / Overrides"])
+    results_tab, clean_api_tab, start_lists_tab, gender_fixes_tab, settings_tab = st.tabs(["🏁 Results", "🔄 Clean API Refresh", "📋 Start Lists", "🧬 Gender Fixes", "⚙️ Settings / Overrides"])
 
-    with import_tabs[0]:
+    with results_tab:
         section_title("🏁", "Result imports")
         st.write("Use this for athlete race history and race-field result CSVs.")
         table_choice = st.radio("Result CSV type", ["Athlete Results", "Race Field Results"], horizontal=True)
@@ -5453,7 +5453,7 @@ elif page == "Import CSVs":
                     st.exception(e)
 
 
-    with import_tabs[1]:
+    with clean_api_tab:
         section_title("🔄", "Clean API results refresh")
         st.write("Refresh athlete results from the clean TriNews API tables instead of the older spreadsheet import. This repairs corrupted split times like 0:32 or 3:14 when the API has the full leg time.")
         if build_clean_results_refresh is None:
@@ -5533,7 +5533,7 @@ elif page == "Import CSVs":
                         st.dataframe(logs_df, width="stretch")
                     st.info("Next step: Model Cache → Rebuild athlete scorecards.")
 
-    with import_tabs[2]:
+    with start_lists_tab:
         section_title("📋", "Start-list imports and updates")
         st.write("Use this when a start list changes. Replace a selected race/gender group, merge only new athletes, or import a CSV that already includes race/date/gender columns.")
         start_mode = st.radio(
@@ -5615,13 +5615,13 @@ elif page == "Import CSVs":
                         st.error("Start-list import failed.")
                         st.exception(e)
 
-    with import_tabs[3]:
+    with gender_fixes_tab:
         section_title("🧬", "Manual gender fixes")
         st.write("Fix athlete gender from a small CSV. This writes to the athlete master and propagates the gender to linked result/start-list rows.")
         raw_athletes = load_table("athletes")
         render_manual_gender_override_import(raw_athletes, key_prefix="import_center_gender")
 
-    with import_tabs[4]:
+    with settings_tab:
         section_title("⚙️", "Overrides and settings")
         admin_choice = st.radio("Admin CSV type", ["Race Overrides", "Scoring Settings"], horizontal=True)
         replace_admin = st.checkbox("Replace existing rows before importing", value=False, key="admin_replace_csv")
