@@ -28,7 +28,7 @@ supabase = get_supabase()
 # ============================================================
 # Fixed model settings
 # ============================================================
-MODEL_CACHE_VERSION = "scorecard_tables_v5"
+MODEL_CACHE_VERSION = "scorecard_tables_v6_gender_locks"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -1325,6 +1325,74 @@ def upsert_chunks(table_name: str, rows: List[Dict[str, Any]], on_conflict: str,
         supabase.table(table_name).upsert(rows[i:i + chunk_size], on_conflict=on_conflict).execute()
 
 
+def load_gender_override_map() -> Dict[str, Dict[str, Any]]:
+    """Manual gender overrides are the highest-priority gender source.
+
+    If this optional table does not exist yet, return an empty map so the rest
+    of the app keeps working. Once created, imports, sync tools, and display
+    logic should never overwrite these rows with inferred/start-list gender.
+    """
+    try:
+        df = load_table("athlete_gender_overrides")
+    except Exception:
+        return {}
+    if df is None or df.empty or "athlete_url" not in df.columns:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for _, r in df.iterrows():
+        url = canonical_athlete_url(r.get("athlete_url"))
+        g = normalize_gender(r.get("gender"))
+        if url and g in ["Men", "Women"]:
+            out[url] = {
+                "athlete_url": url,
+                "athlete_name": clean_str(r.get("athlete_name")),
+                "gender": g,
+                "source": clean_str(r.get("source")) or "manual",
+            }
+    return out
+
+
+def gender_override_for(athlete_url: Any) -> Optional[str]:
+    url = canonical_athlete_url(athlete_url)
+    if not url:
+        return None
+    rec = load_gender_override_map().get(url)
+    return normalize_gender(rec.get("gender")) if rec else None
+
+
+def upsert_gender_override_rows(rows: List[Dict[str, Any]]) -> int:
+    """Persist manual gender overrides so future imports cannot undo them."""
+    cleaned: List[Dict[str, Any]] = []
+    seen = set()
+    for row in rows or []:
+        url = canonical_athlete_url(row.get("athlete_url") or row.get("Athlete URL"))
+        g = normalize_gender(row.get("gender") or row.get("Suggested Gender"))
+        name = clean_str(row.get("athlete_name") or row.get("Athlete"))
+        if not url or g not in ["Men", "Women"]:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        cleaned.append({
+            "athlete_url": url,
+            "athlete_name": name,
+            "gender": g,
+            "source": "manual_csv",
+            "notes": clean_str(row.get("notes") or row.get("Notes")),
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+    if not cleaned:
+        return 0
+    try:
+        upsert_chunks("athlete_gender_overrides", cleaned, on_conflict="athlete_url")
+    except Exception as e:
+        st.error("Could not save athlete_gender_overrides. Run the gender override SQL table script first.")
+        st.exception(e)
+        return 0
+    clear_cache()
+    return len(cleaned)
+
+
 def athlete_upsert_rows_preserve_gender(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Prepare athlete upserts without overwriting known gender with blank/null.
 
@@ -1335,13 +1403,15 @@ def athlete_upsert_rows_preserve_gender(rows: List[Dict[str, Any]]) -> List[Dict
     """
     cleaned: List[Dict[str, Any]] = []
     seen = set()
+    override_map = load_gender_override_map()
     for row in rows or []:
         athlete_url = canonical_athlete_url(row.get("athlete_url"))
         athlete_name = clean_str(row.get("athlete_name"))
         if not athlete_url:
             continue
         out = {"athlete_url": athlete_url, "athlete_name": athlete_name}
-        g = normalize_gender(row.get("gender"))
+        override_gender = normalize_gender((override_map.get(athlete_url) or {}).get("gender"))
+        g = override_gender or normalize_gender(row.get("gender"))
         if g in ["Men", "Women"]:
             out["gender"] = g
         key = (athlete_url, out.get("gender"))
@@ -1375,6 +1445,7 @@ def upsert_athletes_preserve_gender(rows: List[Dict[str, Any]]) -> Tuple[int, in
                 continue
             existing_map[url] = r.to_dict()
 
+    override_map = load_gender_override_map()
     to_insert: List[Dict[str, Any]] = []
     updated = 0
     for row in prepared:
@@ -1389,11 +1460,14 @@ def upsert_athletes_preserve_gender(rows: List[Dict[str, Any]]) -> Tuple[int, in
             incoming_name = clean_str(row.get("athlete_name"))
             existing_name = clean_str(existing_row.get("athlete_name"))
             incoming_gender = normalize_gender(row.get("gender"))
+            override_gender = normalize_gender((override_map.get(url) or {}).get("gender"))
             existing_gender = normalize_gender(existing_row.get("gender"))
+            final_gender = override_gender or incoming_gender
             if incoming_name and not existing_name:
                 payload["athlete_name"] = incoming_name
-            if incoming_gender in ["Men", "Women"] and existing_gender not in ["Men", "Women"]:
-                payload["gender"] = incoming_gender
+            if final_gender in ["Men", "Women"] and (existing_gender not in ["Men", "Women"] or override_gender):
+                if existing_gender != final_gender:
+                    payload["gender"] = final_gender
             existing_url_raw = clean_str(existing_row.get("athlete_url"))
             if len(payload) > 1 or existing_url_raw != url:
                 try:
@@ -1461,9 +1535,13 @@ def fill_row_from_athlete_master(row: Dict[str, Any], default_gender: Any = None
 
     if url:
         out["athlete_url"] = url
+    override_gender = gender_override_for(url) if url else None
     if master:
         if not clean_str(out.get("athlete_name")):
             out["athlete_name"] = clean_str(master.get("athlete_name"))
+    if override_gender in ["Men", "Women"]:
+        out["gender"] = override_gender
+    elif master:
         master_gender = normalize_gender(master.get("gender"))
         if master_gender in ["Men", "Women"] and normalize_gender(out.get("gender")) not in ["Men", "Women"]:
             out["gender"] = master_gender
@@ -1489,8 +1567,10 @@ def athlete_rows_from_import_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, 
         current = best.get(url, {"athlete_url": url})
         if name and not clean_str(current.get("athlete_name")):
             current["athlete_name"] = name
-        if gender in ["Men", "Women"] and normalize_gender(current.get("gender")) not in ["Men", "Women"]:
-            current["gender"] = gender
+        override_gender = gender_override_for(url)
+        final_gender = override_gender or gender
+        if final_gender in ["Men", "Women"] and (normalize_gender(current.get("gender")) not in ["Men", "Women"] or override_gender):
+            current["gender"] = final_gender
         best[url] = current
     return list(best.values())
 
@@ -1529,15 +1609,27 @@ def repair_related_rows_from_athlete_master() -> pd.DataFrame:
     if athletes_df is None or athletes_df.empty or "athlete_url" not in athletes_df.columns:
         return pd.DataFrame()
     url_map: Dict[str, Dict[str, Any]] = {}
+    override_map = load_gender_override_map()
     for _, r in athletes_df.iterrows():
         url = canonical_athlete_url(r.get("athlete_url"))
         if not url:
             continue
+        override_gender = normalize_gender((override_map.get(url) or {}).get("gender"))
         url_map[url] = {
             "athlete_url": url,
             "athlete_name": clean_str(r.get("athlete_name")),
-            "gender": normalize_gender(r.get("gender")),
+            "gender": override_gender or normalize_gender(r.get("gender")),
+            "has_override": bool(override_gender),
         }
+
+    for url, rec in override_map.items():
+        if url not in url_map:
+            url_map[url] = {
+                "athlete_url": url,
+                "athlete_name": clean_str(rec.get("athlete_name")),
+                "gender": normalize_gender(rec.get("gender")),
+                "has_override": True,
+            }
 
     logs = []
     for table in ["athlete_results", "race_field_results", "start_lists"]:
@@ -1559,8 +1651,11 @@ def repair_related_rows_from_athlete_master() -> pd.DataFrame:
             if old_url and old_url != url:
                 payload["athlete_url"] = url
             if master:
-                if normalize_gender(r.get("gender")) not in ["Men", "Women"] and master.get("gender") in ["Men", "Women"]:
-                    payload["gender"] = master.get("gender")
+                current_gender = normalize_gender(r.get("gender"))
+                master_gender = normalize_gender(master.get("gender"))
+                if master_gender in ["Men", "Women"] and (current_gender not in ["Men", "Women"] or master.get("has_override")):
+                    if current_gender != master_gender:
+                        payload["gender"] = master_gender
                 if not clean_str(r.get("athlete_name")) and master.get("athlete_name"):
                     payload["athlete_name"] = master.get("athlete_name")
             if payload:
@@ -1840,6 +1935,20 @@ def apply_gender_updates(suggestions: pd.DataFrame, include_medium: bool = False
         & suggestions["Confidence"].isin(allowed_conf)
         & suggestions["Conflict"].ne("Yes")
     ].copy()
+    override_map = load_gender_override_map()
+    # Manual CSV rows become locked overrides. Inferred rows never override a locked manual value.
+    manual_work = work[work.get("Sources", pd.Series(index=work.index, dtype=object)).astype(str).str.contains("Manual override", case=False, na=False)].copy()
+    if not manual_work.empty:
+        upsert_gender_override_rows([
+            {
+                "athlete_url": canonical_athlete_url(r.get("Athlete URL")),
+                "athlete_name": clean_str(r.get("Athlete")),
+                "gender": normalize_gender(r.get("Suggested Gender")),
+            }
+            for _, r in manual_work.iterrows()
+        ])
+        override_map = load_gender_override_map()
+
     applied = 0
     progress = st.progress(0, text="Applying gender updates...") if len(work) else None
     for idx, (_, r) in enumerate(work.iterrows(), start=1):
@@ -1848,6 +1957,9 @@ def apply_gender_updates(suggestions: pd.DataFrame, include_medium: bool = False
         name = clean_str(r.get("Athlete"))
         if not g or (not url and not name):
             continue
+        locked_gender = normalize_gender((override_map.get(url) or {}).get("gender")) if url else None
+        if locked_gender in ["Men", "Women"]:
+            g = locked_gender
         for table in ["athletes", "athlete_results", "race_field_results", "start_lists"]:
             try:
                 query = supabase.table(table).update({"gender": g})
@@ -2405,6 +2517,7 @@ def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
 
     gender_map: Dict[str, str] = {}
     name_gender_map: Dict[str, str] = {}
+    override_map = load_gender_override_map()
     for df in [athletes, starts]:
         if df is None or df.empty:
             continue
@@ -2418,6 +2531,15 @@ def prepare_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
                 gender_map[u] = g
             if n:
                 name_gender_map[n.lower()] = g
+    # Manual overrides are the final source of truth. They win over athlete rows,
+    # result rows, and start-list imports.
+    for url, rec in override_map.items():
+        g = normalize_gender(rec.get("gender"))
+        if g in ["Men", "Women"]:
+            gender_map[url] = g
+            nm = clean_str(rec.get("athlete_name"))
+            if nm:
+                name_gender_map[nm.lower()] = g
 
     if not results.empty:
         results["race_date"] = pd.to_datetime(results["race_date"], errors="coerce")
@@ -3349,7 +3471,7 @@ def selectable_table(df: pd.DataFrame, columns: List[str], key: str, height: Opt
 # ============================================================
 # Model cache helpers
 # ============================================================
-MODEL_CACHE_VERSION = "scorecard_tables_v5"
+MODEL_CACHE_VERSION = "scorecard_tables_v6_gender_locks"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
@@ -3753,12 +3875,17 @@ def import_general_start_list_csv(df: pd.DataFrame, replace_matching_groups: boo
     st.success(f"Imported {inserted:,} new start-list rows and skipped {skipped:,} duplicate rows.")
     if replace_matching_groups:
         st.info(f"Replace mode deleted existing rows for {replaced_groups:,} matching race/date/gender group(s), not the entire start_lists table.")
-    st.info(f"Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Auto-propagated gender for {propagated:,} athletes from this start list import.")
+    st.info(f"Athlete master: {athlete_inserted:,} new, {athlete_updated:,} updated. Auto-propagated gender for {propagated:,} athletes from this start list import. Manual gender locks are preserved.")
 
 
 def render_manual_gender_override_import(raw_athletes: pd.DataFrame, key_prefix: str = "manual_gender") -> None:
     st.caption("Upload athlete_url + gender, or just athlete_name + gender. Name-only rows are applied only when the name matches exactly one athlete in the master athletes table.")
     st.code("athlete_name,gender\nTaylor Knibb,Women\nHayden Wilde,Men", language="csv")
+    override_map = load_gender_override_map()
+    if override_map:
+        st.caption(f"Manual gender locks active: {len(override_map):,}. These override start-list and result-row gender during imports and scoring.")
+    else:
+        st.caption("No manual gender locks saved yet.")
     override_file = st.file_uploader("Manual gender CSV", type=["csv"], key=f"{key_prefix}_csv")
     if override_file is None:
         return
@@ -3824,7 +3951,8 @@ def render_manual_gender_override_import(raw_athletes: pd.DataFrame, key_prefix:
         display_table(manual_df.head(250), ["Athlete", "Athlete URL", "Suggested Gender", "Sources"], height=300)
         if st.button("Apply manual gender overrides", type="primary", key=f"{key_prefix}_apply"):
             applied = apply_gender_updates(manual_df, include_medium=False)
-            st.success(f"Applied manual gender overrides for {applied:,} athletes.")
+            st.success(f"Applied and locked manual gender overrides for {applied:,} athletes. These will now win over future start-list/result imports.")
+            st.info("Next: click Refresh database cache, then rebuild athlete scorecards.")
             st.rerun()
     if not skipped_df.empty:
         st.warning(f"Skipped {len(skipped_df):,} manual rows that were ambiguous or incomplete.")
@@ -3867,7 +3995,7 @@ if "page_label" not in st.session_state or st.session_state["page_label"] not in
 # The predictor now works from durable athlete scorecards:
 #   profile + athlete + view(overall/swim/bike/run) -> score + top evidence rows.
 # A selected start list simply joins to those scorecards and displays them.
-MODEL_CACHE_VERSION = "scorecard_tables_v5"
+MODEL_CACHE_VERSION = "scorecard_tables_v6_gender_locks"
 TOP_SCORES_USED = 5
 LOW_SAMPLE_WARNING_THRESHOLD = 5
 STRONG_SOF_THRESHOLD = 65.0
