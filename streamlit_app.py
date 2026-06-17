@@ -5559,6 +5559,13 @@ elif page == "Import CSVs":
     def _source_race_to_api(row: Dict[str, Any]) -> Dict[str, Any]:
         raw = _source_raw_dict(row.get("raw"))
         if raw.get("id"):
+            # Older cached race rows may have computed SOF in the flat source row
+            # while raw still has strength_of_field=None. Prefer the flat value
+            # when available so scoring rows do not get capped at the missing-SOF floor.
+            flat_sof = safe_float(row.get("strength_of_field"))
+            if flat_sof is not None and safe_float(raw.get("strength_of_field")) is None:
+                raw = dict(raw)
+                raw["strength_of_field"] = flat_sof
             return raw
         return {
             "id": clean_str(row.get("id")),
@@ -5685,6 +5692,45 @@ elif page == "Import CSVs":
 
         return rows
 
+    def computed_sof_by_race_gender_from_cached_results(source_rows: List[Dict[str, Any]], top_n: int = 10) -> Dict[Tuple[str, str], float]:
+        """Compute field strength from cached result OpenRank values.
+
+        TriNews race rows often have strength_of_field blank, but each result can
+        carry points.openrank. Use the top OpenRank values per race + gender as a
+        local SOF so split scores are not flattened to the 55 missing-SOF cap.
+        """
+        grouped: Dict[Tuple[str, str], List[float]] = {}
+        for src in source_rows or []:
+            rid = clean_str(src.get("race_id"))
+            if not rid:
+                continue
+            gender = normalize_gender(src.get("gender")) or clean_str(src.get("gender")) or clean_str(src.get("program_name"))
+            gender_key = clean_str(gender).lower()
+            status = clean_str(src.get("status")).upper()
+            if re.search(r"DNF|DNS|DSQ|\bDQ\b|CANCEL", status):
+                continue
+            v = safe_float(src.get("openrank"))
+            if v is None or v <= 0:
+                raw = _source_raw_dict(src.get("raw"))
+                pts = raw.get("points") if isinstance(raw, dict) else None
+                if isinstance(pts, str):
+                    try:
+                        pts = json.loads(pts)
+                    except Exception:
+                        pts = {}
+                if isinstance(pts, dict):
+                    v = safe_float(pts.get("openrank"))
+            if v is None or v <= 0:
+                continue
+            grouped.setdefault((rid, gender_key), []).append(float(v))
+
+        out: Dict[Tuple[str, str], float] = {}
+        for key, values in grouped.items():
+            values = sorted(values, reverse=True)[:max(1, int(top_n or 10))]
+            if values:
+                out[key] = round(sum(values) / len(values), 2)
+        return out
+
     def build_app_rows_from_cached_trinews_results(source_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
         if result_to_pick_rows is None:
             raise RuntimeError(f"trinews_api_refresh.py conversion helpers could not be imported: {TRINEWS_API_IMPORT_ERROR}")
@@ -5692,6 +5738,7 @@ elif page == "Import CSVs":
         athlete_ids = [clean_str(r.get("athlete_id")) for r in source_rows if clean_str(r.get("athlete_id"))]
         race_source_map = _fetch_source_rows_by_ids("trinews_races", race_ids)
         athlete_source_map = _fetch_source_rows_by_ids("trinews_athletes", athlete_ids)
+        computed_sof_map = computed_sof_by_race_gender_from_cached_results(source_rows)
 
         app_rows: List[Dict[str, Any]] = []
         athlete_rows: List[Dict[str, Any]] = []
@@ -5714,6 +5761,13 @@ elif page == "Import CSVs":
                 "slug": clean_str(src.get("race_slug")),
                 "date": clean_str(src.get("race_date")),
             }
+            # Fill missing race SOF from cached result OpenRank values. Compute by
+            # race + gender so Elite Men and Elite Women fields stay separate.
+            src_gender_key = clean_str((normalize_gender(src.get("gender")) or clean_str(src.get("gender")) or clean_str(src.get("program_name")))).lower()
+            computed_sof = computed_sof_map.get((rid, src_gender_key))
+            if safe_float(api_race.get("strength_of_field")) is None and computed_sof is not None:
+                api_race = dict(api_race)
+                api_race["strength_of_field"] = computed_sof
             api_athlete = _source_athlete_to_api(athlete_src) if athlete_src else {
                 "id": aid,
                 "full_name": clean_str(src.get("athlete_name")),
@@ -5736,6 +5790,7 @@ elif page == "Import CSVs":
             "athlete_rows_ready": len(athlete_rows),
             "missing_race_metadata": missing_race,
             "missing_athlete_metadata": missing_athlete,
+            "computed_sof_fields": len(computed_sof_map),
             "skipped": skipped,
         }
         return app_rows, list(app_rows), athlete_rows, stats
@@ -5784,6 +5839,7 @@ elif page == "Import CSVs":
             "missing_identity": 0,
             "missing_race": 0,
             "duplicate_source_id": 0,
+            "missing_sof": 0,
             "ready_rows": 0,
         }
 
@@ -5834,6 +5890,10 @@ elif page == "Import CSVs":
                 except Exception:
                     finish_seconds = None
 
+            row_sof = _pool_float(r.get("sof"))
+            if row_sof is None:
+                stats["missing_sof"] += 1
+
             row = {
                 "source_result_id": source_result_id,
                 "athlete_id": clean_str(raw.get("trinews_athlete_id")),
@@ -5854,7 +5914,7 @@ elif page == "Import CSVs":
                 "place": clean_str(r.get("place")),
                 "status": status,
                 "bad_status": bad_status,
-                "sof": _pool_float(r.get("sof")),
+                "sof": row_sof,
                 "ors": _pool_float(r.get("ors")),
                 "finish_seconds": finish_seconds,
                 "swim_seconds": swim_seconds,
