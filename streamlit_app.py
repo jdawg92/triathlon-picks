@@ -8677,58 +8677,36 @@ elif page in {"Race Dashboard", "Split Audit"}:
     strong_sof_threshold = STRONG_SOF_THRESHOLD
 
     if page == "Race Dashboard":
-        # Dashboard home: show system coverage first, then let the user choose
-        # which start-list race to analyze. Race selection belongs in the main
-        # workspace instead of being buried at the bottom of the sidebar.
+        # Race selection belongs in the main workspace instead of being buried
+        # at the bottom of the sidebar.
         race_options_df["profile"] = race_options_df["race_name"].map(lambda x: prediction_scope_from_race(x, None, None))
         race_options_df["race_date_sort"] = pd.to_datetime(race_options_df["race_date"], errors="coerce")
 
-        pending_count = 0
-        try:
-            scorecard_total = count_rows("athlete_scorecards") or 0
-        except Exception:
-            scorecard_total = 0
-        try:
-            evidence_total = count_rows("athlete_scorecard_evidence") or 0
-        except Exception:
-            evidence_total = 0
-        try:
-            athlete_total = count_rows("athletes") or 0
-        except Exception:
-            athlete_total = 0
-        try:
-            scoring_pool_total = count_rows("scoring_result_pool") or 0
-        except Exception:
-            scoring_pool_total = 0
+        starts_for_counts = starts.copy()
+        starts_for_counts["_athlete_key"] = starts_for_counts.apply(
+            lambda r: canonical_athlete_url(r.get("athlete_url")) or (clean_str(r.get("athlete_name")) or "").lower(),
+            axis=1,
+        )
+        start_counts = (
+            starts_for_counts.groupby(["race_name", "race_date", "gender"], dropna=False)["_athlete_key"]
+            .nunique()
+            .reset_index(name="start_count")
+        )
+        race_options_df = race_options_df.merge(start_counts, on=["race_name", "race_date", "gender"], how="left")
+        race_options_df["start_count"] = pd.to_numeric(race_options_df.get("start_count"), errors="coerce").fillna(0).astype(int)
+        race_options_df["picker_label"] = race_options_df.apply(
+            lambda r: f"{clean_str(r.get('race_date_label')) or 'No date'} | {clean_str(r.get('gender')) or 'All'} | {clean_str(r.get('race_name'))} | {int(r.get('start_count') or 0)} athletes",
+            axis=1,
+        )
 
-        unique_start_athletes = 0
-        if "athlete_url" in starts.columns:
-            unique_start_athletes = int(starts["athlete_url"].dropna().astype(str).str.lower().nunique())
-        if unique_start_athletes == 0 and "athlete_name" in starts.columns:
-            unique_start_athletes = int(starts["athlete_name"].dropna().astype(str).str.lower().nunique())
-
-        # Estimate pending races without doing a heavy join: a race is pending if
-        # it has zero saved overall matches after the user opens it. This top-line
-        # metric is the number of selectable start lists; selected-race coverage
-        # appears below once a race is chosen.
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Start-list races", f"{len(race_options_df):,}")
-        m2.metric("Start-list athletes", f"{unique_start_athletes:,}")
-        m3.metric("Athletes in system", f"{athlete_total:,}")
-        m4.metric("Scorecards", f"{scorecard_total:,}")
-        m5, m6, m7, m8 = st.columns(4)
-        m5.metric("Scoring-pool rows", f"{scoring_pool_total:,}")
-        m6.metric("Evidence rows", f"{evidence_total:,}")
-        m7.metric("Race profiles", f"{race_options_df['profile'].nunique():,}")
-        m8.metric("Rows in start_lists", f"{len(starts):,}")
-
-        st.markdown("### Select a race to analyze")
-        f1, f2, f3 = st.columns([1.2, 1.2, 2.4])
-        gender_choices = ["All"] + [g for g in ["Men", "Women"] if g in set(race_options_df["gender"].dropna().astype(str))]
-        dash_gender_filter = f1.selectbox("Gender", gender_choices, index=0, key="dashboard_race_gender_filter")
-        profile_choices = ["All"] + sorted([p for p in race_options_df["profile"].dropna().unique().tolist() if p])
-        dash_profile_filter = f2.selectbox("Profile", profile_choices, index=0, key="dashboard_race_profile_filter")
-        dash_search = f3.text_input("Search race", value="", placeholder="Search by race name, date, or series...", key="dashboard_race_search")
+        section_title("Race", "Choose Race")
+        with st.container(border=True):
+            f1, f2, f3 = st.columns([1.05, 1.15, 2.8])
+            gender_choices = ["All"] + [g for g in ["Men", "Women"] if g in set(race_options_df["gender"].dropna().astype(str))]
+            dash_gender_filter = f1.selectbox("Gender", gender_choices, index=0, key="dashboard_race_gender_filter")
+            profile_choices = ["All"] + sorted([p for p in race_options_df["profile"].dropna().unique().tolist() if p])
+            dash_profile_filter = f2.selectbox("Profile", profile_choices, index=0, key="dashboard_race_profile_filter")
+            dash_search = f3.text_input("Search race", value="", placeholder="Search race, date, series, or location...", key="dashboard_race_search")
 
         filtered_races = race_options_df.copy()
         if dash_gender_filter != "All":
@@ -8747,6 +8725,7 @@ elif page in {"Race Dashboard", "Split Audit"}:
 
         filtered_races = filtered_races.sort_values(["race_date_sort", "race_name", "gender"], ascending=[True, True, True], na_position="last")
         filtered_labels = filtered_races["label"].tolist()
+        label_to_picker = dict(zip(filtered_races["label"], filtered_races["picker_label"]))
         if not filtered_labels:
             st.warning("No start-list races match those filters.")
             st.stop()
@@ -8765,10 +8744,21 @@ elif page in {"Race Dashboard", "Split Audit"}:
             else:
                 default_index = max(0, len(filtered_labels) - 1)
 
-        selected_label = st.selectbox("Race / gender to analyze", filtered_labels, index=default_index, key="dashboard_selected_race_picker")
+        selected_label = st.selectbox(
+            "Race to analyze",
+            filtered_labels,
+            index=default_index,
+            key="dashboard_selected_race_picker",
+            format_func=lambda x: label_to_picker.get(x, x),
+        )
         st.session_state["dashboard_selected_race_label"] = selected_label
-        st.caption(f"Model settings: top {TOP_SCORES_USED} scores · strong SOF {int(STRONG_SOF_THRESHOLD)} · sorted by race date")
-
+        selected_preview = filtered_races[filtered_races["label"] == selected_label].iloc[0]
+        st.caption(
+            f"{len(filtered_races):,} matching races | "
+            f"{int(selected_preview.get('start_count') or 0)} start-list athletes | "
+            f"{clean_str(selected_preview.get('profile')) or 'Profile unknown'} | "
+            f"Top {TOP_SCORES_USED} scores | SOF {int(STRONG_SOF_THRESHOLD)}"
+        )
     else:
         with st.sidebar:
             selected_label = st.selectbox("Race / Gender", labels, index=max(0, len(labels) - 1))
